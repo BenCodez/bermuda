@@ -339,6 +339,17 @@ class DiagnosticHistory:
     def stop(self) -> None:
         self.enabled = False
 
+    def reconfigure(self, *, window_s: float, now: float) -> None:
+        """Validate a new window and prune existing evidence without new captures."""
+        window = finite_number(window_s, "window_s", minimum=1)
+        current = finite_number(now, "now", minimum=0)
+        if window > MAX_WINDOW_S:
+            _fail("history window exceeds one day")
+        if self._frames and current < self._frames[-1]["captured_at"]:
+            _fail("history reconfiguration cannot precede its latest capture")
+        self.window_s = window
+        self._prune(current)
+
     def clear(self) -> None:
         self._frames.clear()
         self._frame_sizes.clear()
@@ -438,6 +449,15 @@ class DiagnosticHistory:
         )
         if self._sequence >= MAX_CLOCK_EPOCH:
             _fail("history sequence exhausted; clear the history")
+        accepted_pairs = {(row["device_id"], row["scanner_id"]) for row in rows}
+        # Sources can have independent cadences. A repeated source contributes
+        # neither a new observation nor a label to this capture; another source
+        # in the same batch can still supply valid independent evidence.
+        labels = [
+            label
+            for label in labels
+            if any((label["device_id"], scanner) in accepted_pairs for scanner in label["ranges"])
+        ]
         frame = {
             "sequence": self._sequence + 1,
             "captured_at": captured,
@@ -582,8 +602,16 @@ class DiagnosticHistory:
             result["frames"] = [self._redact_frame(frame) for frame in self._frames]
         return result
 
-    def import_data(self, payload: dict[str, Any] | str, *, now: float) -> None:
-        """Atomically replace memory with strictly validated bounded JSON history."""
+    def import_data(self, payload: dict[str, Any] | str, *, now: float, resume: bool = False) -> None:
+        """
+        Atomically replace memory with strictly validated bounded JSON history.
+
+        Trusted local Store reloads can resume the current epoch's source clocks
+        on the same host. Explicit user imports always default to a new epoch;
+        imported monotonic stamps must not seed another host's live deduplication.
+        """
+        if type(resume) is not bool:
+            _fail("resume must be a boolean")
         current = finite_number(now, "now", minimum=0)
         if isinstance(payload, str):
             if len(payload.encode("utf-8")) > self.max_bytes:
@@ -644,10 +672,14 @@ class DiagnosticHistory:
                 clocks[key] = row["stamp"], row["observed"]
         self._frames = frames
         self.selected_devices = selection
-        # Imported captures remain frozen. Fresh live recording uses a distinct
-        # epoch; source stamps from another machine cannot seed its dedup clock.
-        self.session_epoch = epoch + 1
+        # Trusted local reloads retain evidence clocks. A user import instead
+        # starts a distinct live epoch and never trusts another host's stamps.
+        self.session_epoch = epoch if resume else epoch + 1
         self._sequence = previous_sequence
-        self._clocks.clear()
+        self._clocks = {
+            (device, scanner): clock
+            for (clock_epoch, device, scanner), clock in clocks.items()
+            if resume and clock_epoch == epoch
+        }
         self.dropped_rows = 0
         self._refresh_counts()

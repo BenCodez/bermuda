@@ -8,11 +8,11 @@ import json
 import time
 from copy import deepcopy
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.storage import Store
 
 from .api import async_get_advert_snapshot, public_device_id, snapshot_observations
 from .calibration import CalibrationEngine, range_from_rssi
@@ -30,10 +30,20 @@ from .profiles import effective_model, finite_number, model_version, normalize_t
 from .recording import DiagnosticHistory, validate_truth
 from .replay import ReplayEngine, ShadowSession
 from .signal_quality import FilterState
+from .toolkit_store import DurableToolkitStore
 
 OPTIONS_KEY = "measurement_toolkit"
 MAX_STATES = 4096
 HISTORY_BYTES = 1_500_000
+
+
+def _host_clock_id() -> str | None:
+    """Read a private boot marker outside the event loop; never export its value."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()[:24] if value else None
 
 
 def _settings(value: Any) -> dict:
@@ -63,13 +73,15 @@ class ToolkitManager:
         self.settings = _settings(self.entry.options.get(OPTIONS_KEY))
         self._saved_options = deepcopy(dict(self.entry.options))
         self.coordinator.options[OPTIONS_KEY] = self.settings
-        self.store = Store(self.hass, 1, f"{DOMAIN}.measurement_toolkit.{self.entry.entry_id}")
+        self.store = DurableToolkitStore(self.hass, 1, f"{DOMAIN}.measurement_toolkit.{self.entry.entry_id}")
         self._lock = asyncio.Lock()
         self._worker: asyncio.Future | None = None
         self._background: asyncio.Task | None = None
+        self._action_task: asyncio.Task | None = None
         self._closed = False
         self._generation = 0
         self._version_cache: str | None = None
+        self._boot_id: str | None = None
         self._identities: dict[str, dict] = {}
         self._identity_dirty = False
         self._states: dict[tuple[str, str], FilterState] = {}
@@ -144,9 +156,12 @@ class ToolkitManager:
         self.proposal = None
         self._proposal_rows = []
         self._suggestions.clear()
+        if self.shadow:
+            self.shadow.cancel("the radio model changed")
 
     async def async_load(self) -> None:
         """Load only validated bounded local state before scanner identity resolution."""
+        self._boot_id = await self.hass.async_add_executor_job(_host_clock_id)
         saved = await self.store.async_load()
         if not isinstance(saved, dict):
             return
@@ -162,12 +177,25 @@ class ToolkitManager:
             }
         if saved.get("history"):
             try:
-                self.history.import_data(saved["history"], now=time.time())
+                self.history.import_data(saved["history"], now=time.time(), resume=True)
                 self.history.enabled = self.settings["history_enabled"]
             except ValueError:
                 self.last_result = {"reasons": ["saved_history_invalid"]}
         if saved.get("fingerprints"):
             self.fingerprints.import_state(saved["fingerprints"])
+        clock = saved.get("clock", {})
+        reset = False
+        if isinstance(clock, dict):
+            if self._boot_id and clock.get("boot_id"):
+                reset = self._boot_id != clock["boot_id"]
+            elif finite_number(clock.get("stamp")) and finite_number(clock.get("observed")):
+                elapsed_wall = time.time() - clock["observed"]
+                elapsed_source = monotonic_time_coarse() - clock["stamp"]
+                reset = elapsed_source < 0 or abs(elapsed_wall - elapsed_source) > 5
+        if reset:
+            self.history.start(clear=False)
+            self.history.enabled = self.settings["history_enabled"]
+            self.fingerprints.new_session()
         trial = saved.get("trial")
         if isinstance(trial, dict) and isinstance(trial.get("previous_options"), dict):
             self.trial = trial
@@ -179,12 +207,18 @@ class ToolkitManager:
                 setattr(self, field, value)
 
     def _store_payload(
-        self, *, trial: dict | None = None, replace_trial: bool = False, history: DiagnosticHistory | None = None
+        self,
+        *,
+        trial: dict | None = None,
+        replace_trial: bool = False,
+        history: DiagnosticHistory | None = None,
+        fingerprints: FingerprintModel | None = None,
     ) -> dict:
         return {
+            "clock": {"boot_id": self._boot_id, "stamp": monotonic_time_coarse(), "observed": time.time()},
             "identities": deepcopy(self._identities),
             "history": (history or self.history).export(redact=False),
-            "fingerprints": self.fingerprints.export_state(),
+            "fingerprints": (fingerprints or self.fingerprints).export_state(),
             "trial": deepcopy(trial if replace_trial else self.trial),
             "last_applied": self.last_applied,
             "last_data_id": self.last_data_id,
@@ -193,6 +227,8 @@ class ToolkitManager:
     async def async_close(self) -> None:
         """Finish outstanding work without allowing it to publish after unloading."""
         self._closed = True
+        if self._action_task:
+            await asyncio.gather(self._action_task, return_exceptions=True)
         if self._background:
             await asyncio.gather(self._background, return_exceptions=True)
         if self._worker:
@@ -268,12 +304,19 @@ class ToolkitManager:
         now = monotonic_time_coarse()
         model = self.effective_advert_model(advert)
         kwargs = {"raw_distance": getattr(advert, "rssi_distance_raw", None), "attenuation": model["attenuation"]}
+        reference = self.settings["fixed_references"].get(device_id)
+        if reference:
+            kwargs["expected_distance"] = receiver_value(reference["ranges"], advert.scanner_address)
+            kwargs["expected_accuracy_m"] = reference["accuracy_m"]
         if new_stamp is not None:
             quality = state.process(
                 advert.rssi, new_stamp, now, observed=time.time() - max(0, now - new_stamp), **kwargs
             )
         else:
             quality = state.snapshot(now, **kwargs)
+            last = self._quality.get(key, {})
+            reasons = {reason.get("code"): reason for reason in last.get("reasons", []) + quality.get("reasons", [])}
+            quality["reasons"] = list(reasons.values())[:32]
         self._quality[key] = quality
         if mode == "legacy":
             return False
@@ -289,23 +332,31 @@ class ToolkitManager:
                 advert.rssi_distance = None
                 quality.setdefault("reasons", []).append({"code": "unsafe_range_conversion"})
         if new_stamp is not None and quality.get("fresh") and advert.rssi_distance is not None:
-            advert.hist_distance_by_interval.append(advert.rssi_distance)
-            del advert.hist_distance_by_interval[:-32]
+            advert.hist_distance_by_interval.insert(0, advert.rssi_distance)
+            del advert.hist_distance_by_interval[32:]
         return True
 
     def snapshot_metadata(self, device_id: str, scanner_id: str, advert: Any) -> dict:
         """Publish effective settings and source-clock quality, independently of capture time."""
         state = self._states.get((device_id, scanner_id))
         model = self.effective_advert_model(advert, device_id)
+        reference = self.settings["fixed_references"].get(device_id, {})
         quality = (
             state.snapshot(
                 monotonic_time_coarse(),
                 raw_distance=getattr(advert, "rssi_distance_raw", None),
                 attenuation=model["attenuation"],
+                expected_distance=receiver_value(reference.get("ranges", {}), scanner_id),
+                expected_accuracy_m=reference.get("accuracy_m"),
             )
             if state
             else {"reasons": [{"code": "not_processed"}], "reliability": None}
         )
+        last = self._quality.get((device_id, scanner_id), {})
+        reasons = {reason.get("code"): reason for reason in last.get("reasons", []) + quality.get("reasons", [])}
+        quality["reasons"] = list(reasons.values())[:32]
+        if state and state.mode == "legacy":
+            quality["filtered_rssi"] = None  # Legacy smooths ranges; it does not produce an RSSI estimate.
         return {
             **model,
             "model_version": self.version(),
@@ -414,6 +465,10 @@ class ToolkitManager:
         """Save rollback evidence before publishing a synchronous HA options update."""
         settings = _settings(options.get(OPTIONS_KEY))
         options[OPTIONS_KEY] = settings
+        candidate_history = history or self.history
+        if candidate_history.window_s != settings["history_window_s"]:
+            history = deepcopy(candidate_history)
+            history.reconfigure(window_s=settings["history_window_s"], now=time.time())
         payload = self._store_payload(trial=trial, replace_trial=replace_trial, history=history)
         if trial and replace_trial:
             payload["last_applied"] = trial["applied_at"]
@@ -667,8 +722,21 @@ class ToolkitManager:
             and row["status"] == "current"
             and finite_number(row["age"])
             and row["age"] <= 5
+            and finite_number(row["rssi"])
+            and finite_number(row["raw_distance"])
             and receiver_value(truth["ranges"], row["scanner_id"]) is not None
         ]
+        labelled = {
+            (row["device_id"], row["scanner_id"], row["stamp"])
+            for frame in self.history.frames()
+            if frame["session_epoch"] == self.history.session_epoch
+            for row in frame["observations"]
+            if any(
+                label["device_id"] == row["device_id"] and row["scanner_id"] in label["ranges"]
+                for label in frame["truth"]
+            )
+        }
+        rows = [row for row in rows if (row["device_id"], row["scanner_id"], row["stamp"]) not in labelled]
         if not rows:
             msg = "No fresh observations match these measured receivers"
             raise ValueError(msg)
@@ -694,7 +762,32 @@ class ToolkitManager:
             for frame in self._shadow_history.frames():
                 self.shadow.add_frame(frame)
 
-    async def async_dispatch(self, action: str, payload: dict) -> dict:  # noqa: C901, PLR0911
+    async def async_dispatch(self, action: str, payload: dict) -> dict:
+        """Own one complete mutation until it commits, even if its caller disconnects."""
+        if action in ("state", "diagnostics"):
+            return await self._async_dispatch(action, payload)
+        if self._action_task is not None and not self._action_task.done():
+            msg = "A measurement action is already running"
+            raise RuntimeError(msg)
+        task = self.hass.async_create_background_task(
+            self._async_dispatch(action, deepcopy(payload)), "bermuda toolkit action"
+        )
+        self._action_task = task
+
+        def finished(result: asyncio.Task) -> None:
+            if self._action_task is result:
+                self._action_task = None
+            if not result.cancelled():
+                result.exception()
+
+        task.add_done_callback(finished)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._action_task is task:
+                self._action_task = None
+
+    async def _async_dispatch(self, action: str, payload: dict) -> dict:  # noqa: C901, PLR0911
         """Execute entry-scoped actions; the transport/service verifies administrator access."""
         if self._closed:
             msg = "The Bermuda entry is unloading"
@@ -790,13 +883,8 @@ class ToolkitManager:
                 replacement = DiagnosticHistory(window_s=self.settings["history_window_s"], max_bytes=HISTORY_BYTES)
                 await self._run_worker(replacement.import_data, deepcopy(payload.get("data")), now=time.time())
                 replacement.enabled = self.settings["history_enabled"]
-                old = self.history
+                await self.store.async_save(self._store_payload(history=replacement))
                 self.history = replacement
-                try:
-                    await self.store.async_save(self._store_payload())
-                except Exception:
-                    self.history = old
-                    raise
                 if self.shadow:
                     self.shadow.cancel("history was imported")
                 self.proposal = None
@@ -829,9 +917,16 @@ class ToolkitManager:
                 if not self.shadow:
                     msg = "No shadow comparison is running"
                     raise RuntimeError(msg)
-                result = await self._run_worker(
-                    deepcopy(self.shadow).promotion_check, current_model_version=self.version()
-                )
+                shadow, version, generation = self.shadow, self.version(), self._generation
+                result = await self._run_worker(deepcopy(shadow).promotion_check, current_model_version=version)
+                if (
+                    generation != self._generation
+                    or version != self.version()
+                    or shadow is not self.shadow
+                    or self._closed
+                ):
+                    msg = "The shadow validation no longer matches the live model"
+                    raise RuntimeError(msg)
                 if not result["eligible"]:
                     return result
                 offsets, modes = self.shadow.proposed_offsets, self.shadow.filter_modes
@@ -843,7 +938,7 @@ class ToolkitManager:
                 self.shadow.state = "promoted"
                 return {"promoted": True, "validation": result}
             if action in ("fingerprint_train", "fingerprint_clear"):
-                previous = self.fingerprints.export_state()
+                fingerprints = deepcopy(self.fingerprints)
                 if action == "fingerprint_train":
                     device_id, location_id = payload.get("device_id"), payload.get("location_id")
                     if not self.coordinator.ar.async_get_area(location_id):
@@ -851,7 +946,7 @@ class ToolkitManager:
                         raise ValueError(msg)
                     snapshot = self._snapshot()
                     rows = [row for row in snapshot_observations(snapshot) if row["device_id"] == device_id]
-                    result = self.fingerprints.train(
+                    result = fingerprints.train(
                         device_id,
                         location_id,
                         rows,
@@ -860,12 +955,10 @@ class ToolkitManager:
                         now=snapshot["captured"],
                     )
                 else:
-                    result = {"cleared": self.fingerprints.clear(payload.get("device_id"), payload.get("location_id"))}
-                try:
-                    await self.store.async_save(self._store_payload())
-                except Exception:
-                    self.fingerprints.import_state(previous)
-                    raise
+                    result = {"cleared": fingerprints.clear(payload.get("device_id"), payload.get("location_id"))}
+                await self.store.async_save(self._store_payload(fingerprints=fingerprints))
+                self.fingerprints = fingerprints
+                self._suggestions.clear()
                 return result
             msg = "Unknown measurement action"
             raise ValueError(msg)

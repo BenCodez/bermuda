@@ -101,6 +101,9 @@ async def test_options_flow(hass: HomeAssistant, setup_bermuda_entry: MockConfig
 
     # Verify that the options were updated
     assert setup_bermuda_entry.options == MOCK_OPTIONS_GLOBALS
+    # The options listener owns a real reload, including the toolkit's durable
+    # close. Finish it while the setup fixtures are still installed.
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 def _fake_scanners() -> list[SimpleNamespace]:

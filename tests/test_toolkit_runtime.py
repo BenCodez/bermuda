@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import time
 from copy import deepcopy
@@ -18,7 +19,7 @@ from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bermuda import BermudaData
-from custom_components.bermuda.api import async_get_coordinator, public_device_id
+from custom_components.bermuda.api import async_get_coordinator, public_device_id, snapshot_observations
 from custom_components.bermuda.bermuda_advert import BermudaAdvert
 from custom_components.bermuda.bermuda_device import BermudaDevice
 from custom_components.bermuda.const import (
@@ -30,6 +31,8 @@ from custom_components.bermuda.const import (
 )
 from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
 from custom_components.bermuda.number import BermudaNumber
+from custom_components.bermuda.recording import DiagnosticHistory
+from custom_components.bermuda.replay import ShadowSession
 from custom_components.bermuda.entity import BermudaEntity
 from custom_components.bermuda.toolkit import OPTIONS_KEY, ToolkitManager
 
@@ -531,3 +534,199 @@ async def test_legacy_power_change_rejects_inflight_preview_before_republishing_
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_legacy_power_change_rejects_validated_inflight_shadow_promotion_without_applying(runtime):
+    manager = runtime.manager
+    original_version = manager.version()
+    snapshot = manager._snapshot()
+    current = snapshot_observations(snapshot)[0]
+    expected_distance = current["raw_distance"] / 2
+    candidate_offset = current["rssi_offset"] + 10 * current["attenuation"] * math.log10(2)
+    history = DiagnosticHistory(enabled=True)
+    for index in range(6):
+        captured = snapshot["captured"] - 6 + index
+        observation = {**deepcopy(current), "stamp": SOURCE_STAMP - 6 + index, "observed": captured, "age": 0.0}
+        history.record(
+            [observation],
+            captured_at=captured,
+            model_version=original_version,
+            truth=[
+                {
+                    "source": "measured",
+                    "device_id": DEVICE,
+                    "location_id": "synthetic_site_a" if index < 3 else "synthetic_site_b",
+                    "ranges": {SCANNER: expected_distance},
+                    "accuracy_m": 0.0,
+                    "observed": captured,
+                    "independent": True,
+                }
+            ],
+        )
+    shadow = manager.shadow = ShadowSession(
+        [], model_version=original_version, proposed_offsets={SCANNER: candidate_offset}
+    )
+    for frame in history.frames():
+        assert shadow.add_frame(frame) == 1
+    check = shadow.promotion_check(current_model_version=original_version)
+    assert check["eligible"] is True, check["reasons"]
+    before_options = deepcopy(dict(runtime.entry.options))
+    before_offsets = deepcopy(runtime.coordinator.options[CONF_RSSI_OFFSETS])
+    before_saved = manager.store.async_save.await_count
+    started, release = threading.Event(), threading.Event()
+    original_check = ShadowSession.promotion_check
+    validated = []
+
+    def slow_check(session, *, current_model_version):
+        result = original_check(session, current_model_version=current_model_version)
+        validated.append(result)
+        started.set()
+        if not release.wait(timeout=3):
+            raise RuntimeError("Synthetic shadow promotion was not released")
+        return result
+
+    async def wait_until_started():
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+    with patch.object(ShadowSession, "promotion_check", new=slow_check):
+        task = asyncio.create_task(manager.async_dispatch("shadow_promote", {}))
+        try:
+            await asyncio.wait_for(wait_until_started(), timeout=1)
+            assert validated[0]["eligible"] is True
+            assert validated[0]["model_version"] == original_version
+            number = BermudaNumber(runtime.coordinator, runtime.entry, DEVICE)
+            with patch.object(number, "async_write_ha_state"):
+                await number.async_set_native_value(-62)
+            assert manager.version() != original_version
+            assert shadow.state == "cancelled"
+            release.set()
+            with pytest.raises(RuntimeError, match="live model"):
+                await asyncio.wait_for(task, timeout=1)
+            assert dict(runtime.entry.options) == before_options
+            assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == before_offsets
+            assert manager.store.async_save.await_count == before_saved
+            assert manager.trial is None
+            assert shadow.state == "cancelled"
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def _add_receiver(coordinator, device, scanner_id, stamp):
+    """Create a real second receiver/advert for fingerprint coverage."""
+    scanner = BermudaDevice(scanner_id, coordinator)
+    scanner._is_scanner = True
+    scanner._is_remote_scanner = True
+    scanner.stamps = {DEVICE.upper(): stamp}
+    scanner.last_seen = stamp
+    coordinator.devices[scanner_id] = scanner
+    coordinator.scanner_list_add(scanner)
+    data = AdvertisementData(
+        local_name="Synthetic Beacon",
+        manufacturer_data={},
+        service_data={},
+        service_uuids=[],
+        tx_power=-59,
+        rssi=-68 if scanner_id == SCANNER else -72,
+        platform_data=(),
+    )
+    advert = BermudaAdvert(device, data, coordinator.options, scanner)
+    device.adverts[(DEVICE, scanner_id)] = advert
+    advert.calculate_data()
+    return advert
+
+
+@pytest.mark.parametrize("changed_boot", [False, True])
+async def test_local_store_reload_resumes_clock_epochs_only_after_host_boot_change(runtime, monkeypatch, changed_boot):
+    second_scanner = "aa:bb:cc:dd:ee:22"
+    old = runtime.manager
+    _add_receiver(runtime.coordinator, runtime.device, second_scanner, SOURCE_STAMP)
+    area = runtime.coordinator.ar.async_create("Synthetic Persisted Fingerprint Room")
+    await old.async_dispatch("history_start", {"clear": True})
+    await old._after_update()
+    trained = await old.async_dispatch("fingerprint_train", {"device_id": DEVICE, "location_id": area.id})
+    assert trained["accepted"] is True and trained["added_samples"] == 1
+    assert old.history.summary()["rows"] == 2
+    old._boot_id = "synthetic-boot-a"
+    saved = deepcopy(old._store_payload())
+    saved_history_epoch = saved["history"]["session_epoch"]
+    saved_fingerprint_epoch = saved["fingerprints"]["active_session_epoch"]
+    await old.async_close()
+    current_stamp = 5.0 if changed_boot else SOURCE_STAMP + 5
+    source_stamp = 5.0 if changed_boot else SOURCE_STAMP
+    for module in ("api", "toolkit", "bermuda_advert", "bermuda_device"):
+        monkeypatch.setattr(f"custom_components.bermuda.{module}.monotonic_time_coarse", lambda: current_stamp)
+    monkeypatch.setattr(
+        "custom_components.bermuda.toolkit._host_clock_id",
+        lambda: "synthetic-boot-b" if changed_boot else "synthetic-boot-a",
+    )
+    token = current_entry.set(runtime.entry)
+    try:
+        coordinator = BermudaDataUpdateCoordinator(runtime.hass, runtime.entry)
+    finally:
+        current_entry.reset(token)
+    resumed = coordinator.toolkit = ToolkitManager(coordinator)
+    resumed.store = MagicMock(spec=Store)
+    resumed.store.async_load = AsyncMock(return_value=saved)
+    resumed.store.async_save = AsyncMock()
+    runtime.entry.runtime_data = BermudaData(coordinator)
+    try:
+        await resumed.async_load()
+        assert resumed.history.summary()["rows"] == 2
+        assert resumed.history.session_epoch == saved_history_epoch + int(changed_boot)
+        assert resumed.fingerprints.export_state()["active_session_epoch"] == saved_fingerprint_epoch + int(
+            changed_boot
+        )
+        device = BermudaDevice(DEVICE, coordinator)
+        device.create_sensor = True
+        coordinator.devices[DEVICE] = device
+        _add_receiver(coordinator, device, SCANNER, source_stamp)
+        _add_receiver(coordinator, device, second_scanner, source_stamp)
+        await resumed._after_update()
+        first = await resumed.async_dispatch("fingerprint_train", {"device_id": DEVICE, "location_id": area.id})
+        assert first["accepted"] is changed_boot
+        assert first["added_samples"] == int(changed_boot)
+        assert first["samples"] == 1 + int(changed_boot)
+        assert resumed.history.summary()["rows"] == 2 + 2 * int(changed_boot)
+        rows_before = resumed.history.frames()
+        await resumed._after_update()
+        duplicate = await resumed.async_dispatch("fingerprint_train", {"device_id": DEVICE, "location_id": area.id})
+        assert duplicate["accepted"] is False
+        assert duplicate["added_samples"] == 0
+        assert duplicate["samples"] == 1 + int(changed_boot)
+        assert resumed.history.frames() == rows_before
+        epochs = [frame["session_epoch"] for frame in resumed.history.frames()]
+        assert epochs == ([saved_history_epoch, saved_history_epoch + 1] if changed_boot else [saved_history_epoch])
+    finally:
+        await resumed.async_close()
+
+
+async def test_optional_filter_interval_history_lists_latest_approach_readings_first(runtime, monkeypatch):
+    manager, advert = runtime.manager, runtime.advert
+    await manager.async_dispatch("settings", {"settings": {"filters": {DEVICE: "pet"}}})
+    advert.hist_distance_by_interval.clear()
+    distances = []
+    for index, expected_distance in enumerate([12.0] * 40 + [8.0] * 6, start=1):
+        stamp = SOURCE_STAMP + index
+        monkeypatch.setattr("custom_components.bermuda.toolkit.monotonic_time_coarse", lambda: stamp)
+        runtime.scanner.stamps[DEVICE.upper()] = stamp
+        rssi = -55 - 30 * math.log10(expected_distance) - 1.5
+        data = AdvertisementData(
+            local_name="Synthetic Beacon",
+            manufacturer_data={},
+            service_data={},
+            service_uuids=[],
+            tx_power=-59,
+            rssi=rssi,
+            platform_data=(),
+        )
+        advert.update_advertisement(data, runtime.scanner)
+        advert.calculate_data()
+        distances.append(advert.rssi_distance)
+    assert advert.rssi_distance_raw == pytest.approx(8.0)
+    assert 8.0 < advert.rssi_distance < 9.0
+    assert len(advert.hist_distance_by_interval) == 32
+    assert advert.hist_distance_by_interval[:5] == list(reversed(distances[-5:]))
+    assert advert.hist_distance_by_interval[0] < advert.hist_distance_by_interval[4] < 12.0
+    assert advert.hist_distance_by_interval[-1] == pytest.approx(12.0)

@@ -253,3 +253,81 @@ def test_explicit_capture_bypasses_selection_only_for_its_independently_labelled
     assert restored.summary()["rows"] == 1
     with pytest.raises(ValueError, match="already has independent truth"):
         history.record(rows, captured_at=1000, model_version="model-1", truth=[truth(device="beacon-b")], force=True)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_staggered_fixed_references_label_only_sources_surviving_dedup(force):
+    history = DiagnosticHistory(enabled=not force)
+    first = [observation(device="beacon-a"), observation(device="beacon-b")]
+    labels = [truth(device=device, source="fixed_reference") for device in ("beacon-a", "beacon-b")]
+    assert history.record(first, captured_at=1000, model_version="model-1", truth=labels, force=force) == 2
+    second = [observation(device="beacon-a"), observation(1001, device="beacon-b")]
+    second[0]["age"] = 1
+    labels = [truth(1001, device=device, source="fixed_reference") for device in ("beacon-a", "beacon-b")]
+    assert history.record(second, captured_at=1001, model_version="model-1", truth=labels, force=force) == 1
+    frame = history.frames()[-1]
+    assert [row["device_id"] for row in frame["observations"]] == ["beacon-b"]
+    assert [label["device_id"] for label in frame["truth"]] == ["beacon-b"]
+    assert history.summary()["rows"] == 3
+    assert history.record(second, captured_at=1001, model_version="model-1", truth=labels, force=force) == 0
+
+
+def test_trusted_same_host_resume_restores_deduplication_and_only_current_epoch_clocks():
+    history = DiagnosticHistory(enabled=True)
+    initial = [observation(stamp=100), observation(device="beacon-b", stamp=200)]
+    assert history.record(initial, captured_at=1000, model_version="model-1") == 2
+    resumed = DiagnosticHistory(enabled=True)
+    resumed.import_data(history.export(redact=False), now=1001, resume=True)
+    assert resumed.session_epoch == history.session_epoch
+    assert record(resumed, observation(1001, stamp=100)) == 0
+    assert record(resumed, observation(1001, stamp=99)) == 0
+    assert record(resumed, observation(1001, stamp=101)) == 1
+    history.start(clear=False)
+    assert record(history, observation(1001, stamp=10)) == 1
+    resumed.import_data(history.export(redact=False), now=1002, resume=True)
+    assert record(resumed, observation(1002, stamp=9)) == 0
+    assert record(resumed, observation(1002, device="beacon-b", stamp=1)) == 1
+    assert record(resumed, observation(1002, stamp=11)) == 1
+    # A deliberate new live session permits a genuine lower source clock.
+    resumed.start(clear=False)
+    assert record(resumed, observation(1003, stamp=1)) == 1
+
+
+@pytest.mark.parametrize("resume", [None, "true", 1, 0])
+def test_import_resume_flag_is_strict_and_failed_validation_is_atomic(resume):
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation())
+    original = history.frames()
+    with pytest.raises(ValueError, match="resume must be a boolean"):
+        history.import_data(history.export(redact=False), now=1001, resume=resume)
+    assert history.frames() == original
+
+
+def test_shrinking_a_stopped_history_window_retains_latest_valid_reloadable_evidence():
+    history = DiagnosticHistory(enabled=True, window_s=10)
+    for index in range(6):
+        record(history, observation(1000 + index), [truth(1000 + index)])
+    history.stop()
+    epoch = history.session_epoch
+    history.reconfigure(window_s=3, now=1005)
+    assert history.enabled is False and history.session_epoch == epoch
+    assert [frame["captured_at"] for frame in history.frames()] == [1002, 1003, 1004, 1005]
+    assert history.summary()["rows"] == 4
+    assert history.dropped_rows == 2
+    assert history.frames()[-1]["truth"][0]["observed"] == 1005
+    resumed = DiagnosticHistory(window_s=3, enabled=True)
+    resumed.import_data(history.export(redact=False), now=1005, resume=True)
+    assert resumed.frames() == history.frames()
+    assert record(resumed, observation(1006, stamp=1005)) == 0
+    history.reconfigure(window_s=3, now=1010)
+    assert history.frames() == [] and history.summary()["rows"] == 0
+
+
+@pytest.mark.parametrize("window,now", [(True, 1005), (0, 1005), (86401, 1005), (3, float("nan")), (3, 999)])
+def test_history_window_reconfiguration_validates_before_mutating(window, now):
+    history = DiagnosticHistory(enabled=True, window_s=10)
+    record(history, observation())
+    original = history.frames()
+    with pytest.raises(ValueError):
+        history.reconfigure(window_s=window, now=now)
+    assert history.window_s == 10 and history.frames() == original

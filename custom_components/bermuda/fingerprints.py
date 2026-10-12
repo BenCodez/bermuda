@@ -27,6 +27,7 @@ MAX_LABELS_PER_DEVICE = 32
 MAX_FRAMES_PER_LABEL = 64
 MAX_TOTAL_FRAMES = 1024
 MAX_STATE_BYTES = 2_000_000
+MAX_SESSION_EPOCH = 1_000_000_000
 MAX_ID_LENGTH = 256
 MAX_AGE_S = 15.0
 MIN_TRAINING_SPAN_S = 4.0
@@ -63,6 +64,7 @@ class _Frame:
     observed: dict[str, float]
     model_version: str
     truth_source: str
+    session_epoch: int
 
 
 class FingerprintModel:
@@ -70,6 +72,28 @@ class FingerprintModel:
 
     def __init__(self) -> None:
         self._labels: dict[tuple[str, str], list[_Frame]] = {}
+        self._session_epoch = 1
+
+    def new_session(self) -> int:
+        """
+        Start deduplication after an independently established source-clock reset.
+
+        The lifecycle owner calls this only when the host monotonic clock epoch
+        changes, not for an integration reload or a newer publication UTC time.
+        Stored templates retain their measurements and explicit label coverage.
+        """
+        if self._session_epoch >= MAX_SESSION_EPOCH:
+            # Rebase provenance before the bounded integer is exhausted. Distinct
+            # old sessions remain distinct, without evicting labelled templates.
+            epochs = sorted({frame.session_epoch for frames in self._labels.values() for frame in frames})
+            rebased = {epoch: index for index, epoch in enumerate(epochs)}
+            for frames in self._labels.values():
+                for frame in frames:
+                    frame.session_epoch = rebased[frame.session_epoch]
+            self._session_epoch = len(epochs)
+        else:
+            self._session_epoch += 1
+        return self._session_epoch
 
     def _parse_rows(
         self,
@@ -119,7 +143,7 @@ class FingerprintModel:
             return None, [*reasons, _reason("insufficient_receiver_coverage", receivers=len(values))]
         if len(versions) != 1:
             return None, [_reason("mixed_model_versions")]
-        return _Frame(values, stamps, observed, versions.pop(), truth_source), reasons
+        return _Frame(values, stamps, observed, versions.pop(), truth_source, self._session_epoch), reasons
 
     def train(  # noqa: PLR0911 - independent validation/budget guards prevent any partial model mutation.
         self,
@@ -162,6 +186,8 @@ class FingerprintModel:
         staged = list(existing)
         latest_stamps: dict[str, float] = {}
         for frame in existing:
+            if frame.session_epoch != self._session_epoch:
+                continue
             for scanner, stamp in frame.stamps.items():
                 latest_stamps[scanner] = max(stamp, latest_stamps.get(scanner, -1.0))
         added = 0
@@ -192,7 +218,10 @@ class FingerprintModel:
             return {"accepted": False, "ready": False, "reasons": [_reason("model_frame_budget")]}
         if added:
             proposed = {**self._labels, key: staged}
-            if len(json.dumps(self._export_labels(proposed), allow_nan=False).encode()) > MAX_STATE_BYTES:
+            if (
+                len(json.dumps(self._export_labels(proposed, self._session_epoch), allow_nan=False).encode())
+                > MAX_STATE_BYTES
+            ):
                 return {"accepted": False, "ready": False, "reasons": [_reason("model_byte_budget")]}
             self._labels = proposed
         template, ready_reasons = self._template(staged)
@@ -363,12 +392,13 @@ class FingerprintModel:
 
     def export_state(self) -> dict[str, Any]:
         """Export detached bounded primitive state with explicit label provenance."""
-        return self._export_labels(self._labels)
+        return self._export_labels(self._labels, self._session_epoch)
 
     @staticmethod
-    def _export_labels(labels: dict[tuple[str, str], list[_Frame]]) -> dict[str, Any]:
+    def _export_labels(labels: dict[tuple[str, str], list[_Frame]], session_epoch: int) -> dict[str, Any]:
         return {
             "schema_version": 1,
+            "active_session_epoch": session_epoch,
             "labels": [
                 {
                     "device_id": device,
@@ -381,6 +411,7 @@ class FingerprintModel:
                             "model_version": frame.model_version,
                             "truth_source": frame.truth_source,
                             "independent": True,
+                            "session_epoch": frame.session_epoch,
                         }
                         for frame in frames
                     ],
@@ -409,15 +440,22 @@ class FingerprintModel:
     def import_state(self, state: object) -> dict[str, Any]:
         """Strictly validate bounded exported state before atomically replacing it."""
         try:
-            restored = self._restore(state)
+            restored, session_epoch = self._restore(state)
         except (ValueError, TypeError, OverflowError, RecursionError) as err:
             return {"accepted": False, "reasons": [_reason("invalid_model_state", detail=str(err)[:120])]}
         self._labels = restored
+        self._session_epoch = session_epoch
         return {"accepted": True, "labels": len(restored), "reasons": []}
 
     @staticmethod
-    def _restore(state: object) -> dict[tuple[str, str], list[_Frame]]:
-        if not isinstance(state, dict) or len(state) != 2 or set(state) != {"schema_version", "labels"}:
+    def _restore(state: object) -> tuple[dict[tuple[str, str], list[_Frame]], int]:
+        required = {"schema_version", "labels"}
+        if (
+            not isinstance(state, dict)
+            or not 2 <= len(state) <= 3
+            or not required <= state.keys()
+            or state.keys() - required != ({"active_session_epoch"} if len(state) == 3 else set())
+        ):
             msg = "Invalid state schema"
             raise ValueError(msg)
         if type(state["schema_version"]) is not int or state["schema_version"] != 1:
@@ -452,26 +490,41 @@ class FingerprintModel:
             restored[(device, location)] = FingerprintModel._restore_frames(frames)
         # Check bytes only after structural counts bound the work/memory. Import
         # never serializes arbitrary caller-defined keys or unlimited collections.
-        if len(json.dumps(state, allow_nan=False).encode()) > MAX_STATE_BYTES:
+        newest_epoch = max((frame.session_epoch for frames in restored.values() for frame in frames), default=0)
+        session_epoch = state.get("active_session_epoch", newest_epoch)
+        if type(session_epoch) is not int or not newest_epoch <= session_epoch <= MAX_SESSION_EPOCH:
+            msg = "Invalid active source-clock session"
+            raise ValueError(msg)
+        if (
+            len(json.dumps(FingerprintModel._export_labels(restored, session_epoch), allow_nan=False).encode())
+            > MAX_STATE_BYTES
+        ):
             msg = "Model byte budget exceeded"
             raise ValueError(msg)
-        return restored
+        return restored, session_epoch
 
     @staticmethod
     def _restore_frames(frames: list[dict[str, Any]]) -> list[_Frame]:
         restored: list[_Frame] = []
-        latest: dict[str, float] = {}
+        latest: dict[tuple[int, str], float] = {}
         version: str | None = None
+        previous_session = 0
         for frame in frames:
             expected = {"values", "stamps", "observed", "model_version", "truth_source", "independent"}
             if (
                 not isinstance(frame, dict)
-                or len(frame) != len(expected)
-                or set(frame) != expected
+                or not len(expected) <= len(frame) <= len(expected) + 1
+                or not expected <= frame.keys()
+                or frame.keys() - expected != ({"session_epoch"} if len(frame) > len(expected) else set())
                 or frame["independent"] is not True
             ):
                 msg = "Explicit frame provenance required"
                 raise ValueError(msg)
+            session_epoch = frame.get("session_epoch", 0)
+            if type(session_epoch) is not int or not previous_session <= session_epoch <= MAX_SESSION_EPOCH:
+                msg = "Invalid or regressing source-clock session"
+                raise ValueError(msg)
+            previous_session = session_epoch
             if frame["truth_source"] not in {"measured", "fixed_reference"}:
                 msg = "Independent truth source required"
                 raise ValueError(msg)
@@ -500,10 +553,12 @@ class FingerprintModel:
                 if not _identifier(scanner) or rssi is None or stamp is None or epoch is None:
                     msg = "Invalid receiver value"
                     raise ValueError(msg)
-                if stamp <= latest.get(scanner, -1.0):
+                if stamp <= latest.get((session_epoch, scanner), -1.0):
                     msg = "Duplicate or regressing source stamps"
                     raise ValueError(msg)
                 clean_values[scanner], clean_stamps[scanner], clean_observed[scanner] = rssi, stamp, epoch
-            latest.update(clean_stamps)
-            restored.append(_Frame(clean_values, clean_stamps, clean_observed, model, frame["truth_source"]))
+            latest.update({(session_epoch, scanner): stamp for scanner, stamp in clean_stamps.items()})
+            restored.append(
+                _Frame(clean_values, clean_stamps, clean_observed, model, frame["truth_source"], session_epoch)
+            )
         return restored

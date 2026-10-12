@@ -321,6 +321,141 @@ def test_export_import_roundtrip_preserves_predictions_and_dedup():
     assert result["samples"] == 5
 
 
+def source_snapshot(stamp, observed):
+    rows = snapshot(stamp)
+    for row in rows:
+        row["observed"] = observed
+    return rows
+
+
+def persisted_high_uptime_model():
+    model = FingerprintModel()
+    frames = [source_snapshot(100000 + index, 1000 + index) for index in range(5)]
+    assert model.train(DEVICE, "area:a", frames, independent=True, now=1005)["ready"]
+    return model.export_state()
+
+
+def test_imported_templates_remain_usable_and_explicit_new_boot_accepts_lower_source_clock():
+    state = persisted_high_uptime_model()
+    restored = FingerprintModel()
+    assert restored.import_state(state)["accepted"]
+    assert restored.suggest(DEVICE, source_snapshot(10, 1200), now=1200)["accepted"]
+    # A new capture/publication UTC alone is not evidence of a new source packet.
+    rejected = restored.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)
+    assert not rejected["accepted"]
+    assert rejected["samples"] == 5
+    assert "insufficient_fresh_receivers" in codes(rejected)
+    assert restored.new_session() == 2
+    result = restored.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)
+    assert result["accepted"] and result["ready"]
+    assert result["samples"] == 6
+    exported = restored.export_state()
+    assert exported["active_session_epoch"] == 2
+    assert [frame["session_epoch"] for frame in exported["labels"][0]["frames"]] == [1] * 5 + [2]
+
+
+@pytest.mark.parametrize("stamp", [10, 9])
+def test_duplicate_and_backward_packets_rejected_in_current_boot_even_with_newer_utc(stamp):
+    model = FingerprintModel()
+    model.import_state(persisted_high_uptime_model())
+    model.new_session()
+    model.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)
+    result = model.train(DEVICE, "area:a", source_snapshot(stamp, 1201), independent=True, now=1201)
+    assert not result["accepted"]
+    assert result["samples"] == 6
+    assert "insufficient_fresh_receivers" in codes(result)
+    accepted = model.train(DEVICE, "area:a", source_snapshot(11, 1202), independent=True, now=1202)
+    assert accepted["accepted"]
+    assert accepted["samples"] == 7
+
+
+def test_same_clock_reload_and_failed_persistence_restore_keep_current_boot_dedup():
+    model = FingerprintModel()
+    model.import_state(persisted_high_uptime_model())
+    model.new_session()
+    model.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)
+    persisted = model.export_state()
+    reloaded = FingerprintModel()
+    assert reloaded.import_state(persisted)["accepted"]
+    result = reloaded.train(DEVICE, "area:a", source_snapshot(10, 1201), independent=True, now=1201)
+    assert not result["accepted"]
+    assert result["samples"] == 6
+    reloaded.train(DEVICE, "area:a", source_snapshot(11, 1202), independent=True, now=1202)
+    assert reloaded.import_state(persisted)["accepted"]  # manager's failed-save rollback
+    assert reloaded.export_state() == persisted
+    assert not reloaded.train(DEVICE, "area:a", source_snapshot(10, 1203), independent=True, now=1203)["accepted"]
+
+
+def test_legacy_state_migration_preserves_existing_dedup_until_proven_clock_reset():
+    state = persisted_high_uptime_model()
+    del state["active_session_epoch"]
+    for frame in state["labels"][0]["frames"]:
+        del frame["session_epoch"]
+    model = FingerprintModel()
+    assert model.import_state(state)["accepted"]
+    migrated = model.export_state()
+    assert migrated["active_session_epoch"] == 0
+    assert all(frame["session_epoch"] == 0 for frame in migrated["labels"][0]["frames"])
+    assert model.suggest(DEVICE, source_snapshot(10, 1200), now=1200)["accepted"]
+    assert not model.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)["accepted"]
+    assert model.new_session() == 1
+    assert model.train(DEVICE, "area:a", source_snapshot(10, 1201), independent=True, now=1201)["accepted"]
+
+
+def test_distinct_actual_sessions_keep_independent_minimum_samples_and_span():
+    model = FingerprintModel()
+    first = [source_snapshot(1000 + index, 1000 + index) for index in range(3)]
+    result = model.train(DEVICE, "area:a", first, independent=True, now=1003)
+    assert result["samples"] == 3 and not result["ready"]
+    model.new_session()
+    second = [source_snapshot(1 + index, 1200 + index) for index in range(2)]
+    result = model.train(DEVICE, "area:a", second, independent=True, now=1202)
+    assert result["samples"] == 5 and result["ready"]
+    reloaded = FingerprintModel()
+    assert reloaded.import_state(model.export_state())["accepted"]
+    assert reloaded.summary()[0]["ready"]
+
+
+@pytest.mark.parametrize("field", ["active_session_epoch", "session_epoch"])
+@pytest.mark.parametrize("invalid", [True, -1, 1.5, "1", None, fingerprints.MAX_SESSION_EPOCH + 1])
+def test_invalid_session_provenance_rejected_atomically(field, invalid):
+    state = persisted_high_uptime_model()
+    model = FingerprintModel()
+    assert model.import_state(state)["accepted"]
+    invalid_state = copy.deepcopy(state)
+    if field == "active_session_epoch":
+        invalid_state[field] = invalid
+    else:
+        invalid_state["labels"][0]["frames"][0][field] = invalid
+    assert not model.import_state(invalid_state)["accepted"]
+    assert model.export_state() == state
+
+
+def test_regressing_or_uncommitted_session_provenance_rejected():
+    state = persisted_high_uptime_model()
+    state["active_session_epoch"] = 2
+    state["labels"][0]["frames"][0]["session_epoch"] = 2
+    model = FingerprintModel()
+    assert not model.import_state(state)["accepted"]  # following frames regress to epoch 1
+    state = persisted_high_uptime_model()
+    state["active_session_epoch"] = 0
+    assert not model.import_state(state)["accepted"]  # cannot publish an epoch older than its frames
+
+
+def test_epoch_counter_rebases_within_bounded_state_without_discarding_templates():
+    state = persisted_high_uptime_model()
+    state["active_session_epoch"] = fingerprints.MAX_SESSION_EPOCH
+    for frame in state["labels"][0]["frames"]:
+        frame["session_epoch"] = fingerprints.MAX_SESSION_EPOCH
+    model = FingerprintModel()
+    assert model.import_state(state)["accepted"]
+    assert model.new_session() == 1
+    assert model.summary()[0]["samples"] == 5
+    assert model.summary()[0]["ready"]
+    assert model.suggest(DEVICE, source_snapshot(10, 1200), now=1200)["accepted"]
+    assert model.train(DEVICE, "area:a", source_snapshot(10, 1200), independent=True, now=1200)["accepted"]
+
+
 @pytest.mark.parametrize("corruption", ["provenance", "duplicate", "numeric", "schema", "boolean_version", "timestamp"])
 def test_import_invalid_state_rejected_atomically(corruption):
     model = FingerprintModel()

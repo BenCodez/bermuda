@@ -285,3 +285,43 @@ async def test_explicit_capture_other_device_after_selected_history_stops(runtim
     restored = deepcopy(manager.history.export(redact=False))
     await manager.async_dispatch("history_import", {"data": restored})
     assert len(manager._labelled_rows()) == 1
+
+
+async def test_fixed_reference_beacons_with_staggered_source_cadence_keep_fresh_labels(runtime):
+    manager = runtime.manager
+    other_id = "aa:bb:cc:dd:ee:02"
+    other_advert = SyntheticAdvert(**vars(runtime.advert))
+    other_advert.device_address = other_id
+    other_device = SimpleNamespace(**vars(runtime.device))
+    other_device.address = other_device.unique_id = other_id
+    other_device.adverts = {(other_id, SCANNER): other_advert}
+    runtime.coordinator.devices[other_id] = other_device
+    await manager.async_dispatch(
+        "settings",
+        {
+            "settings": {
+                "fixed_references": {
+                    device: {"location_id": location, "ranges": {SCANNER: 2}, "accuracy_m": 0.1}
+                    for device, location in ((DEVICE, "reference-a"), (other_id, "reference-b"))
+                }
+            }
+        },
+    )
+    await complete_update(manager)
+    assert manager.history.summary()["rows"] == 2
+    await manager.async_dispatch("shadow_start", {"candidate": {SCANNER: 6}})
+    runtime.advance(new_source=False)
+    other_advert.stamp = runtime.clock["stamp"]
+    await complete_update(manager)
+    assert manager.history.summary()["rows"] == 3
+    assert [label["device_id"] for label in manager.history.frames()[-1]["truth"]] == [other_id]
+    runtime.advance()
+    await complete_update(manager)
+    assert manager.history.summary()["rows"] == 4
+    assert [label["device_id"] for label in manager.history.frames()[-1]["truth"]] == [DEVICE]
+    assert len(manager._labelled_rows()) == 4
+    assert not manager.last_result or manager.last_result.get("status") != "pending"
+    assert manager.shadow.state == "active"
+    report = manager.shadow.evaluate()["report"]
+    assert report["counts"]["observations"] == 4
+    assert report["counts"]["labelled"] == 4

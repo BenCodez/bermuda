@@ -377,6 +377,18 @@ class BermudaAdvert:
         is how we decide how long to wait, and should accommodate for dropped
         packets and for temporary occlusion (dogs' bodies etc)
         """
+        scanner = self.scanner_device
+        if (
+            self.name != scanner.name
+            or self.area_id != scanner.area_id
+            or self.area_name != scanner.area_name
+            or self.scanner_sends_stamps != scanner.is_remote_scanner
+        ):
+            # Registry edits/manual bindings update the existing scanner object.
+            # Refresh its display/area cache even when no new packet arrived;
+            # this association change is not a new RSSI observation.
+            self.apply_new_scanner(scanner)
+
         new_stamp = self.new_stamp  # should have been set by update()
         self.new_stamp = None  # Clear so we know if an update is missed next cycle
 
