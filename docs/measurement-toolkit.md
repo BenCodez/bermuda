@@ -171,7 +171,7 @@ response_variable: calibration_preview
 
 Supported actions are `state`, `diagnostics`, `settings`, `profile`, `capture`, `calibration_preview`, `calibration_apply`, `calibration_rollback`, `history_start`, `history_stop`, `history_clear`, `history_export`, `history_import`, `replay`, `shadow_start`, `shadow_stop`, `shadow_promote`, `fingerprint_train` and `fingerprint_clear`. They use the same manager checks as the panel.
 
-Only one action runs at a time. Disconnecting a caller lets an already accepted action finish its complete transaction. Local evidence and rollback records use atomic writes with visible save errors; a failed write keeps the prior live state. Host reboot detection starts a new source-clock session, while ordinary integration reloads retain packet deduplication. Changing the history window prunes retained captures before saving the new bound.
+Only one action runs at a time. Disconnecting a caller lets an already accepted action finish its complete transaction. Local evidence and rollback records use atomic writes with visible save errors; a failed write keeps the prior live state. Options changes also keep a bounded local commit record. This preserves trial evidence while Home Assistant saves its options file and lets restart recovery complete an accepted change without overwriting later manual edits. Internal commit identifiers stay out of published measurements and control settings. Host reboot detection starts a new source-clock session, while ordinary integration reloads retain packet deduplication. Changing the history window prunes retained captures before saving the new bound.
 
 ## Privacy and interpretation
 

@@ -173,7 +173,7 @@ async def test_apply_and_rollback_bind_to_current_model_and_keep_other_offsets(r
     payload = manager.store.async_save.call_args.args[0]
     assert payload["trial"]["model_version"] == manager.version()
     assert payload["trial"]["previous_options"] == before
-    assert manager.store.async_save.await_count == 1
+    assert manager.store.async_save.await_count == 2
     rolled = await manager.async_dispatch("calibration_rollback", {})
     assert rolled["rolled_back"] is True
     assert entry.options[CONF_RSSI_OFFSETS] == before[CONF_RSSI_OFFSETS]
@@ -265,7 +265,7 @@ async def test_automatic_regression_rollback_disables_auto_in_one_transaction(ru
     manager.store.async_save.side_effect = save_or_fail
     regression = {"rollback": True, "sufficient": True, "reasons": ["regression:synthetic-receiver"]}
     with patch.object(manager.engine, "evaluate_trial", return_value=regression):
-        if fail_write == 1:
+        if fail_write in (1, 2):
             with pytest.raises(OSError, match="automatic rollback write failure"):
                 await manager._automatic(time.time())
             assert dict(runtime.entry.options) == applied_options
@@ -280,7 +280,7 @@ async def test_automatic_regression_rollback_disables_auto_in_one_transaction(ru
             assert manager.trial is None
             assert saved[-1]["trial"] is None
             assert manager.last_result["rolled_back"] is True
-        assert len(saved) == 1
+        assert len(saved) == (fail_write or 2)
 
 
 @pytest.mark.parametrize("baseline_kind", ["legacy", "profile", "affected_receiver"])
@@ -876,11 +876,13 @@ async def test_external_options_edit_wins_while_toolkit_settings_persistence_is_
         with pytest.raises(RuntimeError, match="changed while saving"):
             await asyncio.wait_for(action, timeout=1)
         assert await asyncio.wait_for(listener, timeout=1) is True
-        assert dict(runtime.entry.options) == external
+        committed = deepcopy(dict(runtime.entry.options))
+        assert committed.pop(OPTIONS_KEY) == {"_commit_id": manager._saved_options[OPTIONS_KEY]["_commit_id"]}
+        assert committed == external
         assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == external[CONF_RSSI_OFFSETS]
         assert manager.settings["receiver_limits"] == {}
         assert runtime.advert.conf_rssi_offset == 7.0
-        assert len(durable_payloads) == 2
+        assert len(durable_payloads) == 4
         assert durable_payloads[-1]["trial"] is None
     finally:
         release.set()
@@ -915,8 +917,11 @@ async def test_queued_options_listeners_adopt_latest_entry_options_after_acquiri
             manager._lock.release()
             lock_held = False
             assert await asyncio.wait_for(asyncio.gather(first, second), timeout=1) == [True, True]
-            assert observed == [latest]
-            assert dict(runtime.entry.options) == latest
+            assert len(observed) == 1
+            committed = deepcopy(dict(runtime.entry.options))
+            assert committed.pop(OPTIONS_KEY) == {"_commit_id": manager._saved_options[OPTIONS_KEY]["_commit_id"]}
+            assert committed == latest
+            assert observed[0] == dict(runtime.entry.options)
             assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == latest[CONF_RSSI_OFFSETS]
             assert runtime.advert.conf_rssi_offset == 9.0
         finally:

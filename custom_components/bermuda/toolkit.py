@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import time
+import uuid
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
@@ -20,10 +21,20 @@ from .calibration import CalibrationEngine, range_from_rssi
 from .const import (
     CONF_ATTENUATION,
     CONF_DEVICES,
+    CONF_DEVTRACK_TIMEOUT,
+    CONF_MAX_RADIUS,
+    CONF_MAX_VELOCITY,
     CONF_REF_POWER,
     CONF_RSSI_OFFSETS,
+    CONF_SMOOTHING_SAMPLES,
+    CONF_UPDATE_INTERVAL,
     DEFAULT_ATTENUATION,
+    DEFAULT_DEVTRACK_TIMEOUT,
+    DEFAULT_MAX_RADIUS,
+    DEFAULT_MAX_VELOCITY,
     DEFAULT_REF_POWER,
+    DEFAULT_SMOOTHING_SAMPLES,
+    DEFAULT_UPDATE_INTERVAL,
     DISTANCE_INFINITE,
     DOMAIN,
 )
@@ -38,6 +49,9 @@ from .util import rssi_to_metres
 OPTIONS_KEY = "measurement_toolkit"
 MAX_STATES = 4096
 HISTORY_BYTES = 1_500_000
+COMMIT_KEY = "_commit_id"
+MAX_COMMIT_ANCHORS = 128
+MAX_COMMIT_BYTES = 4 * 1024 * 1024
 
 
 def _host_clock_id() -> str | None:
@@ -51,6 +65,8 @@ def _host_clock_id() -> str | None:
 
 def _settings(value: Any) -> dict:
     """Use opaque public beacon keys even for older or directly submitted options."""
+    if isinstance(value, dict):
+        value = {key: item for key, item in value.items() if key != COMMIT_KEY}
     settings = normalize_toolkit_settings(value)
     for field in ("beacon_profiles", "filters", "fixed_references"):
         canonical = {}
@@ -64,6 +80,31 @@ def _settings(value: Any) -> dict:
             canonical[public] = item
         settings[field] = canonical
     return settings
+
+
+def _same_options(left: dict, right: dict) -> bool:
+    """Compare complete JSON state without conflating boolean/numeric edits."""
+    return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(right, sort_keys=True, allow_nan=False)
+
+
+def _options_digest(options: dict, modified_at: str) -> str:
+    value = {"options": options, "modified_at": modified_at}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def _disk_options(path: str, entry_id: str) -> dict | None:
+    """Read only an acknowledgement of HA's own delayed options write."""
+    try:
+        file = Path(path)
+        if file.stat().st_size > 32 * 1024 * 1024:
+            return None
+        saved = json.loads(file.read_bytes())
+        for entry in saved.get("data", {}).get("entries", []):
+            if entry.get("entry_id") == entry_id and isinstance(entry.get("options"), dict):
+                return {"options": entry["options"], "modified_at": entry.get("modified_at")}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def _rebase_distance(distance: float | None, old_model: dict, new_model: dict) -> float | None:
@@ -89,6 +130,7 @@ class ToolkitManager:
         self.entry = coordinator.config_entry
         self.settings = _settings(self.entry.options.get(OPTIONS_KEY))
         self._saved_options = deepcopy(dict(self.entry.options))
+        self._options_journal: dict | None = None
         self.coordinator.options[OPTIONS_KEY] = self.settings
         self.store = DurableToolkitStore(self.hass, 1, f"{DOMAIN}.measurement_toolkit.{self.entry.entry_id}")
         self._lock = asyncio.Lock()
@@ -185,6 +227,7 @@ class ToolkitManager:
         if not isinstance(saved, dict):
             self._available = True
             return
+        saved = await self._recover_options(saved)
         identities = saved.get("identities", {})
         if isinstance(identities, dict) and len(identities) <= 128:
             self._identities = {
@@ -246,7 +289,107 @@ class ToolkitManager:
             "trial": deepcopy(trial if replace_trial else self.trial),
             "last_applied": self.last_applied,
             "last_data_id": self.last_data_id,
+            "options_journal": deepcopy(self._options_journal),
         }
+
+    def _trial_state(self) -> dict:
+        return {"trial": deepcopy(self.trial), "last_applied": self.last_applied, "last_data_id": self.last_data_id}
+
+    def _reconcile_options(self, options: dict) -> None:
+        """Rebuild all constructor defaults before any refresh or Number restore."""
+        defaults = {
+            CONF_ATTENUATION: DEFAULT_ATTENUATION,
+            CONF_DEVTRACK_TIMEOUT: DEFAULT_DEVTRACK_TIMEOUT,
+            CONF_MAX_RADIUS: DEFAULT_MAX_RADIUS,
+            CONF_MAX_VELOCITY: DEFAULT_MAX_VELOCITY,
+            CONF_REF_POWER: DEFAULT_REF_POWER,
+            CONF_SMOOTHING_SAMPLES: DEFAULT_SMOOTHING_SAMPLES,
+            CONF_UPDATE_INTERVAL: DEFAULT_UPDATE_INTERVAL,
+            CONF_RSSI_OFFSETS: {},
+        }
+        self._adopt_settings(_settings(options.get(OPTIONS_KEY)), options)
+        self.coordinator.options.clear()
+        self.coordinator.options.update({**defaults, **deepcopy(options), OPTIONS_KEY: self.settings})
+        self._version_cache = None
+        self._saved_options = deepcopy(options)
+
+    @staticmethod
+    def _valid_journal(value: Any) -> bool:
+        """Require bounded local provenance before replaying an options transition."""
+        try:
+            return (
+                isinstance(value, dict)
+                and value.get("phase") in ("prepared", "accepted")
+                and isinstance(value.get("desired"), dict)
+                and isinstance(value.get("before"), dict)
+                and isinstance(value.get("after"), dict)
+                and isinstance(value.get("anchors"), list)
+                and 0 < len(value["anchors"]) <= MAX_COMMIT_ANCHORS
+                and all(isinstance(anchor, str) and len(anchor) == 64 for anchor in value["anchors"])
+                and len(json.dumps(value, allow_nan=False).encode()) <= MAX_COMMIT_BYTES
+                and isinstance(value["desired"].get(OPTIONS_KEY), dict)
+                and isinstance(value["desired"][OPTIONS_KEY].get(COMMIT_KEY), str)
+                and len(value["desired"][OPTIONS_KEY][COMMIT_KEY]) == 32
+            )
+        except (ValueError, TypeError, RecursionError):
+            return False
+
+    async def _recover_options(self, saved: dict) -> dict:
+        """Recover durable accepted intent while respecting later actual HA edits."""
+        journal = saved.get("options_journal")
+        if not self._valid_journal(journal):
+            return saved
+        current = deepcopy(dict(self.entry.options))
+        selected = journal
+        same_marker = current.get(OPTIONS_KEY, {}).get(COMMIT_KEY) == journal["desired"][OPTIONS_KEY][COMMIT_KEY]
+        if journal["phase"] == "prepared" and not same_marker:
+            fallback = journal.get("fallback")
+            if not self._valid_journal(fallback) or fallback["phase"] != "accepted":
+                return {**saved, **deepcopy(journal["before"])}
+            saved = {
+                **saved,
+                **{
+                    key: deepcopy(journal["before"][key])
+                    for key in ("history", "history_clocks")
+                    if key in journal["before"]
+                },
+            }
+            selected = fallback
+        desired = selected["desired"]
+        if _same_options(current, desired):
+            recovered = selected["after"]
+        elif (
+            selected["phase"] == "accepted"
+            and _options_digest(current, self.entry.modified_at.isoformat()) in selected["anchors"]
+        ):
+            # The complete old options and token must match a known committed
+            # ancestor. Newer external edits are never merged or overwritten.
+            self.hass.config_entries.async_update_entry(self.entry, options=deepcopy(desired))
+            self._reconcile_options(desired)
+            recovered = selected["after"]
+        else:
+            # An external edit can retain the latest token, including an undo.
+            # Preserve it. Retain prior monitoring evidence rather than discard
+            # it solely because restored Number powers are not available yet.
+            recovered = selected["before"] if selected["before"].get("trial") else selected["after"]
+            backup = selected.get("backup_trial")
+            if isinstance(backup, dict) and self._trial_offsets_match(backup, current):
+                recovered = {**recovered, "trial": backup}
+        self._options_journal = deepcopy(selected)
+        metadata = {
+            key: deepcopy(recovered[key]) for key in ("trial", "last_applied", "last_data_id") if key in recovered
+        }
+        return {**saved, **metadata}
+
+    @staticmethod
+    def _trial_offsets_match(trial: dict, options: dict) -> bool:
+        settings = _settings(options.get(OPTIONS_KEY))
+        for scanner, expected in trial.get("offsets", {}).items():
+            profile = receiver_value(settings["receiver_profiles"], scanner, {})
+            current = profile.get("rssi_offset", receiver_value(options.get(CONF_RSSI_OFFSETS, {}), scanner, 0.0))
+            if not finite_number(current) or current != expected:
+                return False
+        return bool(trial.get("offsets"))
 
     async def async_close(self) -> None:
         """Finish outstanding work without allowing it to publish after unloading."""
@@ -519,11 +662,17 @@ class ToolkitManager:
         replace_trial: bool = False,
         history: DiagnosticHistory | None = None,
         expected_version: str | None = None,
+        preserve_namespace: bool = False,
     ) -> None:
-        """Save rollback evidence before publishing a synchronous HA options update."""
+        """Durably prepare and acknowledge a recoverable normal HA options update."""
         baseline_options = deepcopy(dict(self.entry.options))
+        baseline_modified = self.entry.modified_at.isoformat()
+        previous_journal = deepcopy(self._options_journal)
+        before = self._trial_state()
         settings = _settings(options.get(OPTIONS_KEY))
-        options[OPTIONS_KEY] = settings
+        options = deepcopy(options)
+        namespace = dict(options.get(OPTIONS_KEY) or {}) if preserve_namespace else settings
+        options[OPTIONS_KEY] = {**namespace, COMMIT_KEY: uuid.uuid4().hex}
         candidate_history = history or self.history
         if candidate_history.window_s != settings["history_window_s"]:
             history = deepcopy(candidate_history)
@@ -532,8 +681,44 @@ class ToolkitManager:
         if trial and replace_trial:
             payload["last_applied"] = trial["applied_at"]
             payload["last_data_id"] = trial["data_id"]
+        after = {key: deepcopy(payload[key]) for key in before}
+        if history is not None:
+            before.update(
+                {"history": self.history.export(redact=False), "history_clocks": self.history.export_clocks()}
+            )
+        # Compact ancestry retains commits that HA's one-second delayed write
+        # may not have reached. A read-only acknowledgement permits safe pruning.
+        disk = await self.hass.async_add_executor_job(
+            _disk_options, self.hass.config.path(".storage", "core.config_entries"), self.entry.entry_id
+        )
+        if not _same_options(dict(self.entry.options), baseline_options) or self._closed:
+            msg = "Options changed while preparing the commit"
+            raise RuntimeError(msg)
+        anchors = list((previous_journal or {}).get("anchors", []))
+        acknowledged = (
+            disk is not None
+            and disk.get("modified_at") == baseline_modified
+            and _same_options(disk["options"], baseline_options)
+        )
+        if acknowledged:
+            anchors = []
+        if previous_journal:
+            previous_digest = previous_journal.get("desired_anchor")
+            if isinstance(previous_digest, str) and previous_digest not in anchors:
+                anchors.append(previous_digest)
+        digest = _options_digest(baseline_options, baseline_modified)
+        if digest not in anchors:
+            anchors.append(digest)
+        journal = {"phase": "prepared", "anchors": anchors, "desired": options, "before": before, "after": after}
+        journal["backup_trial"] = deepcopy(before.get("trial") or (previous_journal or {}).get("backup_trial"))
+        if previous_journal and previous_journal.get("phase") == "accepted" and not acknowledged:
+            journal["fallback"] = previous_journal
+        if not self._valid_journal(journal):
+            msg = "Wait for Home Assistant options to finish saving before another toolkit change"
+            raise RuntimeError(msg)
+        payload["options_journal"] = journal
         await self.store.async_save(payload)
-        if dict(self.entry.options) != baseline_options or (
+        if not _same_options(dict(self.entry.options), baseline_options) or (
             expected_version is not None and self.version() != expected_version
         ):
             await self.store.async_save(self._store_payload())
@@ -549,6 +734,30 @@ class ToolkitManager:
             self.history = history
         if replace_trial:
             self.trial = deepcopy(trial)
+        self.last_applied, self.last_data_id = after["last_applied"], after["last_data_id"]
+        accepted = {key: deepcopy(value) for key, value in journal.items() if key != "fallback"}
+        accepted["phase"] = "accepted"
+        accepted["desired_anchor"] = _options_digest(options, self.entry.modified_at.isoformat())
+        self._options_journal = accepted
+        try:
+            await self.store.async_save(self._store_payload())
+        except (OSError, asyncio.CancelledError):
+            self._options_journal = previous_journal
+            if _same_options(dict(self.entry.options), options):
+                self.hass.config_entries.async_update_entry(self.entry, options=baseline_options)
+                self._reconcile_options(baseline_options)
+                self.trial, self.last_applied, self.last_data_id = (
+                    before["trial"],
+                    before["last_applied"],
+                    before["last_data_id"],
+                )
+                if "history" in before:
+                    restored = DiagnosticHistory(window_s=self.settings["history_window_s"], max_bytes=HISTORY_BYTES)
+                    restored.import_data(before["history"], now=time.time(), resume=True)
+                    restored.restore_clocks(before["history_clocks"], now=time.time())
+                    restored.enabled = self.settings["history_enabled"]
+                    self.history = restored
+            raise
 
     def _adopt_settings(self, settings: dict, options: dict) -> None:
         previous = self.version()
@@ -640,11 +849,30 @@ class ToolkitManager:
             excluded = {OPTIONS_KEY, CONF_RSSI_OFFSETS}
             old_other = {key: value for key, value in self._saved_options.items() if key not in excluded}
             new_other = {key: value for key, value in new.items() if key not in excluded}
+            if new != self._saved_options:
+                backup = (self._options_journal or {}).get("backup_trial")
+                if self.trial is None and isinstance(backup, dict) and self._trial_offsets_match(backup, new):
+                    self.trial = deepcopy(backup)
+                try:
+                    await self._persist_options(new, preserve_namespace=True)
+                except (OSError, RuntimeError):
+                    if self._closed:
+                        return True
+                    # HA already accepted this external edit. A failed best-effort
+                    # witness must not prevent its live corrections or reload.
+                    latest = deepcopy(dict(entry.options))
+                    self._adopt_settings(_settings(latest.get(OPTIONS_KEY)), latest)
+                    self._saved_options = latest
+                    self.last_result = {"reasons": ["external_options_witness_unavailable"]}
+                    new_other = {key: value for key, value in latest.items() if key not in excluded}
+                else:
+                    latest = deepcopy(dict(entry.options))
+                    if not _same_options(latest, self._saved_options):
+                        self._adopt_settings(_settings(latest.get(OPTIONS_KEY)), latest)
+                        self._saved_options = latest
+                    new_other = {key: value for key, value in latest.items() if key not in excluded}
             if old_other != new_other:
                 return False
-            if new != self._saved_options:
-                self._adopt_settings(_settings(new.get(OPTIONS_KEY)), new)
-                self._saved_options = new
         return True
 
     def _labelled_rows(self, frames: list[dict] | None = None) -> list[dict]:

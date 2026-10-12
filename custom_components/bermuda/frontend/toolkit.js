@@ -47,6 +47,9 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._connected = false;
     this._generation = 0;
     this._drafts = new Map();
+    this._draftVersions = new Map();
+    this._fieldDefaults = new Map();
+    this._draftRevision = 0;
     this._results = {};
     this._captureNeedsPreview = false;
     this._message = "";
@@ -64,6 +67,8 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._state = null;
       this._content = null;
       this._drafts.clear();
+      this._draftVersions.clear();
+      this._fieldDefaults.clear();
       this._results = {};
       this._captureNeedsPreview = false;
       this._message = denied ? "Administrator access is required." : "";
@@ -83,6 +88,8 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._state = null;
       this._content = null;
       this._drafts.clear();
+      this._draftVersions.clear();
+      this._fieldDefaults.clear();
       this._results = {};
       this._message = "";
       this._captureNeedsPreview = false;
@@ -137,18 +144,33 @@ export class BermudaToolkitPanel extends HTMLElement {
     return error?.body?.message || error?.message || "The toolkit request failed. Refresh and try again.";
   }
 
-  async _perform(action, payload = {}, { download = false } = {}) {
+  async _perform(action, payload = {}, { download = false, draftNames = [] } = {}) {
     if (this._busy || !this._hass || this._hass.user?.is_admin === false) return;
+    this._rememberDrafts();
+    const submitted = draftNames.map(name => [name, this._draftVersions.get(name)]);
     this._busy = true;
     const generation = this._generation;
     const entryId = this._entryId;
     this._message = "Working…";
-    this._render();
     try {
+      this._render();
       const request = { ...payload, action, entry_id: entryId };
       if (new TextEncoder().encode(JSON.stringify(request)).length > MAX_IMPORT_BYTES) throw new Error("The JSON request including metadata exceeds 2 MiB. Use a smaller recording or settings document.");
       const result = await this._hass.callApi("POST", "bermuda/toolkit", request);
       if (generation !== this._generation || !this._connected) return;
+      this._rememberDrafts();
+      for (const [name, version] of submitted) {
+        if (this._draftVersions.get(name) === version) {
+          this._drafts.delete(name);
+          this._draftVersions.delete(name);
+        }
+      }
+      if (result?.options && this._state) this._state = { ...this._state, options: result.options };
+      if (action === "profile" && result?.profile && this._state) {
+        const key = `${payload.kind}_profiles`;
+        const options = this._options();
+        this._state = { ...this._state, options: { ...options, [key]: { ...options[key], [payload.id]: result.profile } } };
+      }
       this._invalidateResults(action);
       this._results[action] = result;
       if (action === "calibration_preview") this._captureNeedsPreview = false;
@@ -183,8 +205,8 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (this._busy || this._fileBusy) return;
     this._fileBusy = true;
     const generation = this._generation;
-    this._render();
     try {
+      this._render();
       const data = await readJSONFile(file);
       if (generation === this._generation && this._connected) await this._perform("history_import", { data });
     } catch (error) {
@@ -209,7 +231,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       await navigator.clipboard.writeText(compact ? JSON.stringify(data) : pretty(data));
       this._message = "Copied JSON to clipboard.";
     } catch {
-      this._message = "Clipboard is unavailable. Select and copy the displayed JSON.";
+      this._message = compact ? "Clipboard is unavailable. Use Export JSON to save the recording." : "Clipboard is unavailable. Select and copy the displayed diagnostics JSON in Health.";
     }
     this._render();
   }
@@ -217,18 +239,58 @@ export class BermudaToolkitPanel extends HTMLElement {
   _rememberDrafts() {
     if (!this._content) return;
     for (const input of this._content.querySelectorAll("[data-draft]")) {
-      this._drafts.set(input.dataset.draft, input.type === "checkbox" ? input.checked : input.value);
+      if (this._drafts.has(input.dataset.draft) && this._drafts.get(input.dataset.draft) !== this._draftValue(input)) this._markDraft(input);
     }
+  }
+
+  _draftValue(input) { return input.type === "checkbox" ? input.checked : input.value; }
+
+  _markDraft(input) {
+    const name = input.dataset.draft;
+    if (!name || input.type === "file") return;
+    const value = this._draftValue(input);
+    this._draftVersions.set(name, ++this._draftRevision);
+    if (value === this._fieldDefaults.get(name)) this._drafts.delete(name);
+    else this._drafts.set(name, value);
+  }
+
+  _trackDraft(input, value) {
+    this._fieldDefaults.set(input.dataset.draft, value);
+    const generation = this._generation;
+    const remember = () => { if (generation === this._generation) this._markDraft(input); };
+    input.addEventListener("input", remember);
+    input.addEventListener("change", remember);
+  }
+
+  _resetField(input, value) {
+    this._drafts.delete(input.dataset.draft);
+    this._draftVersions.delete(input.dataset.draft);
+    if (input.type === "checkbox") input.checked = Boolean(value);
+    else input.value = String(value ?? "");
+    this._fieldDefaults.set(input.dataset.draft, this._draftValue(input));
+  }
+
+  _saveSettings(settings, inputs) {
+    if (!Object.keys(settings).length) {
+      this._message = "No unsaved settings changes.";
+      this._render();
+      return;
+    }
+    return this._perform("settings", { settings }, { draftNames: inputs.map(input => input.dataset.draft) });
   }
 
   _field(parent, label, name, value = "", options = {}) {
     const wrapper = node("label", undefined, { class: "field" });
     wrapper.append(node("span", label));
     const input = node(options.multiline ? "textarea" : "input");
-    input.type = options.type || "text";
-    input.dataset.draft = name;
-    if (input.type === "checkbox") input.checked = this._drafts.has(name) ? this._drafts.get(name) : Boolean(value);
-    else input.value = this._drafts.has(name) ? this._drafts.get(name) : String(value ?? "");
+    if (!options.multiline) input.type = options.type || "text";
+    if (input.type !== "file") {
+      input.dataset.draft = name;
+      const defaultValue = input.type === "checkbox" ? Boolean(value) : String(value ?? "");
+      if (input.type === "checkbox") input.checked = this._drafts.has(name) ? this._drafts.get(name) : defaultValue;
+      else input.value = this._drafts.has(name) ? this._drafts.get(name) : defaultValue;
+      this._trackDraft(input, defaultValue);
+    }
     if (options.min !== undefined) input.min = String(options.min);
     if (options.max !== undefined) input.max = String(options.max);
     if (options.step !== undefined) input.step = String(options.step);
@@ -247,6 +309,8 @@ export class BermudaToolkitPanel extends HTMLElement {
     for (const [id, text] of choices) select.append(node("option", text, { value: id }));
     const saved = this._drafts.has(name) ? this._drafts.get(name) : value;
     if (choices.some(([id]) => id === saved)) select.value = saved;
+    const defaultValue = choices.some(([id]) => id === value) ? value : choices[0]?.[0] || "";
+    this._trackDraft(select, defaultValue);
     wrapper.append(select);
     parent.append(wrapper);
     return select;
@@ -286,6 +350,7 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _render() {
     this._rememberDrafts();
+    this._fieldDefaults.clear();
     this.shadowRoot.replaceChildren();
     const style = node("style", `
       :host{display:block;padding:20px;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family, sans-serif)}
@@ -336,17 +401,22 @@ export class BermudaToolkitPanel extends HTMLElement {
     const area = this._field(general, "Enable fingerprint area selection", "fingerprint-area", options.fingerprint_area_selection, { type: "checkbox" });
     const reliability = this._field(general, "Enable reliability weighting", "reliability", options.reliability_weighting, { type: "checkbox" });
     const window = this._field(general, "History window (seconds)", "window", options.history_window_s ?? 3600, { type: "number", min: 60, max: 86400 });
-    this._button(general, "Save runtime settings", () => this._perform("settings", { settings: { auto_calibration: auto.checked, fingerprint_area_selection: area.checked, reliability_weighting: reliability.checked, history_window_s: finiteInput(window, { min: 60, max: 86400 }) } }));
+    this._button(general, "Save runtime settings", () => {
+      const controls = [["auto_calibration", auto], ["fingerprint_area_selection", area], ["reliability_weighting", reliability], ["history_window_s", window]];
+      const edited = controls.filter(([, input]) => this._drafts.has(input.dataset.draft));
+      const settings = Object.fromEntries(edited.map(([key, input]) => [key, input.type === "checkbox" ? input.checked : finiteInput(input, { min: 60, max: 86400 })]));
+      return this._saveSettings(settings, edited.map(([, input]) => input));
+    });
     const receiver = this._section(parent, "Receiver maximum distance", "A value of 0 follows Bermuda’s existing global maximum distance.");
     const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
     const limit = this._field(receiver, "Maximum distance (m)", "limit", options.receiver_limits?.[scanner.value] ?? 0, { type: "number", min: 0, max: 1000, step: .1 });
-    scanner.addEventListener("change", () => { limit.value = options.receiver_limits?.[scanner.value] ?? 0; });
-    this._button(receiver, "Save receiver limit", () => this._perform("settings", { settings: { receiver_limits: { ...options.receiver_limits, [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } }), { disabled: !this._scanners().length });
+    scanner.addEventListener("change", () => { this._resetField(limit, this._options().receiver_limits?.[scanner.value] ?? 0); });
+    this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { ...this._options().receiver_limits, [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit]), { disabled: !this._scanners().length });
     const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
     const device = this._select(filters, "Device", "filter-device", this._devices());
     const mode = this._select(filters, "Filter", "filter-mode", ["legacy", "pet", "stationary"].map(x => [x, x]), options.filters?.[device.value] || "legacy");
-    device.addEventListener("change", () => { mode.value = options.filters?.[device.value] || "legacy"; });
-    this._button(filters, "Save filter mode", () => this._perform("settings", { settings: { filters: { ...options.filters, [device.value]: mode.value } } }), { disabled: !this._devices().length });
+    device.addEventListener("change", () => { this._resetField(mode, this._options().filters?.[device.value] || "legacy"); });
+    this._button(filters, "Save filter mode", () => this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { ...this._options().filters, [device.value]: mode.value } } : {}, [mode]), { disabled: !this._devices().length });
     const profiles = this._section(parent, "Hardware and radio profile", "Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance. Leave a numeric field empty to inherit the existing model.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
@@ -361,9 +431,9 @@ export class BermudaToolkitPanel extends HTMLElement {
     const configureKind = () => { profileInputs.rssi_offset.disabled = kind.value !== "receiver"; verified.disabled = kind.value !== "beacon"; };
     configureKind();
     const loadProfile = () => {
-      const existing = options[`${kind.value}_profiles`]?.[target.value] || {};
-      for (const [key, input] of Object.entries(profileInputs)) input.value = existing[key] ?? "";
-      verified.checked = Boolean(existing.reference_power_verified);
+      const existing = this._options()[`${kind.value}_profiles`]?.[target.value] || {};
+      for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
+      this._resetField(verified, existing.reference_power_verified);
       configureKind();
     };
     target.addEventListener("change", loadProfile);
@@ -376,19 +446,23 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (!target.value) throw new Error("Choose a profile target.");
       const profile = {};
       const remove = [];
+      const edited = [];
       for (const [key, input] of Object.entries(profileInputs)) {
-        if (!input.disabled && input.value.trim()) profile[key] = input.type === "number" ? finiteInput(input) : input.value;
-        else if (!input.disabled) remove.push(key);
+        if (input.disabled || !this._drafts.has(input.dataset.draft)) continue;
+        edited.push(input);
+        if (input.value.trim()) profile[key] = input.type === "number" ? finiteInput(input) : input.value;
+        else remove.push(key);
       }
-      if (!verified.disabled) profile.reference_power_verified = verified.checked;
-      return this._perform("profile", { kind: kind.value, id: target.value, profile, remove });
+      if (!verified.disabled && this._drafts.has(verified.dataset.draft)) { profile.reference_power_verified = verified.checked; edited.push(verified); }
+      if (!edited.length) { this._message = "No unsaved profile changes."; this._render(); return; }
+      return this._perform("profile", { kind: kind.value, id: target.value, profile, remove }, { draftNames: edited.map(input => input.dataset.draft) });
     });
     const fixed = this._section(parent, "Fixed reference labels", "Only permanently fixed beacons belong here. Saving explicitly labels future samples. Use measured slant ranges and an independent location label. Use {} to remove fixed references.");
     const referenceJSON = this._field(fixed, "Fixed reference map (JSON)", "fixed-references", pretty(options.fixed_references || {}), { multiline: true });
-    this._button(fixed, "Save fixed references", () => this._perform("settings", { settings: { fixed_references: JSON.parse(referenceJSON.value) } }));
+    this._button(fixed, "Save fixed references", () => this._saveSettings(this._drafts.has(referenceJSON.dataset.draft) ? { fixed_references: JSON.parse(referenceJSON.value) } : {}, [referenceJSON]));
     const binding = this._section(parent, "Explicit scanner bindings", 'Bind an opaque Bluetooth source to its Home Assistant device registry ID using {"source-id":{"device_registry_id":"registry-id"}}. Friendly names are not identity.');
     const bindingJSON = this._field(binding, "Source → binding object map (JSON)", "scanner-bindings", pretty(options.scanner_bindings || {}), { multiline: true });
-    this._button(binding, "Save scanner bindings", () => this._perform("settings", { settings: { scanner_bindings: JSON.parse(bindingJSON.value) } }));
+    this._button(binding, "Save scanner bindings", () => this._saveSettings(this._drafts.has(bindingJSON.dataset.draft) ? { scanner_bindings: JSON.parse(bindingJSON.value) } : {}, [bindingJSON]));
   }
 
   _calibration(parent) {

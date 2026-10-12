@@ -1,6 +1,5 @@
 /** Behavioral tests for the production web component, using a small native DOM double. */
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 class Element {
@@ -10,7 +9,7 @@ class Element {
     this.dataset = {};
     this.attributes = {};
     this.listeners = {};
-    this.type = "text";
+    this._type = "text";
     this.checked = false;
   }
   attachShadow() { this.shadowRoot = new Element("shadow"); return this.shadowRoot; }
@@ -19,8 +18,18 @@ class Element {
   remove() { this.parent.children = this.parent.children.filter(child => child !== this); }
   set textContent(value) { this._text = value; this.children = []; }
   get textContent() { return String(this._text || "") + this.children.map(child => child.textContent).join(""); }
-  set value(value) { this._value = String(value); }
+  set type(value) {
+    if (this.tagName === "textarea" || this.tagName === "select") throw new TypeError("Native control type is read-only");
+    this._type = String(value);
+  }
+  get type() { return this.tagName === "textarea" ? "textarea" : this.tagName === "select" ? "select-one" : this._type; }
+  set value(value) {
+    if (this.type === "file" && String(value) !== "") throw new DOMException("A file input may only be reset to an empty string", "InvalidStateError");
+    this._value = String(value);
+    if (this.type === "file") this.files = [];
+  }
   get value() {
+    if (this.type === "file" && this.files?.length) return `C:\\fakepath\\${this.files[0].name || "synthetic-recording.json"}`;
     if (this.tagName === "select") return this.children.some(child => child.value === this._value) ? this._value : this.children[0]?.value || "";
     return this._value ?? this.attributes.value ?? "";
   }
@@ -38,8 +47,7 @@ class Element {
 globalThis.HTMLElement = Element;
 globalThis.document = { createElement: tag => new Element(tag) };
 globalThis.customElements = { definitions: new Map(), get(name) { return this.definitions.get(name); }, define(name, value) { this.definitions.set(name, value); } };
-const source = await readFile(new URL("../../custom_components/bermuda/frontend/toolkit.js", import.meta.url), "utf8");
-const { BermudaToolkitPanel, finiteInput, readJSONFile } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { BermudaToolkitPanel, finiteInput, readJSONFile } = await import(new URL("../../custom_components/bermuda/frontend/toolkit.js", import.meta.url));
 
 const state = () => ({
   options: { auto_calibration: false, receiver_limits: { receiver1: 0 }, filters: {} },
@@ -50,7 +58,7 @@ const state = () => ({
   areas: [{ area_id: "room1", name: "Known room" }],
 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
+function deferred() { let resolve, reject; const promise = new Promise((done, failed) => { resolve = done; reject = failed; }); return { promise, resolve, reject }; }
 function panel(callApi = async () => state()) {
   const result = new BermudaToolkitPanel();
   result._connected = true;
@@ -60,6 +68,14 @@ function panel(callApi = async () => state()) {
 }
 const button = (component, label) => component.shadowRoot.all().find(element => element.tagName === "button" && element.textContent === label);
 const field = (component, label) => component.shadowRoot.all().find(element => element.tagName === "label" && element.children[0]?.textContent === label)?.children[1];
+async function edit(component, label, value, event = "input") {
+  const input = field(component, label);
+  assert.ok(input, `field ${label} exists`);
+  if (input.type === "checkbox") input.checked = Boolean(value);
+  else input.value = String(value);
+  await input.dispatch(event);
+  return input;
+}
 
 test("numbers preserve blank optional ranges and reject nonfinite/out-of-bound input", () => {
   assert.equal(finiteInput({ value: "" }, { optional: true }), undefined);
@@ -157,11 +173,11 @@ test("capture validates independent truth and sends measured ranges through the 
   await button(component, "Capture labelled readings").click();
   assert.equal(calls.length, 0);
   assert.match(component._message, /location label/);
-  field(component, "Independent location label").value = "Measured spot A";
-  field(component, "Measured slant range to Receiver one (receiver1) (m)").value = "-2";
+  await edit(component, "Independent location label", "Measured spot A");
+  await edit(component, "Measured slant range to Receiver one (receiver1) (m)", "-2");
   await button(component, "Capture labelled readings").click();
   assert.equal(calls.length, 0);
-  field(component, "Measured slant range to Receiver one (receiver1) (m)").value = "2.25";
+  await edit(component, "Measured slant range to Receiver one (receiver1) (m)", "2.25");
   await button(component, "Capture labelled readings").click();
   assert.deepEqual(calls[0], {
     action: "capture", entry_id: "entry1", device_id: "device1", location_id: "Measured spot A", ranges: { receiver1: 2.25 }, accuracy_m: .1,
@@ -187,7 +203,7 @@ test("failed preview preserves previous result and unsaved measured range draft"
   component._activeTab = 1;
   component._results.calibration_preview = { accepted: false, reason: "Prior result" };
   component._render();
-  field(component, "Measured slant range to Receiver one (receiver1) (m)").value = "4.2";
+  await edit(component, "Measured slant range to Receiver one (receiver1) (m)", "4.2");
   await button(component, "Preview calibration").click();
   assert.equal(component._results.calibration_preview.reason, "Prior result");
   assert.equal(field(component, "Measured slant range to Receiver one (receiver1) (m)").value, "4.2");
@@ -215,21 +231,21 @@ test("runtime settings and receiver limits send their values through native cont
   const component = panel(async (method, path, payload) => { if (method === "POST") calls.push(payload); return state(); });
   component._entryId = "entry1";
   component._render();
-  field(component, "Enable automatic calibration").checked = true;
-  field(component, "Enable reliability weighting").checked = true;
-  field(component, "History window (seconds)").value = "1800";
+  await edit(component, "Enable automatic calibration", true);
+  await edit(component, "Enable reliability weighting", true);
+  await edit(component, "History window (seconds)", "1800");
   await button(component, "Save runtime settings").click();
-  assert.deepEqual(calls[0].settings, { auto_calibration: true, fingerprint_area_selection: false, reliability_weighting: true, history_window_s: 1800 });
-  field(component, "Maximum distance (m)").value = "0";
+  assert.deepEqual(calls[0].settings, { auto_calibration: true, reliability_weighting: true, history_window_s: 1800 });
+  await edit(component, "Maximum distance (m)", "5");
   await button(component, "Save receiver limit").click();
-  assert.deepEqual(calls[1].settings, { receiver_limits: { receiver1: 0 } });
-  field(component, "Filter").value = "pet";
+  assert.deepEqual(calls[1].settings, { receiver_limits: { receiver1: 5 } });
+  await edit(component, "Filter", "pet", "change");
   await button(component, "Save filter mode").click();
   assert.deepEqual(calls[2].settings, { filters: { device1: "pet" } });
-  field(component, "Fixed reference map (JSON)").value = '{"device1":{"location_id":"reference","ranges":{"receiver1":3},"accuracy_m":0.1}}';
+  await edit(component, "Fixed reference map (JSON)", '{"device1":{"location_id":"reference","ranges":{"receiver1":3},"accuracy_m":0.1}}');
   await button(component, "Save fixed references").click();
   assert.equal(calls[3].settings.fixed_references.device1.ranges.receiver1, 3);
-  field(component, "Source → binding object map (JSON)").value = '{"receiver1":{"device_registry_id":"registry1"}}';
+  await edit(component, "Source → binding object map (JSON)", '{"receiver1":{"device_registry_id":"registry1"}}');
   await button(component, "Save scanner bindings").click();
   assert.deepEqual(calls[4].settings.scanner_bindings, { receiver1: { device_registry_id: "registry1" } });
 });
@@ -378,9 +394,9 @@ test("profile targets load their own drafts and beacon verification sends correc
   kind.value = "beacon";
   await kind.dispatch("change");
   assert.equal(field(component, "Receiver RSSI offset (dB)").disabled, true);
-  field(component, "model").value = "Synthetic measured beacon";
-  field(component, "Reference power at 1 m (dBm)").value = "-59";
-  field(component, "Reference power independently verified").checked = true;
+  await edit(component, "model", "Synthetic measured beacon");
+  await edit(component, "Reference power at 1 m (dBm)", "-59");
+  await edit(component, "Reference power independently verified", true);
   await button(component, "Save profile").click();
   assert.equal(calls[0].kind, "beacon");
   assert.equal(calls[0].id, "device1");
@@ -388,7 +404,7 @@ test("profile targets load their own drafts and beacon verification sends correc
   assert.equal(calls[0].profile.reference_power, -59);
   assert.equal(calls[0].profile.reference_power_verified, true);
   assert.equal("rssi_offset" in calls[0].profile, false);
-  assert.equal(calls[0].remove.includes("attenuation"), true);
+  assert.equal(calls[0].remove.includes("attenuation"), false);
   assert.equal(calls[0].remove.includes("reference_power"), false);
   assert.equal(calls[0].remove.includes("rssi_offset"), false);
 });
@@ -457,4 +473,191 @@ test("new measured captures gate a previous proposal until another preview compl
   assert.equal(button(component, "Apply accepted proposal").disabled, true);
   await button(component, "Preview calibration").click();
   assert.equal(button(component, "Apply accepted proposal").disabled, false);
+});
+
+test("native textarea and selected-file restrictions hold across all tabs and import renders", async () => {
+  assert.throws(() => { new Element("textarea").type = "text"; }, TypeError);
+  const nativeFile = new Element("input"); nativeFile.type = "file";
+  assert.throws(() => { nativeFile.value = "C:\\fakepath\\recording.json"; }, { name: "InvalidStateError" });
+  const calls = [];
+  const component = panel(async (method, path, payload) => { if (method === "POST") calls.push(payload); return state(); });
+  for (let tab = 0; tab < 5; tab += 1) { component._activeTab = tab; assert.doesNotThrow(() => component._render()); }
+  component._activeTab = 2; component._render();
+  let file = field(component, "Import recording JSON (maximum 2 MiB)");
+  file.files = [{ name: "recording.json", size: 2, text: async () => "{}" }];
+  assert.match(file.value, /fakepath/);
+  await component.refresh();
+  assert.equal(component._drafts.has("history-file"), false);
+  file = field(component, "Import recording JSON (maximum 2 MiB)");
+  file.files = [{ name: "recording.json", size: 2, text: async () => "{}" }];
+  await button(component, "Import recording").click();
+  assert.equal(calls.at(-1).action, "history_import");
+  assert.equal(component._fileBusy, false);
+  file = field(component, "Import recording JSON (maximum 2 MiB)");
+  file.files = [{ name: "broken.json", size: 1, text: async () => "{" }];
+  await button(component, "Import recording").click();
+  assert.equal(component._fileBusy, false);
+  assert.equal(calls.length, 1);
+});
+
+test("untouched controls reflect new server radio, automatic setting and history window", async () => {
+  const server = state(); server.options.receiver_profiles = { receiver1: { rssi_offset: 1 } };
+  const component = panel(async () => structuredClone(server));
+  component._state = structuredClone(server); component._render();
+  assert.equal(component._drafts.size, 0);
+  server.options.receiver_profiles.receiver1.rssi_offset = 5;
+  server.options.auto_calibration = true;
+  server.options.history_window_s = 7200;
+  await component.refresh();
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
+  assert.equal(field(component, "Enable automatic calibration").checked, true);
+  assert.equal(field(component, "History window (seconds)").value, "7200");
+  assert.equal(component._drafts.size, 0);
+});
+
+test("metadata and runtime saves send only edited fields and preserve concurrent radio and auto changes", async () => {
+  const server = state(); server.options.receiver_profiles = { receiver1: { rssi_offset: 1, model: "original" } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload);
+    if (payload.action === "profile") {
+      const profile = { ...server.options.receiver_profiles.receiver1, ...payload.profile };
+      for (const key of payload.remove) delete profile[key];
+      server.options.receiver_profiles.receiver1 = profile;
+      return { profile: structuredClone(profile) };
+    }
+    server.options = { ...server.options, ...payload.settings };
+    return { options: structuredClone(server.options) };
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "model", "submitted metadata");
+  server.options.receiver_profiles.receiver1.rssi_offset = 5;
+  server.options.auto_calibration = true;
+  await button(component, "Save profile").click();
+  assert.deepEqual(calls[0].profile, { model: "submitted metadata" });
+  assert.deepEqual(calls[0].remove, []);
+  assert.equal(server.options.receiver_profiles.receiver1.rssi_offset, 5);
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
+  assert.equal(field(component, "Enable automatic calibration").checked, true);
+  assert.equal(component._drafts.has("profile-model"), false);
+  server.options.receiver_profiles.receiver1.model = "external metadata";
+  await component.refresh();
+  assert.equal(field(component, "model").value, "external metadata");
+  await edit(component, "History window (seconds)", "1800");
+  server.options.auto_calibration = false;
+  await button(component, "Save runtime settings").click();
+  assert.deepEqual(calls[1].settings, { history_window_s: 1800 });
+  assert.equal(server.options.auto_calibration, false);
+});
+
+test("failed saves preserve deliberately edited fields through refresh and tab changes", async () => {
+  const server = state(); server.options.receiver_profiles = { receiver1: { rssi_offset: 1, model: "original" } };
+  const component = panel(async method => { if (method === "POST") throw { body: { message: "Synthetic save failed" } }; return structuredClone(server); });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "model", "unsaved metadata");
+  await button(component, "Save profile").click();
+  assert.equal(field(component, "model").value, "unsaved metadata");
+  component._activeTab = 4; component._render();
+  server.options.receiver_profiles.receiver1 = { model: "external metadata", rssi_offset: 8 };
+  await component.refresh();
+  component._activeTab = 0; component._render();
+  assert.equal(field(component, "model").value, "unsaved metadata");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "8");
+  await edit(component, "Enable automatic calibration", true);
+  await button(component, "Save runtime settings").click();
+  await component.refresh();
+  assert.equal(field(component, "Enable automatic calibration").checked, true);
+  assert.equal(component._message, "Synthetic save failed");
+});
+
+test("newer edits during a save survive its acknowledgement and old target replies cannot clear new drafts", async () => {
+  const pending = deferred(); const server = state(); server.options.receiver_profiles = { receiver1: { model: "original", rssi_offset: 1 } };
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    await pending.promise;
+    const profile = { ...server.options.receiver_profiles.receiver1, ...payload.profile };
+    server.options.receiver_profiles.receiver1 = profile;
+    return { profile };
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "model", "first submission");
+  const saving = button(component, "Save profile").click();
+  await edit(component, "model", "newer unsaved metadata");
+  server.options.receiver_profiles.receiver1.rssi_offset = 9;
+  pending.resolve(); await saving;
+  assert.equal(field(component, "model").value, "newer unsaved metadata");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "9");
+  assert.equal(component._drafts.has("profile-model"), true);
+  const oldReply = deferred();
+  component._hass.callApi = async method => method === "GET" ? state() : oldReply.promise;
+  const oldSaving = button(component, "Save profile").click();
+  component.panel = { config: { entry_id: "new-entry" } };
+  await component.refresh();
+  await edit(component, "model", "new entry draft");
+  oldReply.resolve({ profile: { model: "old entry acknowledgement" } }); await oldSaving;
+  assert.equal(field(component, "model").value, "new entry draft");
+  assert.equal(component._drafts.get("profile-model"), "new entry draft");
+});
+
+test("explicitly clearing an edited override removes only that field", async () => {
+  const server = state(); server.options.receiver_profiles = { receiver1: { attenuation: 2.5, rssi_offset: 7 } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => { if (method === "POST") calls.push(payload); return structuredClone(server); });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Path-loss exponent", "");
+  await button(component, "Save profile").click();
+  assert.deepEqual(calls[0].profile, {});
+  assert.deepEqual(calls[0].remove, ["attenuation"]);
+  assert.equal("rssi_offset" in calls[0].profile, false);
+  assert.equal(component._drafts.has("profile-attenuation"), false);
+});
+
+test("successful acknowledgement survives a failed refresh and a failed POST preserves newer edits", async () => {
+  const component = panel(async method => {
+    if (method === "GET") throw { body: { message: "Synthetic refresh failure" } };
+    return { profile: { model: "saved metadata", rssi_offset: 5 } };
+  });
+  component._render();
+  await edit(component, "model", "saved metadata");
+  await button(component, "Save profile").click();
+  assert.equal(field(component, "model").value, "saved metadata");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
+  assert.equal(component._drafts.has("profile-model"), false);
+  const pending = deferred();
+  component._hass.callApi = async method => method === "POST" ? pending.promise : state();
+  await edit(component, "model", "submitted edit");
+  const saving = button(component, "Save profile").click();
+  await edit(component, "model", "newer edit during failed save");
+  pending.reject({ body: { message: "Synthetic POST failure" } }); await saving;
+  assert.equal(field(component, "model").value, "newer edit during failed save");
+  assert.equal(component._drafts.get("profile-model"), "newer edit during failed save");
+  assert.equal(component._message, "Synthetic POST failure");
+});
+
+test("stale control events cannot create drafts after an entry or role change", async () => {
+  const component = panel(); component._render();
+  const priorInput = field(component, "model");
+  component.panel = { config: { entry_id: "new-entry" } }; await component.refresh();
+  priorInput.value = "old entry edit"; await priorInput.dispatch("input");
+  assert.equal(component._drafts.has("profile-model"), false);
+  const newInput = field(component, "model");
+  component._hass.user = { id: "admin", is_admin: true };
+  component.hass = { user: { id: "guest", is_admin: false }, callApi: component._hass.callApi };
+  newInput.value = "old role edit"; await newInput.dispatch("change");
+  assert.equal(component._drafts.size, 0);
+});
+
+test("clipboard denial directs recording users to export and diagnostics users to visible Health JSON", async t => {
+  const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new DOMException("Denied", "NotAllowedError"); } } });
+  t.after(() => { if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor); else delete navigator.clipboard; });
+  const component = panel(); component._activeTab = 2; component._render();
+  await component._copy({ frames: [] }, { compact: true });
+  assert.match(component._message, /Use Export JSON/);
+  assert.ok(button(component, "Export JSON"));
+  component._activeTab = 4; component._results.diagnostics = { quality: "synthetic" }; component._render();
+  await component._copy(component._results.diagnostics);
+  assert.match(component._message, /diagnostics JSON in Health/);
+  assert.match(component.shadowRoot.textContent, /synthetic/);
 });
