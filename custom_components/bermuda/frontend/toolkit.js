@@ -18,6 +18,14 @@ function pretty(value) {
   return JSON.stringify(value === undefined ? null : value, null, 2);
 }
 
+export function receiverValue(values, scannerId, fallback) {
+  if (!values || typeof values !== "object" || typeof scannerId !== "string") return fallback;
+  if (Object.prototype.hasOwnProperty.call(values, scannerId)) return values[scannerId];
+  if (!/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(scannerId)) return fallback;
+  const matches = Object.keys(values).filter(key => key.toLowerCase() === scannerId.toLowerCase());
+  return matches.length === 1 ? values[matches[0]] : fallback;
+}
+
 export function finiteInput(input, { min = -Infinity, max = Infinity, optional = false } = {}) {
   if (input.value.trim() === "") {
     if (optional) return undefined;
@@ -48,7 +56,6 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._generation = 0;
     this._drafts = new Map();
     this._draftVersions = new Map();
-    this._fieldDefaults = new Map();
     this._draftRevision = 0;
     this._results = {};
     this._captureNeedsPreview = false;
@@ -68,7 +75,6 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._content = null;
       this._drafts.clear();
       this._draftVersions.clear();
-      this._fieldDefaults.clear();
       this._results = {};
       this._captureNeedsPreview = false;
       this._message = denied ? "Administrator access is required." : "";
@@ -89,7 +95,6 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._content = null;
       this._drafts.clear();
       this._draftVersions.clear();
-      this._fieldDefaults.clear();
       this._results = {};
       this._message = "";
       this._captureNeedsPreview = false;
@@ -176,6 +181,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (action === "calibration_preview") this._captureNeedsPreview = false;
       const pending = result?.eligible === false || result?.accepted === false || result?.status === "pending" || result?.state === "absent";
       this._message = pending ? `${action.replaceAll("_", " ")} needs more evidence; see results and rejection reasons.` : `${action.replaceAll("_", " ")} completed.`;
+      if (submitted.some(([name]) => this._drafts.has(name))) this._message += " Newer edits remain unsaved.";
       if (download) this._download(result, "bermuda-history.json");
       await this.refresh();
       return result;
@@ -250,12 +256,10 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (!name || input.type === "file") return;
     const value = this._draftValue(input);
     this._draftVersions.set(name, ++this._draftRevision);
-    if (value === this._fieldDefaults.get(name)) this._drafts.delete(name);
-    else this._drafts.set(name, value);
+    this._drafts.set(name, value);
   }
 
-  _trackDraft(input, value) {
-    this._fieldDefaults.set(input.dataset.draft, value);
+  _trackDraft(input) {
     const generation = this._generation;
     const remember = () => { if (generation === this._generation) this._markDraft(input); };
     input.addEventListener("input", remember);
@@ -267,7 +271,6 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._draftVersions.delete(input.dataset.draft);
     if (input.type === "checkbox") input.checked = Boolean(value);
     else input.value = String(value ?? "");
-    this._fieldDefaults.set(input.dataset.draft, this._draftValue(input));
   }
 
   _saveSettings(settings, inputs, { patchMaps = false } = {}) {
@@ -289,7 +292,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       const defaultValue = input.type === "checkbox" ? Boolean(value) : String(value ?? "");
       if (input.type === "checkbox") input.checked = this._drafts.has(name) ? this._drafts.get(name) : defaultValue;
       else input.value = this._drafts.has(name) ? this._drafts.get(name) : defaultValue;
-      this._trackDraft(input, defaultValue);
+      this._trackDraft(input);
     }
     if (options.min !== undefined) input.min = String(options.min);
     if (options.max !== undefined) input.max = String(options.max);
@@ -309,8 +312,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     for (const [id, text] of choices) select.append(node("option", text, { value: id }));
     const saved = this._drafts.has(name) ? this._drafts.get(name) : value;
     if (choices.some(([id]) => id === saved)) select.value = saved;
-    const defaultValue = choices.some(([id]) => id === value) ? value : choices[0]?.[0] || "";
-    this._trackDraft(select, defaultValue);
+    this._trackDraft(select);
     wrapper.append(select);
     parent.append(wrapper);
     return select;
@@ -344,13 +346,17 @@ export class BermudaToolkitPanel extends HTMLElement {
   }
 
   _options() { return this._state?.options || this._state?.settings || this._state?.measurement_toolkit || {}; }
+  _profile(kind, id) {
+    const profiles = this._options()[`${kind}_profiles`] || {};
+    if (kind === "receiver") return receiverValue(profiles, id, {});
+    return Object.prototype.hasOwnProperty.call(profiles, id) ? profiles[id] : {};
+  }
   _snapshot() { return this._state?.snapshot || this._state?.advert_snapshot || this._state || {}; }
   _devices() { return rows(this._snapshot().devices).map(d => [d.device_id || d.id || d.address, `${d.name || d.id || d.address} (${d.device_id || d.id || d.address})`]); }
   _scanners() { return rows(this._snapshot().scanners).map(s => [s.scanner_id || s.id || s.address, `${s.name || s.id || s.address} (${s.scanner_id || s.id || s.address})`]); }
 
   _render() {
     this._rememberDrafts();
-    this._fieldDefaults.clear();
     this.shadowRoot.replaceChildren();
     const style = node("style", `
       :host{display:block;padding:20px;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family, sans-serif)}
@@ -409,8 +415,8 @@ export class BermudaToolkitPanel extends HTMLElement {
     });
     const receiver = this._section(parent, "Receiver maximum distance", "A value of 0 follows Bermuda’s existing global maximum distance.");
     const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
-    const limit = this._field(receiver, "Maximum distance (m)", "limit", options.receiver_limits?.[scanner.value] ?? 0, { type: "number", min: 0, max: 1000, step: .1 });
-    scanner.addEventListener("change", () => { this._resetField(limit, this._options().receiver_limits?.[scanner.value] ?? 0); });
+    const limit = this._field(receiver, "Maximum distance (m)", "limit", receiverValue(options.receiver_limits, scanner.value, 0), { type: "number", min: 0, max: 1000, step: .1 });
+    scanner.addEventListener("change", () => { this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0)); });
     this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true }), { disabled: !this._scanners().length });
     const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
     const device = this._select(filters, "Device", "filter-device", this._devices());
@@ -421,7 +427,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
     const profileInputs = {};
-    const current = options[`${kind.value}_profiles`]?.[target.value] || {};
+    const current = this._profile(kind.value, target.value);
     const numericLabels = { height_m: "Receiver / beacon mounting height (m)", antenna_gain_dbi: "Antenna gain (dBi; metadata)", distance_accuracy_m: "Distance accuracy (m; metadata)", rssi_offset: "Receiver RSSI offset (dB)", reference_power: "Reference power at 1 m (dBm)", attenuation: "Path-loss exponent" };
     for (const key of ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"]) {
       const numeric = ["height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"].includes(key);
@@ -431,7 +437,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     const configureKind = () => { profileInputs.rssi_offset.disabled = kind.value !== "receiver"; verified.disabled = kind.value !== "beacon"; };
     configureKind();
     const loadProfile = () => {
-      const existing = this._options()[`${kind.value}_profiles`]?.[target.value] || {};
+      const existing = this._profile(kind.value, target.value);
       for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
       this._resetField(verified, existing.reference_power_verified);
       configureKind();

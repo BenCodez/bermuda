@@ -26,6 +26,8 @@ MAX_DEVICES = 64
 MAX_LABELS_PER_DEVICE = 32
 MAX_FRAMES_PER_LABEL = 64
 MAX_TOTAL_FRAMES = 1024
+MAX_CLOCKS_PER_DEVICE = MAX_RECEIVERS * MAX_FRAMES_PER_LABEL
+MAX_TOTAL_SOURCE_CLOCKS = MAX_RECEIVERS * MAX_TOTAL_FRAMES
 MAX_STATE_BYTES = 2_000_000
 MAX_SESSION_EPOCH = 1_000_000_000
 MAX_ID_LENGTH = 256
@@ -73,6 +75,9 @@ class FingerprintModel:
     def __init__(self) -> None:
         self._labels: dict[tuple[str, str], list[_Frame]] = {}
         self._session_epoch = 1
+        # Source provenance belongs to a device, not its user label or radio
+        # model. Keep high-water marks even when their training frames expire.
+        self._source_clocks: dict[str, dict[str, float]] = {}
 
     def new_session(self) -> int:
         """
@@ -93,6 +98,7 @@ class FingerprintModel:
             self._session_epoch = len(epochs)
         else:
             self._session_epoch += 1
+        self._source_clocks.clear()
         return self._session_epoch
 
     def _parse_rows(
@@ -184,12 +190,7 @@ class FingerprintModel:
         if budget_reason:
             return {"accepted": False, "ready": False, "reasons": [budget_reason]}
         staged = list(existing)
-        latest_stamps: dict[str, float] = {}
-        for frame in existing:
-            if frame.session_epoch != self._session_epoch:
-                continue
-            for scanner, stamp in frame.stamps.items():
-                latest_stamps[scanner] = max(stamp, latest_stamps.get(scanner, -1.0))
+        latest_stamps = dict(self._source_clocks.get(device_id, {}))
         added = 0
         reasons: list[dict[str, Any]] = []
         for rows in batches:
@@ -218,12 +219,24 @@ class FingerprintModel:
             return {"accepted": False, "ready": False, "reasons": [_reason("model_frame_budget")]}
         if added:
             proposed = {**self._labels, key: staged}
+            proposed_clocks = {**self._source_clocks, device_id: latest_stamps}
             if (
-                len(json.dumps(self._export_labels(proposed, self._session_epoch), allow_nan=False).encode())
+                len(proposed_clocks) > MAX_DEVICES
+                or len(latest_stamps) > MAX_CLOCKS_PER_DEVICE
+                or sum(len(clocks) for clocks in proposed_clocks.values()) > MAX_TOTAL_SOURCE_CLOCKS
+            ):
+                return {"accepted": False, "ready": False, "reasons": [_reason("source_clock_budget")]}
+            if (
+                len(
+                    json.dumps(
+                        self._export_labels(proposed, self._session_epoch, proposed_clocks), allow_nan=False
+                    ).encode()
+                )
                 > MAX_STATE_BYTES
             ):
                 return {"accepted": False, "ready": False, "reasons": [_reason("model_byte_budget")]}
             self._labels = proposed
+            self._source_clocks = proposed_clocks
         template, ready_reasons = self._template(staged)
         return {
             "accepted": added > 0,
@@ -375,7 +388,7 @@ class FingerprintModel:
         return result
 
     def clear(self, device_id: str | None = None, location_id: str | None = None) -> int:
-        """Remove only explicitly selected model keys; no friendly-name inference."""
+        """Remove selected templates, retaining source clocks until a proven new session."""
         if (device_id is not None and not _identifier(device_id)) or (
             location_id is not None and not _identifier(location_id)
         ):
@@ -392,13 +405,16 @@ class FingerprintModel:
 
     def export_state(self) -> dict[str, Any]:
         """Export detached bounded primitive state with explicit label provenance."""
-        return self._export_labels(self._labels, self._session_epoch)
+        return self._export_labels(self._labels, self._session_epoch, self._source_clocks)
 
     @staticmethod
-    def _export_labels(labels: dict[tuple[str, str], list[_Frame]], session_epoch: int) -> dict[str, Any]:
+    def _export_labels(
+        labels: dict[tuple[str, str], list[_Frame]], session_epoch: int, source_clocks: dict[str, dict[str, float]]
+    ) -> dict[str, Any]:
         return {
             "schema_version": 1,
             "active_session_epoch": session_epoch,
+            "source_clocks": {device: dict(sorted(clocks.items())) for device, clocks in sorted(source_clocks.items())},
             "labels": [
                 {
                     "device_id": device,
@@ -440,21 +456,22 @@ class FingerprintModel:
     def import_state(self, state: object) -> dict[str, Any]:
         """Strictly validate bounded exported state before atomically replacing it."""
         try:
-            restored, session_epoch = self._restore(state)
+            restored, session_epoch, source_clocks = self._restore(state)
         except (ValueError, TypeError, OverflowError, RecursionError) as err:
             return {"accepted": False, "reasons": [_reason("invalid_model_state", detail=str(err)[:120])]}
         self._labels = restored
         self._session_epoch = session_epoch
+        self._source_clocks = source_clocks
         return {"accepted": True, "labels": len(restored), "reasons": []}
 
     @staticmethod
-    def _restore(state: object) -> tuple[dict[tuple[str, str], list[_Frame]], int]:
+    def _restore(state: object) -> tuple[dict[tuple[str, str], list[_Frame]], int, dict[str, dict[str, float]]]:
         required = {"schema_version", "labels"}
         if (
             not isinstance(state, dict)
-            or not 2 <= len(state) <= 3
+            or not 2 <= len(state) <= 4
             or not required <= state.keys()
-            or state.keys() - required != ({"active_session_epoch"} if len(state) == 3 else set())
+            or state.keys() - required - {"active_session_epoch", "source_clocks"}
         ):
             msg = "Invalid state schema"
             raise ValueError(msg)
@@ -495,13 +512,59 @@ class FingerprintModel:
         if type(session_epoch) is not int or not newest_epoch <= session_epoch <= MAX_SESSION_EPOCH:
             msg = "Invalid active source-clock session"
             raise ValueError(msg)
+        source_clocks = FingerprintModel._restore_clocks(state.get("source_clocks", {}))
+        # Older schema-1 exports did not retain independent high-water marks.
+        # Recover them from every label, and never let supplied marks regress
+        # behind accepted frames from the active source-clock session.
+        for (device, _location), frames in restored.items():
+            for frame in frames:
+                if frame.session_epoch != session_epoch:
+                    continue
+                clocks = source_clocks.setdefault(device, {})
+                for scanner, stamp in frame.stamps.items():
+                    clocks[scanner] = max(stamp, clocks.get(scanner, -1.0))
+        FingerprintModel._validate_clock_budget(source_clocks)
         if (
-            len(json.dumps(FingerprintModel._export_labels(restored, session_epoch), allow_nan=False).encode())
+            len(
+                json.dumps(
+                    FingerprintModel._export_labels(restored, session_epoch, source_clocks), allow_nan=False
+                ).encode()
+            )
             > MAX_STATE_BYTES
         ):
             msg = "Model byte budget exceeded"
             raise ValueError(msg)
-        return restored, session_epoch
+        return restored, session_epoch, source_clocks
+
+    @staticmethod
+    def _validate_clock_budget(clocks: dict[str, dict[str, float]]) -> None:
+        if (
+            len(clocks) > MAX_DEVICES
+            or any(len(stamps) > MAX_CLOCKS_PER_DEVICE for stamps in clocks.values())
+            or sum(len(stamps) for stamps in clocks.values()) > MAX_TOTAL_SOURCE_CLOCKS
+        ):
+            msg = "Source-clock budget exceeded"
+            raise ValueError(msg)
+
+    @staticmethod
+    def _restore_clocks(clocks: object) -> dict[str, dict[str, float]]:
+        if not isinstance(clocks, dict) or len(clocks) > MAX_DEVICES:
+            msg = "Invalid source-clock device map"
+            raise ValueError(msg)
+        restored: dict[str, dict[str, float]] = {}
+        for device, stamps in clocks.items():
+            if not _identifier(device) or not isinstance(stamps, dict) or not 1 <= len(stamps) <= MAX_CLOCKS_PER_DEVICE:
+                msg = "Invalid source-clock receiver map"
+                raise ValueError(msg)
+            restored[device] = {}
+            for scanner, value in stamps.items():
+                stamp = _number(value, 0.0, 1e12)
+                if not _identifier(scanner) or stamp is None:
+                    msg = "Invalid source clock"
+                    raise ValueError(msg)
+                restored[device][scanner] = stamp
+            FingerprintModel._validate_clock_budget(restored)
+        return restored
 
     @staticmethod
     def _restore_frames(frames: list[dict[str, Any]]) -> list[_Frame]:

@@ -47,7 +47,7 @@ class Element {
 globalThis.HTMLElement = Element;
 globalThis.document = { createElement: tag => new Element(tag) };
 globalThis.customElements = { definitions: new Map(), get(name) { return this.definitions.get(name); }, define(name, value) { this.definitions.set(name, value); } };
-const { BermudaToolkitPanel, finiteInput, readJSONFile } = await import(new URL("../../custom_components/bermuda/frontend/toolkit.js", import.meta.url));
+const { BermudaToolkitPanel, finiteInput, readJSONFile, receiverValue } = await import(new URL("../../custom_components/bermuda/frontend/toolkit.js", import.meta.url));
 
 const state = () => ({
   options: { auto_calibration: false, receiver_limits: { receiver1: 0 }, filters: {} },
@@ -741,4 +741,99 @@ test("map acknowledgements preserve newer target drafts and failed saves keep th
   assert.equal(field(component, "Filter").value, "stationary");
   assert.equal(component._drafts.get("filter-mode"), "stationary");
   assert.equal(component._state.options.filters[deviceB], "stationary");
+});
+
+test("receiver lookup uses own exact keys and only unambiguous MAC case aliases", () => {
+  const mac = "aa:bb:cc:dd:ee:12", upper = mac.toUpperCase(), mixed = "Aa:bB:cC:dD:eE:12";
+  assert.equal(receiverValue({ [upper]: 7 }, mac, 0), 7);
+  assert.equal(receiverValue({ [upper]: 0 }, mac, 9), 0);
+  assert.equal(receiverValue({ [upper]: 7, [mixed]: 8 }, mac, 0), 0);
+  assert.equal(receiverValue({ [mac]: 6, [upper]: 7, [mixed]: 8 }, mac, 0), 6);
+  assert.equal(receiverValue(Object.create({ [mac]: 7, [upper]: 8 }), mac, 0), 0);
+  assert.equal(receiverValue({ Receiver_A: 7 }, "receiver_a", 0), 0);
+  assert.equal(receiverValue({ Receiver_A: 7 }, "Receiver_A", 0), 7);
+  assert.equal(receiverValue({}, "constructor", 0), 0);
+  assert.equal(receiverValue(JSON.parse('{"__proto__":7}'), "__proto__", 0), 7);
+});
+
+test("uppercase receiver profiles and limits populate initial controls, resets, and explicit zero patches", async () => {
+  const { server, receiverA, receiverB } = twoTargetState();
+  const upperA = receiverA.toUpperCase(), upperB = receiverB.toUpperCase();
+  server.options.receiver_profiles = {
+    [upperA]: { rssi_offset: 5, reference_power: -61, model: "Upper A" },
+    [upperB]: { rssi_offset: 6, reference_power: -62, model: "Upper B" },
+  };
+  server.options.receiver_limits = { [upperA]: 7, [upperB]: 9 };
+  const calls = [];
+  const component = panel(async (method, path, payload) => { if (method === "POST") calls.push(payload); return structuredClone(server); });
+  component._state = structuredClone(server); component._render();
+  assert.equal(field(component, "Maximum distance (m)").value, "7");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "-61");
+  await edit(component, "Receiver", receiverB, "change");
+  assert.equal(field(component, "Maximum distance (m)").value, "9");
+  await edit(component, "Profile target", receiverB, "change");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "6");
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "-62");
+  assert.equal(field(component, "model").value, "Upper B");
+  await edit(component, "Receiver", receiverA, "change");
+  await edit(component, "Maximum distance (m)", "0");
+  await button(component, "Save receiver limit").click();
+  assert.deepEqual(calls[0].settings, { receiver_limits: { [receiverA]: 0 } });
+  assert.equal(calls[0].patch_maps, true);
+});
+
+for (const control of [
+  { label: "model", initial: "original", submitted: "submitted metadata", draft: "profile-model", button: "Save profile" },
+  { label: "Enable automatic calibration", initial: false, submitted: true, draft: "auto", button: "Save runtime settings" },
+  { label: "History window (seconds)", initial: "3600", submitted: "1800", draft: "window", button: "Save runtime settings" },
+]) {
+  for (const outcome of ["success", "failed refresh", "failed POST"]) {
+    test(`newer ${control.label} revert survives a pending save with ${outcome}`, async () => {
+      const pending = deferred(); const server = state();
+      server.options.receiver_profiles = { receiver1: { model: "original" } };
+      server.options.history_window_s = 3600;
+      let postSeen = false;
+      const component = panel(async (method, path, payload) => {
+        if (method === "GET") {
+          if (outcome === "failed refresh" && postSeen) throw new Error("Synthetic refresh failure");
+          return structuredClone(server);
+        }
+        postSeen = true; await pending.promise;
+        if (payload.action === "profile") {
+          server.options.receiver_profiles.receiver1 = { ...server.options.receiver_profiles.receiver1, ...payload.profile };
+          return { profile: structuredClone(server.options.receiver_profiles.receiver1) };
+        }
+        return applySettingRequest(server, payload);
+      });
+      component._state = structuredClone(server); component._render();
+      await edit(component, control.label, control.submitted);
+      const saving = button(component, control.button).click();
+      await edit(component, control.label, control.initial);
+      if (outcome === "failed POST") pending.reject(new Error("Synthetic POST failure"));
+      else pending.resolve();
+      await saving;
+      const input = field(component, control.label);
+      assert.equal(input.type === "checkbox" ? input.checked : input.value, control.initial);
+      assert.equal(component._drafts.get(control.draft), control.initial);
+      assert.equal(component._busy, false);
+      if (outcome === "success") assert.match(component._message, /Newer edits remain unsaved/);
+      component._activeTab = 4; component._render(); component._activeTab = 0; component._render();
+      assert.equal(component._drafts.get(control.draft), control.initial);
+    });
+  }
+}
+
+test("new entry reverts remain scoped to the new entry after an old acknowledgement", async () => {
+  const pending = deferred(); const server = state(); server.options.receiver_profiles = { receiver1: { model: "original" } };
+  const component = panel(async method => method === "GET" ? structuredClone(server) : pending.promise);
+  component._state = structuredClone(server); component._render();
+  await edit(component, "model", "old entry submission");
+  const saving = button(component, "Save profile").click();
+  component.panel = { config: { entry_id: "new-entry" } }; await component.refresh();
+  await edit(component, "model", "new entry temporary edit"); await edit(component, "model", "original");
+  pending.resolve({ profile: { model: "old entry acknowledgement" } }); await saving;
+  assert.equal(field(component, "model").value, "original");
+  assert.equal(component._drafts.get("profile-model"), "original");
+  assert.equal(component._entryId, "new-entry");
 });

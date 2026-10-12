@@ -522,14 +522,15 @@ def test_training_frame_window_is_bounded_and_state_byte_limit_is_enforced(monke
     assert model.export_state() == state
 
 
-def test_explicit_clear_scopes_device_and_label_and_resets_stamp_history():
+def test_explicit_clear_scopes_device_and_label_and_preserves_source_history():
     model = FingerprintModel()
     train(model)
     train(model, "area:b", ROOM_B, start=10)
     train(model, device="opaque:other")
     assert model.clear(DEVICE, "area:a") == 1
     assert len(model.summary()) == 2
-    assert train(model)["ready"]
+    assert not train(model)["accepted"]
+    assert train(model, start=20)["ready"]
     assert model.clear(DEVICE) == 2
     assert model.summary()[0]["device_id"] == "opaque:other"
     assert model.clear() == 1

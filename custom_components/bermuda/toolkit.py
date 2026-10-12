@@ -1270,13 +1270,18 @@ class ToolkitManager:
                     raise ValueError(msg)
                 settings = deepcopy(self.settings)
                 profiles = settings[f"{kind}_profiles"]
-                current = {**profiles.get(key, {}), **profile}
+                slot = (
+                    receiver_value({existing: existing for existing in profiles}, key, key)
+                    if kind == "receiver"
+                    else public_device_id(key)
+                )
+                current = {**profiles.get(slot, {}), **profile}
                 for field in remove:
                     current.pop(field, None)
-                profiles[key] = current
+                profiles[slot] = current
                 options = {**deepcopy(dict(self.entry.options)), OPTIONS_KEY: _settings(settings)}
                 await self._persist_options(options)
-                return {"profile": deepcopy(self.settings[f"{kind}_profiles"][key])}
+                return {"profile": deepcopy(self.settings[f"{kind}_profiles"][slot])}
             if action == "capture":
                 return await self._capture(payload)
             if action == "calibration_preview":
