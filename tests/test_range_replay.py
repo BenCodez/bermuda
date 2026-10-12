@@ -38,6 +38,86 @@ def test_range_replay_raw_current_candidate_and_separate_labels():
     assert captured[0]["observations"][0]["rssi"] == -69.5
 
 
+@pytest.mark.parametrize("uppercase_observations", [False, True])
+def test_mac_candidates_match_receiver_and_device_aliases_in_replay_and_shadow(uppercase_observations):
+    scanner, device = "aa:bb:cc:dd:ee:12", "aa:bb:cc:dd:ee:01"
+    observed_scanner = scanner.upper() if uppercase_observations else scanner
+    observed_device = device.upper() if uppercase_observations else device
+    candidate_scanner = scanner if uppercase_observations else scanner.upper()
+    candidate_device = device if uppercase_observations else device.upper()
+    captured = frames(distance=10, expected=1)
+    for frame in captured:
+        frame["observations"][0].update(device_id=observed_device, scanner_id=observed_scanner)
+        frame["truth"][0].update(device_id=observed_device, ranges={observed_scanner: 1})
+    offsets, modes = {candidate_scanner: 20}, {candidate_device: "pet"}
+    original = deepcopy(captured)
+    report = ReplayEngine().evaluate(captured, proposed_offsets=offsets, filter_modes=modes)
+    assert all(row["current"] == 10 and row["candidate"] == pytest.approx(1) for row in report["observations"])
+    assert all(row["candidate_pipeline"] == "replayed_pet_filter" for row in report["observations"])
+    assert report["range_metrics"]["candidate"]["mae_m"] == pytest.approx(0)
+    assert captured == original
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets=offsets, filter_modes=modes)
+    for frame in captured:
+        assert shadow.add_frame(frame) == 1
+    assert shadow.promotion_check(current_model_version="model-1")["eligible"]
+
+
+def test_mac_truth_aliases_label_corresponding_mixed_case_frozen_observations():
+    scanner, device = "aa:bb:cc:dd:ee:12", "aa:bb:cc:dd:ee:01"
+    captured = frames(count=1, distance=10, expected=1)
+    row = captured[0]["observations"][0]
+    row.update(device_id=device.upper(), scanner_id=scanner.upper())
+    captured[0]["observations"].append(
+        {**deepcopy(row), "device_id": device, "scanner_id": scanner, "stamp": row["stamp"] + 1}
+    )
+    captured[0]["truth"][0].update(device_id=device, ranges={scanner: 1})
+    report = ReplayEngine().evaluate(captured, proposed_offsets={scanner: 20})
+    assert report["counts"]["labelled"] == 2
+    assert all(row["expected_distance"] == 1 and row["candidate"] == pytest.approx(1) for row in report["observations"])
+
+
+@pytest.mark.parametrize("field", ["proposed_offsets", "filter_modes"])
+def test_replay_rejects_conflicting_mac_candidate_aliases(field):
+    identifier = "aa:bb:cc:dd:ee:12"
+    first, second = (20, 19) if field == "proposed_offsets" else ("pet", "stationary")
+    with pytest.raises(ValueError, match="conflicting candidate"):
+        ReplayEngine().evaluate(frames(count=1), **{field: {identifier: first, identifier.upper(): second}})
+
+
+def test_opaque_candidate_and_truth_identifiers_keep_exact_case():
+    scanner, device = "receiver:CaseSensitive", "beacon:CaseSensitive"
+    captured = frames(count=1, distance=10, expected=1)
+    row = captured[0]["observations"][0]
+    row.update(device_id=device, scanner_id=scanner)
+    row["quality"]["mode"] = "pet"
+    captured[0]["truth"][0].update(device_id=device, ranges={scanner: 1})
+    report = ReplayEngine().evaluate(
+        captured, proposed_offsets={scanner.lower(): 20}, filter_modes={device.lower(): "legacy"}
+    )
+    assert report["observations"][0]["candidate"] == 10
+    assert report["observations"][0]["candidate_pipeline"] == "preserved_live_filter"
+    captured[0]["observations"].append({**deepcopy(row), "device_id": device.lower(), "scanner_id": scanner.lower()})
+    report = ReplayEngine().evaluate(captured)
+    assert report["counts"]["labelled"] == 1
+    assert report["observations"][1]["expected_distance"] is None
+
+
+@pytest.mark.parametrize("field", ["scanner_id", "device_id"])
+@pytest.mark.parametrize("identifier", ["aa:bb:cc:dd:ee:12", "Opaque:source"])
+def test_replay_source_clock_aliases_only_mac_ids(field, identifier):
+    captured = frames(count=2)
+    for index, frame in enumerate(captured):
+        row, label = frame["observations"][0], frame["truth"][0]
+        row[field] = identifier if index == 0 else identifier.upper()
+        row["stamp"] = 1000
+        label.update(device_id=row["device_id"], ranges={row["scanner_id"]: 2})
+    report = ReplayEngine().evaluate(captured)
+    is_mac = identifier.startswith("aa:")
+    assert report["counts"]["observations"] == (1 if is_mac else 2)
+    assert report["counts"]["duplicates_ignored"] == (1 if is_mac else 0)
+    assert report["observations"][0][field] == identifier
+
+
 @pytest.mark.parametrize("attenuation", [50.0, 0.05, 0.0001, 5e-324])
 def test_replay_preserves_supported_legacy_radio_baselines_without_a_candidate(attenuation):
     captured = frames(distance=1.0, expected=1.0)

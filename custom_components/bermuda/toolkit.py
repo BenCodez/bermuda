@@ -89,6 +89,12 @@ def _same_options(left: dict, right: dict) -> bool:
     return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(right, sort_keys=True, allow_nan=False)
 
 
+def _candidate_identity(identifier: str) -> str:
+    """Collapse MAC aliases only in detached candidate identity maps."""
+    canonical = identifier.lower()
+    return receiver_value({canonical: canonical}, identifier, identifier)
+
+
 def _fixed_reference_profile(reference: dict, profile: dict) -> dict:
     """Keep verification attached to the power supplied by the same source."""
     return {
@@ -1032,11 +1038,19 @@ class ToolkitManager:
         self.proposal, self._proposal_rows = result, rows
         return deepcopy(result)
 
-    def _validate_offsets(self, value: Any) -> dict:
+    def _validate_offsets(self, value: Any, *, frames: list[dict] | None = None) -> dict:
         if not isinstance(value, dict) or len(value) > 128:
             msg = "Candidate offsets must be a bounded object"
             raise ValueError(msg)
-        known = {scanner.address: scanner.address for scanner in self.coordinator.get_scanners}
+        known = (
+            {scanner.address: scanner.address for scanner in self.coordinator.get_scanners}
+            if frames is None
+            else {
+                _candidate_identity(row["scanner_id"]): _candidate_identity(row["scanner_id"])
+                for frame in frames
+                for row in frame["observations"]
+            }
+        )
         result = {}
         for key, offset in value.items():
             canonical = receiver_value(known, key) if isinstance(key, str) else None
@@ -1139,13 +1153,33 @@ class ToolkitManager:
         self.last_result = {"rolled_back": True, "model_version": self.version()}
         return deepcopy(self.last_result)
 
-    def _candidate(self, payload: dict) -> tuple[dict, dict]:
+    def _candidate(self, payload: dict, *, frames: list[dict] | None = None) -> tuple[dict, dict]:
+        """Bind read-only candidates to frozen inputs and shadow candidates to live identities."""
         value = payload.get("candidate")
         if value is None:
             value = (self.proposal or {}).get("offsets", {})
         modes = payload.get("filter_modes", {})
         settings = normalize_toolkit_settings({"filters": modes})
-        return self._validate_offsets(value), settings["filters"]
+        known = (
+            {public_device_id(key): public_device_id(key) for key in self.coordinator.devices}
+            if frames is None
+            else {
+                _candidate_identity(row["device_id"]): _candidate_identity(row["device_id"])
+                for frame in frames
+                for row in frame["observations"]
+            }
+        )
+        filters = {}
+        for key, mode in settings["filters"].items():
+            canonical = receiver_value(known, key)
+            if canonical is None:
+                msg = "Candidate filter refers to an unknown device"
+                raise ValueError(msg)
+            if canonical in filters and filters[canonical] != mode:
+                msg = "Conflicting filter modes refer to the same device"
+                raise ValueError(msg)
+            filters[canonical] = mode
+        return self._validate_offsets(value, frames=frames), filters
 
     async def _capture(self, payload: dict) -> dict:
         snapshot = self._snapshot()
@@ -1385,8 +1419,8 @@ class ToolkitManager:
                 self._proposal_rows = []
                 return self.history.summary()
             if action in ("replay", "shadow_start"):
-                offsets, modes = self._candidate(payload)
                 frames = self.history.frames()
+                offsets, modes = self._candidate(payload, frames=frames if action == "replay" else None)
                 if action == "replay":
                     return await self._run_worker(
                         ReplayEngine().evaluate, frames, proposed_offsets=offsets, filter_modes=modes, now=time.time()
@@ -1423,8 +1457,10 @@ class ToolkitManager:
                     raise RuntimeError(msg)
                 if not result["eligible"]:
                     return result
-                offsets, modes = self.shadow.proposed_offsets, self.shadow.filter_modes
                 try:
+                    offsets, modes = self._candidate(
+                        {"candidate": self.shadow.proposed_offsets, "filter_modes": self.shadow.filter_modes}
+                    )
                     await self._apply(offsets, extra_settings={"filters": {**self.settings["filters"], **modes}})
                 except Exception:
                     self.shadow.cancel("promotion could not be saved")

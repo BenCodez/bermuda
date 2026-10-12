@@ -16,6 +16,7 @@ from copy import deepcopy
 from itertools import pairwise
 from typing import Any, NoReturn
 
+from .profiles import receiver_value
 from .recording import MAX_FRAMES, MAX_IMPORT_BYTES, MAX_ROWS, finite_number, json_size, opaque_id, validate_frame
 from .signal_quality import FilterState
 
@@ -24,6 +25,12 @@ FilterCallback = Callable[[dict[str, Any], float], float | None]
 
 def _fail(message: str) -> NoReturn:
     raise ValueError(message)
+
+
+def _source_identity(identifier: str) -> str:
+    """Share replay clock state between MAC aliases while keeping opaque IDs exact."""
+    canonical = identifier.lower()
+    return receiver_value({canonical: canonical}, identifier, identifier)
 
 
 def _range_scale(delta_db: float, attenuation: float) -> float:
@@ -55,7 +62,10 @@ def _offsets(proposed: dict[str, float] | None) -> dict[str, float]:
         offset = finite_number(value, "candidate offset")
         if abs(offset) > 100:
             _fail("candidate offset exceeds its permitted bound")
-        result[opaque_id(scanner, "candidate scanner_id")] = offset
+        canonical = _source_identity(opaque_id(scanner, "candidate scanner_id"))
+        if canonical in result and result[canonical] != offset:
+            _fail("conflicting candidate offsets refer to the same receiver")
+        result[canonical] = offset
     return result
 
 
@@ -68,7 +78,10 @@ def _filter_modes(modes: dict[str, str] | None) -> dict[str, str]:
     for device, mode in modes.items():
         if mode not in ("legacy", "pet", "stationary"):
             _fail("candidate filter mode is invalid")
-        result[opaque_id(device, "candidate device_id")] = mode
+        canonical = _source_identity(opaque_id(device, "candidate device_id"))
+        if canonical in result and result[canonical] != mode:
+            _fail("conflicting candidate filter modes refer to the same device")
+        result[canonical] = mode
     return result
 
 
@@ -229,7 +242,11 @@ class ReplayEngine:
             previous_capture = frame["captured_at"]
             labels = {truth["device_id"]: truth for truth in frame["truth"]}
             for observation in frame["observations"]:
-                stream = frame["session_epoch"], observation["device_id"], observation["scanner_id"]
+                stream = (
+                    frame["session_epoch"],
+                    _source_identity(observation["device_id"]),
+                    _source_identity(observation["scanner_id"]),
+                )
                 previous = clocks.get(stream)
                 if observation["status"] != "current" or (
                     previous
@@ -249,12 +266,12 @@ class ReplayEngine:
                         }
                     )
                 clocks[stream] = {"stamp": observation["stamp"], "observed": observation["observed"], "origin": origin}
-                candidate_offset = offsets.get(observation["scanner_id"], observation["rssi_offset"])
+                candidate_offset = receiver_value(offsets, observation["scanner_id"], observation["rssi_offset"])
                 offset_scale = _range_scale(observation["rssi_offset"] - candidate_offset, observation["attenuation"])
                 raw_candidate = _scaled_distance(observation["raw_distance"], offset_scale)
                 if raw_candidate > 1e6:
                     _fail("candidate range exceeds the diagnostic model bound")
-                mode = modes.get(observation["device_id"])
+                mode = receiver_value(modes, observation["device_id"])
                 current_mode = observation["quality"].get("mode", "legacy")
                 pipeline = "preserved_live_filter"
                 unavailable_reason = "frozen live filtered distance is unavailable"
@@ -310,8 +327,8 @@ class ReplayEngine:
                     candidate = finite_number(candidate, "candidate distance", minimum=0)
                     if candidate > 1e6:
                         _fail("candidate range exceeds the diagnostic model bound")
-                truth = labels.get(observation["device_id"])
-                expected = truth["ranges"].get(observation["scanner_id"]) if truth else None
+                truth = receiver_value(labels, observation["device_id"])
+                expected = receiver_value(truth["ranges"], observation["scanner_id"]) if truth else None
                 rows.append(
                     {
                         **deepcopy(observation),
@@ -345,7 +362,8 @@ class ReplayEngine:
     def _movement(rows: list[dict[str, Any]], *, has_candidate_filter: bool) -> dict[str, Any]:
         streams = {}
         for row in rows:
-            streams.setdefault((row["session_epoch"], row["device_id"], row["scanner_id"]), []).append(row)
+            stream = row["session_epoch"], _source_identity(row["device_id"]), _source_identity(row["scanner_id"])
+            streams.setdefault(stream, []).append(row)
         transitions = []
         for stream in streams.values():
             labelled = [row for row in stream if row["expected_distance"] is not None]
@@ -627,14 +645,17 @@ class ShadowSession:
             reasons.append("candidate omitted labelled observations")
         if any(row["current"] is None for row in rows):
             reasons.append("frozen live range output is unavailable for labelled observations")
-        scanners = {row["scanner_id"] for row in rows}
-        devices = {row["device_id"] for row in rows}
+        scanners = {row["scanner_id"]: True for row in rows}
+        devices = {row["device_id"]: True for row in rows}
         reasons.extend(
             f"candidate scanner {scanner} lacks new labelled coverage"
-            for scanner in sorted(set(self._offsets) - scanners)
+            for scanner in sorted(self._offsets)
+            if not receiver_value(scanners, scanner, False)
         )
-        for scanner in sorted(set(self._offsets) & scanners):
-            scanner_rows = [row for row in rows if row["scanner_id"] == scanner]
+        for scanner in sorted(self._offsets):
+            if not receiver_value(scanners, scanner, False):
+                continue
+            scanner_rows = [row for row in rows if receiver_value({scanner: True}, row["scanner_id"], False)]
             if (
                 len(scanner_rows) < self.min_labelled_rows
                 or len({row["location_id"] for row in scanner_rows}) < self.min_locations
@@ -642,7 +663,8 @@ class ShadowSession:
                 reasons.append(f"candidate scanner {scanner} lacks sufficient independent coverage")
         reasons.extend(
             f"candidate filter device {device} lacks new labelled coverage"
-            for device in sorted(set(self._filter_modes) - devices)
+            for device in sorted(self._filter_modes)
+            if not receiver_value(devices, device, False)
         )
         comparison = _comparison(rows)
         current, candidate = comparison["current"], comparison["candidate"]
