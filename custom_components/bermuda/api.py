@@ -34,6 +34,7 @@ from .const import (
     DISTANCE_TIMEOUT,
     DOMAIN,
 )
+from .signal_quality import SOURCE_CLOCK_TOLERANCE_S
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -47,7 +48,6 @@ MAX_OBSERVATIONS: Final = 4096
 MAX_HISTORY: Final = 5
 MAX_ALIASES: Final = 32
 MAX_TEXT: Final = 512
-SOURCE_CLOCK_TOLERANCE_S: Final = 0.8
 _PRIVATE_KEY_RE: Final = re.compile(r"^[0-9a-fA-F]{32}$")
 
 

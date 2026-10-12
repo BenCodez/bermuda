@@ -619,10 +619,27 @@ class ToolkitManager:
         return snapshot
 
     def _current_offsets(self) -> dict:
-        offsets = deepcopy(dict(self.coordinator.options.get(CONF_RSSI_OFFSETS, {})))
-        for key, profile in self.settings["receiver_profiles"].items():
-            if "rssi_offset" in profile:
-                offsets[key] = profile["rssi_offset"]
+        legacy = self.coordinator.options.get(CONF_RSSI_OFFSETS, {})
+        offsets = deepcopy(dict(legacy))
+        sources = {key for key in (*legacy, *self.settings["receiver_profiles"]) if isinstance(key, str)}
+        for key in tuple(sources):
+            # Materialize canonical MAC IDs for frozen observations even when
+            # their scanner is offline. Opaque source IDs remain case-sensitive.
+            canonical = receiver_value({key: key.lower()}, key.lower())
+            if canonical is not None:
+                sources.add(canonical)
+        sources.update(scanner.address for scanner in self.coordinator.get_scanners)
+        for source in sources:
+            # Resolve the original maps separately: merging profile aliases into
+            # legacy aliases changes exact-key precedence and ambiguity handling.
+            offsets[source] = effective_model(
+                self.settings,
+                source,
+                "",
+                reference_power=self.coordinator.options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+                attenuation=self.coordinator.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+                rssi_offset=receiver_value(legacy, source, 0.0),
+            )["rssi_offset"]
         return offsets
 
     def _state(self) -> dict:

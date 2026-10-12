@@ -17,6 +17,10 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+# Match the public snapshot's bounded coarse-clock skew allowance. The actual
+# source stamp remains unchanged for deduplication and elapsed-time statistics.
+SOURCE_CLOCK_TOLERANCE_S = 0.8
+
 
 def _number(value: object, low: float, high: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -154,7 +158,7 @@ class FilterState:
         fresh = accepted = False
         if value is None or source is None or current is None or (observed is not None and epoch is None):
             reasons.append({"code": "invalid_observation"})
-        elif source > current + 0.05:
+        elif current - source < -SOURCE_CLOCK_TOLERANCE_S:
             reasons.append({"code": "future_source_stamp"})
         elif self._last_now is not None and current < self._last_now:
             reasons.append({"code": "current_clock_regression"})
@@ -245,7 +249,7 @@ class FilterState:
         )
         clock_valid = (
             current is not None
-            and (self.last_valid_stamp is None or current >= self.last_valid_stamp)
+            and (self.last_valid_stamp is None or current - self.last_valid_stamp >= -SOURCE_CLOCK_TOLERANCE_S)
             and (self._last_now is None or current >= self._last_now)
         )
         if clock_valid:
