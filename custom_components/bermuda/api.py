@@ -34,7 +34,10 @@ from .const import (
     DISTANCE_TIMEOUT,
     DOMAIN,
 )
-from .signal_quality import SOURCE_CLOCK_TOLERANCE_S
+from .signal_quality import (
+    SOURCE_CLOCK_TOLERANCE_S as SOURCE_CLOCK_TOLERANCE_S,  # noqa: PLC0414 - public compatibility re-export
+)
+from .signal_quality import normalize_source_age
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -231,13 +234,14 @@ def _recent_history(advert: Any, nowstamp: float, observed_now: float) -> list[d
     for index, reading in enumerate(readings[:MAX_HISTORY]):
         stamp = _number(stamps[index]) if index < len(stamps) else None
         age = nowstamp - stamp if stamp is not None and stamp > 0 else None
+        normalized_age = normalize_source_age(age)
         history.append(
             {
                 "rssi": _number(reading),
                 "raw_distance": _number(distances[index]) if index < len(distances) else None,
                 "stamp": stamp,
-                "observed": observed_now - age if age is not None and age >= 0 else None,
-                "age": age,
+                "observed": observed_now - normalized_age if normalized_age is not None else None,
+                "age": normalized_age if normalized_age is not None else age,
                 "model_provenance": "runtime_history_not_frozen",
             }
         )
@@ -257,12 +261,13 @@ def _advert_measurement(
     metadata = _model_metadata(coordinator, device_id, scanner_id, advert)
     stamp = _number(getattr(advert, "stamp", None))
     age = nowstamp - stamp if stamp is not None and stamp > 0 else None
+    normalized_age = normalize_source_age(age)
     observed = _number(metadata.get("observed", getattr(advert, "observed", None)))
     clock = "source_epoch" if observed is not None else "derived_monotonic"
-    if observed is None and age is not None and age >= -SOURCE_CLOCK_TOLERANCE_S:
+    if observed is None and normalized_age is not None:
         # Coarse source and receiver clocks can differ slightly. Keep the raw
         # stamp for deduplication, but never publish derived UTC in the future.
-        observed = observed_now - max(0.0, age)
+        observed = observed_now - normalized_age
     rssi = _number(getattr(advert, "rssi", None))
     raw_distance = _number(getattr(advert, "rssi_distance_raw", None))
     filtered_distance = _number(getattr(advert, "rssi_distance", None))
@@ -275,7 +280,7 @@ def _advert_measurement(
     reasons = []
     if age is None:
         reasons.append("missing_source_stamp")
-    elif age < -SOURCE_CLOCK_TOLERANCE_S:
+    elif normalized_age is None:
         reasons.append("source_clock_in_future")
     elif age > timeout:
         reasons.append("stale_observation")
@@ -310,7 +315,7 @@ def _advert_measurement(
         "observed": observed,
         "observed_clock": clock,
         "stamp": stamp,
-        "age": max(0.0, age) if age is not None and age >= -SOURCE_CLOCK_TOLERANCE_S else age,
+        "age": normalized_age if normalized_age is not None else age,
         "status": status,
         "rssi": rssi,
         "raw_rssi": rssi,

@@ -44,7 +44,7 @@ from .fingerprints import FingerprintModel
 from .profiles import effective_model, finite_number, model_version, normalize_toolkit_settings, receiver_value
 from .recording import DiagnosticHistory, validate_truth
 from .replay import ReplayEngine, ShadowSession
-from .signal_quality import FilterState
+from .signal_quality import FilterState, normalize_source_age
 from .toolkit_store import DurableToolkitStore
 from .util import rssi_to_metres
 
@@ -596,15 +596,16 @@ class ToolkitManager:
                 continue
             if scanner not in selected and len(selected) >= 128:
                 continue
-            age = nowstamp - stamp
+            source_age = nowstamp - stamp
+            age = normalize_source_age(source_age)
             selected[scanner] = {
                 "device_id": device_id,
                 "scanner_id": scanner,
                 "stamp": stamp,
                 "rssi": rssi,
-                "observed": epoch - age,
-                "age": age,
-                "status": "current" if age >= 0 else "stale",
+                "observed": epoch - age if age is not None else epoch,
+                "age": age if age is not None else source_age,
+                "status": "current" if age is not None else "stale",
                 "model_version": self.version(),
             }
         result = self.fingerprints.suggest(device_id, list(selected.values()), now=epoch)

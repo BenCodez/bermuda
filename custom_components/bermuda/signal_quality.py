@@ -32,6 +32,12 @@ def _number(value: object, low: float, high: float) -> float | None:
     return numeric if math.isfinite(numeric) and low <= numeric <= high else None
 
 
+def normalize_source_age(age: object) -> float | None:
+    """Clamp supported coarse-clock skew to zero; reject invalid/future ages."""
+    numeric = _number(age, -SOURCE_CLOCK_TOLERANCE_S, math.inf)
+    return max(0.0, numeric) if numeric is not None else None
+
+
 @dataclass(frozen=True, slots=True)
 class _Policy:
     tau_s: float
@@ -158,7 +164,7 @@ class FilterState:
         fresh = accepted = False
         if value is None or source is None or current is None or (observed is not None and epoch is None):
             reasons.append({"code": "invalid_observation"})
-        elif current - source < -SOURCE_CLOCK_TOLERANCE_S:
+        elif normalize_source_age(current - source) is None:
             reasons.append({"code": "future_source_stamp"})
         elif self._last_now is not None and current < self._last_now:
             reasons.append({"code": "current_clock_regression"})
@@ -249,7 +255,7 @@ class FilterState:
         )
         clock_valid = (
             current is not None
-            and (self.last_valid_stamp is None or current - self.last_valid_stamp >= -SOURCE_CLOCK_TOLERANCE_S)
+            and (self.last_valid_stamp is None or normalize_source_age(current - self.last_valid_stamp) is not None)
             and (self._last_now is None or current >= self._last_now)
         )
         if clock_valid:
