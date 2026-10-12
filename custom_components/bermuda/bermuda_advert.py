@@ -323,14 +323,20 @@ class BermudaAdvert:
         of ref_power for a device, or when a metadevice takes on a new source device, and
         propagates its own ref_power to our parent.
 
-        Note that it is unlikely to return None as its only returning the raw, not filtered
-        distance = the exception being uninitialised entries.
+        Optional filters return the reprojected accepted distance, which can be
+        unavailable. Legacy updates return the latest raw distance.
         """
-        # When the user updates the ref_power we want to reflect that change immediately,
-        # and not subject it to the normal smoothing algo.
+        # Reflect model changes immediately, preserving optional RSSI filter state
+        # and retaining the legacy calibration bypass of range smoothing.
         # But make sure it's actually different, in case it's just a metadevice propagating
         # its own ref_power without need.
         if value != self.ref_power:
+            toolkit = getattr(getattr(self._device, "_coordinator", None), "toolkit", None)
+            rebase = getattr(toolkit, "rebase_advert_reference_power", None)
+            if callable(rebase) and rebase(self, value):
+                # A radio-model correction does not accept the newest raw RSSI.
+                # Keep accepted/candidate RSSI and packet clocks in their filter.
+                return self.rssi_distance
             self.ref_power = value
             return self._update_raw_distance(False)
         return self.rssi_distance_raw

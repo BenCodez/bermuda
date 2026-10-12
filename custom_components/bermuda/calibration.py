@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from statistics import mean, median
 
 from .profiles import finite_number, receiver_value
+from .recording import MAX_CLOCK_EPOCH
 
 
 @dataclass(frozen=True)
@@ -159,8 +160,8 @@ def _receiver_key(identifier: str) -> str:
 
 
 def _packet_key(row: Mapping) -> tuple:
-    """Resolve legacy and current packet identities through their target group."""
-    return row["packet_target_id"], row["scanner_id"], row["stamp"]
+    """Resolve aliases within a source-clock epoch; zero identifies legacy rows."""
+    return row["packet_target_id"], row["scanner_id"], row["stamp"], row.get("session_epoch", 0)
 
 
 def _target_groups(rows: list[dict]) -> None:
@@ -207,8 +208,8 @@ def _target_groups(rows: list[dict]) -> None:
         root = find(_receiver_key(row["device_id"]))
         row["target_id"] = targets[root]
         # Missing source IDs cannot make an additional packet from a linked
-        # alias. Reused clocks across rotating sources are ambiguous: deduplicate
-        # matching evidence, and reject contradictions below instead of guessing.
+        # alias. Within an epoch, reused clocks across rotating sources are
+        # ambiguous: deduplicate matching evidence and reject contradictions.
         row["packet_target_id"] = packets[root]
 
 
@@ -280,6 +281,8 @@ class CalibrationEngine:
             row["scanner_id"] = _receiver_key(row["scanner_id"])
             if source.get("source_id") is not None:
                 row["source_id"] = _receiver_key(source["source_id"])
+            if "session_epoch" in source:
+                row["session_epoch"] = source["session_epoch"]
             row["device_ids"] = (row["device_id"],)
             row["stamp"] = source.get("stamp", source["observed"])
             row["accuracy_m"] = source.get("accuracy_m", 0.0)
@@ -335,6 +338,10 @@ class CalibrationEngine:
             not isinstance(physical_source, str) or not physical_source or len(physical_source) > 256
         ):
             return "invalid_source_id"
+        if "session_epoch" in row and (
+            type(row["session_epoch"]) is not int or not 1 <= row["session_epoch"] <= MAX_CLOCK_EPOCH
+        ):
+            return "invalid_session_epoch"
         source = row.get("truth_source")
         if (
             row.get("independent") is not True
@@ -476,7 +483,14 @@ class CalibrationEngine:
         if verified_rows:
             rejected["unverified_reference_power"] = len(rows) - len(verified_rows)
             rows = verified_rows
-        payload = [[*_packet_key(row), row["observed"], row["location_id"], row["rssi"]] for row in rows]
+        payload = []
+        for row in rows:
+            signature = [*_packet_key(row)[:3], row["observed"], row["location_id"], row["rssi"]]
+            # Preserve legacy signatures and place optional epochs after shared
+            # fields so mixed old/new evidence remains safely sortable.
+            if "session_epoch" in row:
+                signature.append(row["session_epoch"])
+            payload.append(signature)
         data_id = hashlib.sha256(json.dumps(sorted(payload), separators=(",", ":")).encode()).hexdigest()[:24]
         result = {
             "eligible": False,

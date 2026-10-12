@@ -1016,6 +1016,7 @@ class ToolkitManager:
                                 "truth_source": truth["source"],
                                 "independent": True,
                                 "captured_at": frame["captured_at"],
+                                "session_epoch": frame["session_epoch"],
                                 "frozen": True,
                             }
                         )
@@ -1498,6 +1499,21 @@ class ToolkitManager:
                 return result
             msg = "Unknown measurement action"
             raise ValueError(msg)
+
+    def advert_uses_optional_filter(self, advert: Any) -> bool:
+        """Resolve the filter policy for the advert's current tracked owner."""
+        return self.settings["filters"].get(self._device_id(advert), "legacy") != "legacy"
+
+    def rebase_advert_reference_power(self, advert: Any, value: float) -> bool:
+        """Reproject an optional filter's ranges while preserving its RSSI pipeline."""
+        if not self.advert_uses_optional_filter(advert):
+            return False
+        old_model = self.effective_advert_model(advert)
+        advert.ref_power = value
+        new_model = self.effective_advert_model(advert)
+        if old_model != new_model:
+            self._project_output(advert, old_model, new_model)
+        return True
 
     @staticmethod
     def _project_output(advert: Any, old_model: dict, new_model: dict) -> None:

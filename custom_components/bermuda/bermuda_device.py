@@ -828,35 +828,49 @@ class BermudaDevice:
 
         return self.name
 
-    def set_ref_power(self, new_ref_power: float):
+    def set_ref_power(self, new_ref_power: float, *, invalidate_model: bool = False):
         """
         Set a new reference power for this device and immediately apply
         an interim distance calculation.
 
         This gets called by the calibration routines, but also by metadevice
         updates, as they need to apply their own ref_power if necessary.
+        Number updates invalidate advisory evidence after mutation, before election.
         """
         if new_ref_power != self.ref_power:
             # The Number can change before the next coordinator batch. Split
             # simultaneous tracked aliases before this owner's direct update.
-            prepare = getattr(getattr(self._coordinator, "toolkit", None), "prepare_update", None)
+            toolkit = getattr(self._coordinator, "toolkit", None)
+            prepare = getattr(toolkit, "prepare_update", None)
             if callable(prepare):
                 prepare()
             # it's actually changed, proceed...
             self.ref_power = new_ref_power
             nearest_distance = 9999  # running tally to find closest scanner
             nearest_scanner = None
+            uses_filter = getattr(toolkit, "advert_uses_optional_filter", None)
+            optional_filter = False
             for advert in self.adverts.values():
-                rawdist = advert.set_ref_power(new_ref_power)
-                if rawdist is not None and rawdist < nearest_distance:
-                    nearest_distance = rawdist
+                distance = advert.set_ref_power(new_ref_power)
+                if callable(uses_filter) and uses_filter(advert):
+                    optional_filter = True
+                if distance is not None and distance < nearest_distance:
+                    nearest_distance = distance
                     nearest_scanner = advert
+            invalidate = getattr(toolkit, "invalidate_model", None)
+            if invalidate_model and callable(invalidate):
+                invalidate()
             # Even though the actual scanner should not have changed (it should
             # remain none or a given scanner, since the relative distances won't have
             # changed due to ref_power), we still call apply so that the new area_distance
             # gets applied.
             # if nearest_scanner is not None:
-            self.apply_scanner_selection(nearest_scanner)
+            if optional_filter:
+                # Optional filters elect from accepted ranges, using the same
+                # eligibility, receiver caps and reliability as ordinary updates.
+                self._coordinator._refresh_area_by_min_distance(self)  # noqa: SLF001
+            else:
+                self.apply_scanner_selection(nearest_scanner)
             # Update the stamp so that the BermudaEntity can clear the cache and show the
             # new measurement(s) immediately.
             self.ref_power_changed = monotonic_time_coarse()

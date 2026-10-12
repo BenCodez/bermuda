@@ -102,11 +102,7 @@ class BermudaNumber(BermudaEntity, RestoreNumber):
     def _set_ref_power_and_invalidate(self, value: float) -> None:
         """A changed effective beacon model invalidates advisory evidence too."""
         device = self.coordinator.devices[self.address]
-        previous = device.ref_power
-        device.set_ref_power(value)
-        invalidate = getattr(getattr(self.coordinator, "toolkit", None), "invalidate_model", None)
-        if device.ref_power != previous and callable(invalidate):
-            invalidate()
+        device.set_ref_power(value, invalidate_model=True)
 
     @property
     def native_value(self) -> float | None:
