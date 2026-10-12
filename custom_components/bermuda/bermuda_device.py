@@ -99,6 +99,8 @@ class BermudaDevice:
         self._coordinator: BermudaDataUpdateCoordinator = coordinator
         self.ref_power: float = 0  # If non-zero, use in place of global ref_power.
         self.ref_power_changed: float = 0  # Stamp for last change to ref_power, for cache zapping.
+        self.model_revision: int = 0  # Each entity consumes a radio change once, even after delayed reads.
+        self.model_selection_pending: bool = False  # Closest output must reflect the new model before consumption.
         self.options = self._coordinator.options
         self.unique_id: str | None = _address  # mac address formatted.
         self.address_type = BDADDR_TYPE_UNKNOWN
@@ -836,6 +838,7 @@ class BermudaDevice:
             # Update the stamp so that the BermudaEntity can clear the cache and show the
             # new measurement(s) immediately.
             self.ref_power_changed = monotonic_time_coarse()
+            self.model_revision += 1
 
     def apply_scanner_selection(self, bermuda_advert: BermudaAdvert | None):
         """
@@ -868,6 +871,7 @@ class BermudaDevice:
                 old_area,
                 self.area_name,
             )
+        self.model_selection_pending = False
 
     def get_scanner(self, scanner_address) -> BermudaAdvert | None:
         """

@@ -562,8 +562,10 @@ class ToolkitManager:
         # Sources and metadevices can share the same advert object. Freeze its
         # old radio model/output once before publishing any replacement settings.
         adverts = {}
+        advert_devices = {}
         for device in self.coordinator.devices.values():
             for advert in getattr(device, "adverts", {}).values():
+                advert_devices.setdefault(id(advert), {})[id(device)] = device
                 if id(advert) not in adverts:
                     adverts[id(advert)] = (
                         advert,
@@ -582,6 +584,7 @@ class ToolkitManager:
         self._generation += 1
         changed = self.version() != previous
         if changed:
+            affected_devices = {}
             self.proposal = None
             self._proposal_rows = []
             for key in list(self._states):
@@ -596,6 +599,7 @@ class ToolkitManager:
                 advert.conf_rssi_offset = receiver_value(options.get(CONF_RSSI_OFFSETS, {}), advert.scanner_address, 0)
                 new_model = self.effective_advert_model(advert)
                 if any(old_model[field] != new_model[field] for field in radio_fields):
+                    affected_devices.update(advert_devices[id(advert)])
                     # RSSI states are independent of the distance model. Preserve
                     # accepted/candidate RSSI, cadence and source freshness while
                     # reprojecting both raw and filtered distance histories.
@@ -611,11 +615,17 @@ class ToolkitManager:
                         _rebase_distance(value, old_model, new_model) for value in filtered_history
                     ]
                 if device_id in changed_filters:
+                    affected_devices.update(advert_devices[id(advert)])
                     # An explicit policy switch has a new pipeline, unlike a
                     # radio correction. Await its normal source-age processing.
                     advert.rssi_distance = None
                     advert.hist_distance_by_interval.clear()
                     advert.hist_velocity.clear()
+            for device in affected_devices.values():
+                device.model_revision = getattr(device, "model_revision", 0) + 1
+                # Closest Distance consumes this revision only after the normal
+                # selection pass publishes ranges from the adopted model.
+                device.model_selection_pending = True
         # Manual scanner mappings affect association only; source keys and historic UIDs survive.
         if binding_changed:
             for scanner in self.coordinator.get_scanners:
@@ -759,8 +769,9 @@ class ToolkitManager:
         }
         return deepcopy(self.last_result)
 
-    async def _rollback(self) -> dict:
-        if not self.trial or self.trial.get("model_version") != self.version():
+    async def _rollback(self, *, disable_auto: bool = False) -> dict:
+        expected_version = self.version()
+        if not self.trial or self.trial.get("model_version") != expected_version:
             msg = "No applicable unchanged trial is available to roll back"
             raise RuntimeError(msg)
         previous = self.trial["previous_options"]
@@ -775,8 +786,10 @@ class ToolkitManager:
             else:
                 profile.pop("rssi_offset", None)
         settings["filters"] = prior["filters"]
+        if disable_auto:
+            settings["auto_calibration"] = False
         options[OPTIONS_KEY] = settings
-        await self._persist_options(options, trial=None, replace_trial=True)
+        await self._persist_options(options, trial=None, replace_trial=True, expected_version=expected_version)
         self.last_result = {"rolled_back": True, "model_version": self.version()}
         return deepcopy(self.last_result)
 
@@ -1189,11 +1202,8 @@ class ToolkitManager:
             )
             self.last_result = result
             if result["rollback"]:
-                await self._rollback()
                 # Prevent repeated oscillation until an administrator explicitly re-enables auto mode.
-                options = deepcopy(dict(self.entry.options))
-                options[OPTIONS_KEY] = {**self.settings, "auto_calibration": False}
-                await self._persist_options(options)
+                await self._rollback(disable_auto=True)
                 return
         proposal = await self._preview()
         decision = self.engine.automatic_decision(

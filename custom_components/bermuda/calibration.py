@@ -148,6 +148,14 @@ def _groups(rows: list[dict], offsets: Mapping, key: str) -> dict:
     return {identifier: _metrics(group, offsets) for identifier, group in sorted(groups.items())}
 
 
+def _receiver_key(identifier: str) -> str:
+    """Normalize MAC case only; every other scanner source remains opaque."""
+    parts = identifier.split(":")
+    if len(parts) == 6 and all(len(part) == 2 and all(c in "0123456789abcdefABCDEF" for c in part) for part in parts):
+        return identifier.lower()
+    return identifier
+
+
 class CalibrationEngine:
     """Pure proposals and decisions; the HA manager owns persistence and rollback."""
 
@@ -576,24 +584,54 @@ class CalibrationEngine:
         separately checks the applied settings signature before an atomic rollback.
         Rows keep raw RSSI; only the comparison baseline is replaced in a detached
         copy. Insufficient evidence requests continued observation, never success.
+        Only new proposed corrections are policy-bounded. A used inherited baseline
+        must be finite but may exceed those bounds; unrelated legacy values do not
+        participate in this comparison or block monitoring.
         """
         rows, rejected = self._prepare(
             observations, now=now, model_version=model_version, verified_reference_devices=verified_reference_devices
         )
-        for offsets in (previous_offsets, proposed_offsets):
-            if not isinstance(offsets, Mapping) or any(
-                not finite_number(value) or abs(value) > self.policy.max_offset_db for value in offsets.values()
+        if not isinstance(previous_offsets, Mapping) or not isinstance(proposed_offsets, Mapping):
+            msg = "Trial offsets must be mappings"
+            raise ValueError(msg)  # noqa: TRY004 - one validation exception contract for toolkit requests
+        proposals = {}
+        for scanner, value in proposed_offsets.items():
+            if (
+                not isinstance(scanner, str)
+                or not scanner
+                or len(scanner) > 256
+                or any(ord(c) < 32 for c in scanner)
+                or not finite_number(value)
+                or abs(value) > self.policy.max_offset_db
             ):
-                msg = "Trial offsets must be finite and within calibration bounds"
+                msg = "Proposed trial offsets need valid receiver IDs and finite values within calibration bounds"
                 raise ValueError(msg)
+            key = _receiver_key(scanner)
+            if key in proposals and proposals[key] != value:
+                msg = "Proposed trial offsets conflict for receiver aliases"
+                raise ValueError(msg)
+            proposals[key] = float(value)
         selected = []
+        missing = object()
+        seen = set()
         for row in rows:
-            proposed = receiver_value(proposed_offsets, row["scanner_id"])
-            previous = receiver_value(previous_offsets, row["scanner_id"])
-            if proposed is None or previous is None:
+            key = _receiver_key(row["scanner_id"])
+            if key not in proposals:
                 continue
+            previous = receiver_value(previous_offsets, row["scanner_id"], missing)
+            if previous is missing:
+                continue
+            if not finite_number(previous):
+                msg = "A used previous trial offset must be finite and cannot be a boolean"
+                raise ValueError(msg)
+            identity = (row["device_id"], key, row["stamp"])
+            if identity in seen:
+                rejected["duplicate_source_stamp"] = rejected.get("duplicate_source_stamp", 0) + 1
+                continue
+            seen.add(identity)
             copy = dict(row)
-            copy["rssi_offset"] = previous
+            copy["scanner_id"] = key
+            copy["rssi_offset"] = float(previous)
             selected.append(copy)
         locations = {row["location_id"] for row in selected}
         devices = {row["device_id"] for row in selected}
@@ -601,14 +639,14 @@ class CalibrationEngine:
         sufficient = (
             len(locations) >= 2
             and len(devices) >= 2
-            and len(counts) == len(proposed_offsets)
+            and set(counts) == set(proposals)
             and all(count >= self.policy.min_holdout_samples for count in counts.values())
         )
         metrics = {
-            "all": _metrics(selected, proposed_offsets),
-            "per_receiver": _groups(selected, proposed_offsets, "scanner_id"),
-            "per_device": _groups(selected, proposed_offsets, "device_id"),
-            "per_location": _groups(selected, proposed_offsets, "location_id"),
+            "all": _metrics(selected, proposals),
+            "per_receiver": _groups(selected, proposals, "scanner_id"),
+            "per_device": _groups(selected, proposals, "device_id"),
+            "per_location": _groups(selected, proposals, "location_id"),
         }
         regressions = []
         if sufficient:

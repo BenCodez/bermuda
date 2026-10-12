@@ -53,6 +53,7 @@ class BermudaEntity(CoordinatorEntity):
         self.bermuda_update_interval = config_entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         self.bermuda_last_state: Any = 0
         self.bermuda_last_stamp: float = 0
+        self.bermuda_model_revision: int = 0
 
     def _cached_ratelimit(self, statevalue: Any, fast_falling=True, fast_rising=False, interval=None):
         """
@@ -67,8 +68,10 @@ class BermudaEntity(CoordinatorEntity):
             self.bermuda_update_interval = interval
 
         nowstamp = monotonic_time_coarse()
+        model_revision = getattr(self._device, "model_revision", 0)
         if (
             (self.bermuda_last_stamp < nowstamp - self.bermuda_update_interval)  # Cache is stale
+            or (getattr(self, "bermuda_model_revision", 0) != model_revision)  # Unconsumed radio correction
             or (self._device.ref_power_changed > nowstamp - 2)  # ref power changed in last 2sec
             or (self.bermuda_last_state is None)  # Nothing compares to you.
             or (statevalue is None)  # or you.
@@ -78,6 +81,7 @@ class BermudaEntity(CoordinatorEntity):
             # Publish the new value and update cache
             self.bermuda_last_stamp = nowstamp
             self.bermuda_last_state = statevalue
+            self.bermuda_model_revision = model_revision
             return statevalue
         else:
             # Send the cached value, don't update cache

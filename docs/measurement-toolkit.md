@@ -66,7 +66,7 @@ Duplicates and out-of-order stamps do not add measurements. A missing packet age
 
 **Calibration → Preview calibration** computes a receiver-offset proposal without changing live settings. Inspect `eligible`, coverage, training/held-out errors, proposed absolute offsets, relative deltas and rejection reasons. **Apply accepted proposal** is available for an eligible result; the server checks the proposal, model version and its five-minute expiry again. **Rollback calibration** restores the saved applicable baseline. An intervening model change can make a trial inapplicable.
 
-The [toolkit manager](../custom_components/bermuda/toolkit.py) persists rollback evidence before publishing an options change. Applied receiver offsets use the existing offset controls; an explicit receiver profile offset replaces that receiver's legacy offset, rather than adding it twice. Numeric model changes recompute range without changing the packet stamp or overwriting received RSSI.
+The [toolkit manager](../custom_components/bermuda/toolkit.py) persists rollback evidence before publishing an options change. Applied receiver offsets use the existing offset controls; an explicit receiver profile offset replaces that receiver's legacy offset, rather than adding it twice. Numeric model changes recompute range without changing the packet stamp or overwriting received RSSI. After selection updates, distance entities publish the corrected value once even when the change falls inside the normal jitter deadband or the first read is delayed.
 
 ### 5. Guided calibration at independently measured locations
 
@@ -84,7 +84,7 @@ An advertised TX-power label is not automatically a measured reference RSSI at 1
 
 ### 6. Safe automatic calibration
 
-**Settings → Enable automatic calibration** is off by default. The manager checks at most every 30 seconds and applies only a current, validated proposal supported by new independent data. Default policy caps each automatic step at 1 dB, bounds total calibrated offsets to ±20 dB, and enforces a 900-second cooldown. A capped step must itself pass held-out validation; a successful larger proposal is not enough. New independent trial evidence can trigger rollback on regression, which also disables automatic mode until an administrator enables it again.
+**Settings → Enable automatic calibration** is off by default. The manager checks at most every 30 seconds and applies only a current, validated proposal supported by new independent data. Default policy caps each automatic step at 1 dB, bounds total calibrated offsets to ±20 dB, and enforces a 900-second cooldown. A capped step must itself pass held-out validation; a successful larger proposal is not enough. These bounds apply to new corrections; finite inherited baselines and unrelated legacy receivers do not block trial monitoring. New independent trial evidence can trigger rollback on regression. Restoring the offsets and disabling automatic mode use one saved options update; an administrator must enable automatic mode again afterward.
 
 For ongoing independently labelled evidence, **Settings → Fixed reference labels** accepts a deliberately configured stationary beacon map:
 

@@ -190,6 +190,123 @@ async def test_model_change_invalidates_an_existing_calibration_trial(runtime):
         await manager.async_dispatch("calibration_rollback", {})
 
 
+@pytest.mark.parametrize("action", ["calibration_apply", "calibration_rollback"])
+@pytest.mark.parametrize("power_source", ["manual", "restored"])
+async def test_power_changes_during_save_cannot_publish_apply_or_rollback(runtime, action, power_source):
+    manager = runtime.manager
+    manager.proposal = _proposal(manager, {SCANNER: -2.0})
+    if action == "calibration_rollback":
+        await manager.async_dispatch("calibration_apply", {})
+    before_options = deepcopy(dict(runtime.entry.options))
+    before_trial = deepcopy(manager.trial)
+    expected_version = manager.version()
+    entered, release = asyncio.Event(), asyncio.Event()
+    saved = []
+
+    async def pause_first_save(payload):
+        saved.append(deepcopy(payload))
+        if len(saved) == 1:
+            entered.set()
+            await release.wait()
+
+    manager.store.async_save.side_effect = pause_first_save
+    request = asyncio.create_task(manager.async_dispatch(action, {}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        number = BermudaNumber(runtime.coordinator, runtime.entry, DEVICE)
+        if power_source == "manual":
+            with patch.object(number, "async_write_ha_state"):
+                await number.async_set_native_value(-62.0)
+        else:
+            restored = NumberExtraStoredData(
+                native_max_value=0,
+                native_min_value=-127,
+                native_step=1,
+                native_unit_of_measurement="dBm",
+                native_value=-62.0,
+            )
+            with (
+                patch.object(BermudaEntity, "async_added_to_hass", new=AsyncMock()),
+                patch.object(number, "async_get_last_number_data", new=AsyncMock(return_value=restored)),
+            ):
+                await number.async_added_to_hass()
+        assert manager.version() != expected_version
+        release.set()
+        with pytest.raises(RuntimeError, match="changed while saving"):
+            await asyncio.wait_for(request, timeout=1)
+        assert dict(runtime.entry.options) == before_options
+        assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == before_options[CONF_RSSI_OFFSETS]
+        assert runtime.advert.conf_rssi_offset == before_options[CONF_RSSI_OFFSETS][SCANNER]
+        assert manager.trial == before_trial
+        assert runtime.device.ref_power == -62.0
+        assert not (manager.last_result or {}).get("rolled_back")
+        assert len(saved) == 2
+        assert saved[-1]["trial"] == before_trial
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.parametrize("fail_write", [None, 1, 2])
+async def test_automatic_regression_rollback_disables_auto_in_one_transaction(runtime, fail_write):
+    manager = runtime.manager
+    await manager.async_dispatch("settings", {"settings": {"auto_calibration": True}})
+    baseline_offsets = deepcopy(dict(runtime.entry.options[CONF_RSSI_OFFSETS]))
+    await manager._apply({SCANNER: -2.0}, automatic=True)
+    applied_options = deepcopy(dict(runtime.entry.options))
+    applied_trial = deepcopy(manager.trial)
+    saved = []
+
+    async def save_or_fail(payload):
+        saved.append(deepcopy(payload))
+        if len(saved) == fail_write:
+            raise OSError("Synthetic automatic rollback write failure")
+
+    manager.store.async_save.side_effect = save_or_fail
+    regression = {"rollback": True, "sufficient": True, "reasons": ["regression:synthetic-receiver"]}
+    with patch.object(manager.engine, "evaluate_trial", return_value=regression):
+        if fail_write == 1:
+            with pytest.raises(OSError, match="automatic rollback write failure"):
+                await manager._automatic(time.time())
+            assert dict(runtime.entry.options) == applied_options
+            assert manager.trial == applied_trial
+            assert manager.settings["auto_calibration"] is True
+        else:
+            await manager._automatic(time.time())
+            assert runtime.entry.options[CONF_RSSI_OFFSETS] == baseline_offsets
+            assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == baseline_offsets
+            assert runtime.entry.options[OPTIONS_KEY]["auto_calibration"] is False
+            assert manager.settings["auto_calibration"] is False
+            assert manager.trial is None
+            assert saved[-1]["trial"] is None
+            assert manager.last_result["rolled_back"] is True
+        assert len(saved) == 1
+
+
+@pytest.mark.parametrize("baseline_kind", ["legacy", "profile", "affected_receiver"])
+async def test_automatic_trial_monitoring_accepts_inherited_offsets_outside_new_bounds(runtime, baseline_kind):
+    manager = runtime.manager
+    options = deepcopy(dict(runtime.entry.options))
+    if baseline_kind == "legacy":
+        options[CONF_RSSI_OFFSETS][OFFLINE] = 30.0
+    elif baseline_kind == "profile":
+        options[OPTIONS_KEY] = {"receiver_profiles": {OFFLINE: {"rssi_offset": -30.0}}}
+    else:
+        options[CONF_RSSI_OFFSETS][SCANNER] = 20.5
+    runtime.hass.config_entries.async_update_entry(runtime.entry, options=options)
+    assert await manager.async_options_changed(runtime.entry) is True
+    candidate = 19.5 if baseline_kind == "affected_receiver" else 2.0
+    await manager._apply({SCANNER: candidate}, automatic=True)
+    applied = deepcopy(dict(runtime.entry.options))
+    trial = deepcopy(manager.trial)
+    # No independent new truth means continued observation. An inherited
+    # baseline must not abort monitoring before the real engine can decide.
+    await manager._automatic(time.time())
+    assert manager.last_result["apply"] is False
+    assert dict(runtime.entry.options) == applied
+    assert manager.trial == trial
+
+
 @pytest.mark.parametrize("action", ["settings", "profile", "calibration_apply"])
 async def test_failed_persistence_cannot_publish_live_settings_or_offsets(runtime, action):
     manager = runtime.manager

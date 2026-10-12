@@ -265,6 +265,103 @@ def test_trial_needs_independent_locations_and_targets():
     assert not result["accepted"]
 
 
+def trial(rows, previous, proposed):
+    return CalibrationEngine().evaluate_trial(
+        rows, previous_offsets=previous, proposed_offsets=proposed, now=100.0, model_version="model-one"
+    )
+
+
+@pytest.mark.parametrize("prior", [30.0, -30.0, 40.0, -127.0])
+def test_trial_allows_finite_inherited_target_baselines_outside_new_offset_bounds(prior):
+    rows = observations(offsets={"receiver-a": 4.0})
+    result = trial(rows, {"receiver-a": prior}, {"receiver-a": 4.0})
+    assert result["sufficient"]
+    assert result["accepted"]
+    assert not result["rollback"]
+    assert result["metrics"]["all"]["current_mae_m"] > result["metrics"]["all"]["proposed_mae_m"]
+
+
+def test_trial_ignores_unrelated_offline_and_invalid_legacy_offsets():
+    rows = observations(offsets={"receiver-a": 4.0})
+    previous = {
+        "receiver-a": 0.0,
+        "offline-receiver": 30.0,
+        "other": float("nan"),
+        "another": True,
+        "invalid": {"legacy": "data"},
+    }
+    frozen = dict(previous)
+    result = trial(rows, previous, {"receiver-a": 4.0})
+    assert result["accepted"]
+    assert result["metrics"]["per_receiver"].keys() == {"receiver-a"}
+    assert previous == frozen
+
+
+@pytest.mark.parametrize("baseline", [float("nan"), float("inf"), -float("inf"), True, None, "30"])
+def test_trial_rejects_nonfinite_boolean_or_nonnumeric_used_baseline(baseline):
+    with pytest.raises(ValueError, match="used previous"):
+        trial(observations(offsets={"receiver-a": 4.0}), {"receiver-a": baseline}, {"receiver-a": 4.0})
+
+
+@pytest.mark.parametrize("candidate", [30.0, -21.0, float("nan"), float("inf"), True, None, "4"])
+def test_trial_rejects_unsafe_new_candidate_even_without_evaluation_rows(candidate):
+    with pytest.raises(ValueError, match="Proposed trial"):
+        trial([], {"receiver-a": 0.0}, {"receiver-a": candidate})
+
+
+def test_trial_mac_aliases_match_prior_and_candidate_and_coverage():
+    lower = "aa:bb:cc:dd:ee:ff"
+    rows = observations(offsets={lower: 4.0})
+    for row in rows[::2]:
+        row["scanner_id"] = lower.upper()
+    result = trial(rows, {lower.upper(): 30.0, "offline": 30.0}, {lower.upper(): 4.0, lower: 4.0})
+    assert result["accepted"]
+    assert list(result["metrics"]["per_receiver"]) == [lower]
+    assert result["metrics"]["all"]["count"] == len(rows)
+    with pytest.raises(ValueError, match="conflict"):
+        trial(rows, {lower: 0.0}, {lower: 4.0, lower.upper(): 5.0})
+
+
+def test_trial_alias_duplicate_packets_cannot_manufacture_holdout_coverage():
+    lower = "aa:bb:cc:dd:ee:ff"
+    rows = observations(offsets={lower: 4.0})
+    duplicates = [{**row, "scanner_id": lower.upper()} for row in rows]
+    result = trial(rows + duplicates, {lower: 0.0}, {lower: 4.0})
+    assert result["accepted"]
+    assert result["metrics"]["all"]["count"] == len(rows)
+    assert result["rejected"]["duplicate_source_stamp"] == len(rows)
+
+
+def test_trial_opaque_sources_remain_case_sensitive_and_missing_baselines_are_insufficient():
+    rows = observations(offsets={"Receiver/Case": 4.0})
+    result = trial(rows, {"receiver/case": 30.0}, {"Receiver/Case": 4.0})
+    assert not result["sufficient"]
+    assert not result["accepted"]
+    assert not result["rollback"]
+    assert result["metrics"]["all"]["count"] == 0
+
+
+def test_trial_unobserved_baseline_invalidity_does_not_raise_or_claim_success():
+    rows = observations(offsets={"receiver-a": 4.0})
+    result = trial(rows, {"receiver-a": 0.0, "offline": float("nan")}, {"receiver-a": 4.0, "offline": 2.0})
+    assert not result["sufficient"]
+    assert not result["accepted"]
+    assert not result["rollback"]
+
+
+def test_trial_unsafe_prediction_from_extreme_finite_baseline_never_claims_acceptance():
+    result = trial(observations(offsets={"receiver-a": 4.0}), {"receiver-a": 10000.0}, {"receiver-a": 4.0})
+    assert result["sufficient"]
+    assert not result["accepted"]
+    assert any(reason.startswith("unsafe_prediction") for reason in result["reasons"])
+
+
+@pytest.mark.parametrize("identifier", [None, 42, True, "", "bad\x00receiver"])
+def test_trial_rejects_invalid_new_receiver_identifiers(identifier):
+    with pytest.raises(ValueError, match="Proposed trial"):
+        trial([], {}, {identifier: 4.0})
+
+
 def test_policy_rejects_nonfinite_boolean_and_unbounded_overrides():
     for kwargs in (
         {"max_auto_step_db": True},

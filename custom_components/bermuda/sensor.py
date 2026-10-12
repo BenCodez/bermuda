@@ -395,9 +395,15 @@ class BermudaSensorRange(BermudaSensor):
         the deadband (see distance_deadband), at most once per interval. BLE
         jitter is wider than the 0.1 m rounding, so without this nearly every
         interval wrote a new recorder row for every tracked device. A large
-        drop (see distance_fast_fall) and a ref_power change (calibration)
-        show at once.
+        drop (see distance_fast_fall) and a radio-model change (calibration)
+        show at once. Radio revisions remain pending until actual selection,
+        so an early property read cannot consume a correction against old data.
         """
+        model_revision = getattr(self._device, "model_revision", 0)
+        selection_ready = not getattr(self._device, "model_selection_pending", False)
+        model_changed = selection_ready and getattr(self, "bermuda_model_revision", 0) != model_revision
+        if selection_ready:
+            self.bermuda_model_revision = model_revision
         distance = self._device.area_distance
         if distance is None:
             # Out of range (or not yet heard): forget the last value, so the
@@ -414,7 +420,8 @@ class BermudaSensorRange(BermudaSensor):
         readings = [*readings[-(DISTANCE_READINGS_MAX - 1) :], (nowstamp, value)]
         self._distance_readings = readings
         if (
-            self._device.ref_power_changed >= nowstamp - 2  # calibration just changed
+            model_changed  # Calibrated model changes bypass the deadband even after a delayed first read.
+            or self._device.ref_power_changed >= nowstamp - 2  # Legacy direct calibration stamp compatibility
             or self.bermuda_last_stamp <= 0  # nothing published yet (the cache starts at 0)
             or not isinstance(last, int | float)
             or last - value >= distance_fast_fall(last) - DISTANCE_DEADBAND_TOLERANCE
