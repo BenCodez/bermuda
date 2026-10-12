@@ -167,13 +167,13 @@ def validate_observation(value: Any, *, captured_at: float, model_version: str) 
         _fail("source observation cannot be after capture")
     for key in ("rssi", "rssi_offset", "reference_power"):
         result[key] = finite_number(value[key], key)
-    result["attenuation"] = finite_number(value["attenuation"], "attenuation", minimum=0.1)
-    if result["attenuation"] > 20:
-        _fail("attenuation exceeds its permitted bound")
-    if not -200 <= result["rssi"] <= 20 or abs(result["rssi_offset"]) > 100:
-        _fail("RSSI or offset exceeds its permitted bound")
-    if not -200 <= result["reference_power"] <= 20:
-        _fail("reference power exceeds its permitted bound")
+    # Frozen diagnostics preserve effective legacy settings. New profiles and
+    # calibration proposals enforce their own narrower numeric bounds.
+    result["attenuation"] = finite_number(value["attenuation"], "attenuation")
+    if result["attenuation"] <= 0:
+        _fail("attenuation must be positive")
+    if not -200 <= result["rssi"] <= 20:
+        _fail("RSSI exceeds its permitted bound")
     result["filtered_distance"] = value.get("filtered_distance")
     if result["filtered_distance"] is not None:
         result["filtered_distance"] = finite_number(result["filtered_distance"], "filtered_distance", minimum=0)
@@ -393,7 +393,13 @@ class DiagnosticHistory:
         relocated = set()
         clocks = self._clocks.copy()
         for item in observations:
-            row = validate_observation(item, captured_at=captured, model_version=version)
+            try:
+                row = validate_observation(item, captured_at=captured, model_version=version)
+            except ValueError:
+                # A live source outside the recording contract must not prevent
+                # other sources from supplying history or independent evidence.
+                self.dropped_rows += 1
+                continue
             pair = row["device_id"], row["scanner_id"]
             if (
                 self.selected_devices

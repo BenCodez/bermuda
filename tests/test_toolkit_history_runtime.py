@@ -97,6 +97,57 @@ async def test_actual_api_runtime_records_source_once_across_poll_cycles(runtime
     assert manager.history.frames()[-1]["truth"] == []
 
 
+@pytest.mark.parametrize("selected", [[], [DEVICE]])
+@pytest.mark.parametrize("field,value", [("rssi", 21.0), ("rssi_distance_raw", 1e7), ("rssi_distance", 1e7)])
+async def test_unsupported_live_device_does_not_block_selected_history(runtime, selected, field, value):
+    other_id = "aa:bb:cc:dd:ee:02"
+    other_advert = SyntheticAdvert(**vars(runtime.advert))
+    other_advert.device_address = other_id
+    setattr(other_advert, field, value)
+    other_device = SimpleNamespace(**vars(runtime.device))
+    other_device.address = other_device.unique_id = other_id
+    other_device.adverts = {(other_id, SCANNER): other_advert}
+    runtime.coordinator.devices[other_id] = other_device
+    manager = runtime.manager
+    reading = manager._snapshot()["devices"][other_id]["scanners"][SCANNER]
+    assert reading["status"] == "current"
+    assert (
+        reading[{"rssi": "rssi", "rssi_distance_raw": "raw_distance", "rssi_distance": "filtered_distance"}[field]]
+        == value
+    )
+
+    await manager.async_dispatch("history_start", {"devices": selected})
+    await complete_update(manager)
+    assert manager.history.summary()["rows"] == 1
+    assert manager.history.summary()["dropped_rows"] == 1
+    assert manager.history.frames()[0]["observations"][0]["device_id"] == DEVICE
+    assert not manager.last_result or manager.last_result.get("status") != "pending"
+    runtime.advance()
+    other_advert.stamp = runtime.clock["stamp"]
+    await complete_update(manager)
+    assert manager.history.summary()["rows"] == 2
+    assert manager.history.summary()["dropped_rows"] == 2
+
+
+async def test_capture_skips_unsupported_receiver_and_preserves_independent_truth(runtime):
+    other_scanner_id = "aa:bb:cc:dd:ee:13"
+    other_advert = SyntheticAdvert(**vars(runtime.advert))
+    other_advert.scanner_address = other_scanner_id
+    other_advert.rssi_distance_raw = other_advert.rssi_distance = 1e7
+    runtime.device.adverts[(DEVICE, other_scanner_id)] = other_advert
+    manager = runtime.manager
+    captured = await manager.async_dispatch("capture", {**measured(), "ranges": {SCANNER: 2.0, other_scanner_id: 2.0}})
+    assert captured["captured"] == 1
+    assert manager.history.summary()["dropped_rows"] == 1
+    frame = manager.history.frames()[0]
+    assert [row["scanner_id"] for row in frame["observations"]] == [SCANNER]
+    assert frame["truth"][0]["ranges"] == {SCANNER: 2.0, other_scanner_id: 2.0}
+    assert len(manager._labelled_rows()) == 1
+    exported = await manager.async_dispatch("history_export", {"redact": False})
+    await manager.async_dispatch("history_import", {"data": exported})
+    assert manager.history.frames() == [frame]
+
+
 async def test_manual_capture_with_history_off_freezes_instant_truth(runtime):
     manager = runtime.manager
     assert manager.history.enabled is False

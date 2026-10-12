@@ -423,6 +423,103 @@ async def test_legacy_model_bounds_remain_compatible_without_explicit_profiles(r
     assert advert.rssi_distance_raw == pytest.approx(10 ** ((1 - (-68 + 40)) / 120))
 
 
+@pytest.mark.parametrize(
+    ("reference_power", "attenuation", "offset", "rssi"),
+    [
+        (-55.0, 50.0, 0.0, -68.0),
+        (-55.0, 0.05, 0.0, -55.1),
+        (-55.0, 3.0, 101.0, -68.0),
+        (-55.0, 3.0, -101.0, -68.0),
+        (25.0, 3.0, 0.0, -68.0),
+        (-201.0, 3.0, 0.0, -68.0),
+        (1e308, 1e308, 1e308, -68.0),
+        (-1e308, 1e308, -1e308, -68.0),
+        (-55.0, 5e-324, 0.0, -55.0),
+    ],
+)
+async def test_legacy_models_record_capture_and_round_trip_without_becoming_new_profiles(
+    runtime, reference_power, attenuation, offset, rssi
+):
+    manager, coordinator, advert = runtime.manager, runtime.coordinator, runtime.advert
+    legacy_options = {
+        **deepcopy(dict(runtime.entry.options)),
+        CONF_REF_POWER: reference_power,
+        CONF_ATTENUATION: attenuation,
+        CONF_RSSI_OFFSETS: {SCANNER: offset},
+    }
+    runtime.hass.config_entries.async_update_entry(runtime.entry, options=legacy_options)
+    coordinator.options.update(legacy_options)
+    advert.conf_ref_power, advert.conf_attenuation, advert.conf_rssi_offset = reference_power, attenuation, offset
+    advert.rssi = rssi
+    manager.invalidate_model()
+    advert._update_raw_distance(reading_is_new=False)
+    snapshot_row = snapshot_observations(manager._snapshot())[0]
+    assert snapshot_row["status"] == "current"
+    assert 0 < snapshot_row["raw_distance"] <= 1e6
+    assert math.isfinite(snapshot_row["raw_distance"])
+    assert snapshot_row["reference_power"] == reference_power
+    assert snapshot_row["attenuation"] == attenuation
+    assert snapshot_row["rssi_offset"] == offset
+
+    await manager.async_dispatch("history_start", {"devices": [DEVICE]})
+    await manager._after_update()
+    assert manager.history.summary()["rows"] == 1
+    assert manager.history.summary()["dropped_rows"] == 0
+    assert not manager.last_result or manager.last_result.get("status") != "pending"
+    await manager.async_dispatch("history_stop", {})
+    captured = await manager.async_dispatch(
+        "capture", {"device_id": DEVICE, "location_id": "legacy-model-site", "ranges": {SCANNER: 2.5}}
+    )
+    assert captured["captured"] == 1
+    assert manager.history.summary()["rows"] == 1
+    frozen = manager.history.frames()
+    for field in (
+        "rssi",
+        "reference_power",
+        "attenuation",
+        "rssi_offset",
+        "raw_distance",
+        "filtered_distance",
+        "stamp",
+    ):
+        assert frozen[0]["observations"][0][field] == snapshot_row[field]
+    assert frozen[0]["truth"][0]["source"] == "measured"
+
+    preview = await manager.async_dispatch("calibration_preview", {})
+    assert preview["eligible"] is False
+    assert preview["coverage"]["samples"] == 0
+    assert preview["rejected"] == {"invalid_numeric_input": 1}
+    assert preview["offsets"] == {}
+    before = deepcopy(dict(runtime.entry.options))
+    with pytest.raises(RuntimeError, match="current verified calibration preview"):
+        await manager.async_dispatch("calibration_apply", {})
+    with pytest.raises(ValueError, match="outside safe bounds"):
+        await manager.async_dispatch("shadow_start", {"candidate": {SCANNER: 101.0}})
+    with pytest.raises(ValueError, match="finite number between"):
+        await manager.async_dispatch(
+            "profile",
+            {
+                "kind": "receiver",
+                "id": SCANNER,
+                "profile": {"reference_power": reference_power, "attenuation": attenuation, "rssi_offset": offset},
+            },
+        )
+    assert dict(runtime.entry.options) == before
+
+    for redact in (False, True):
+        exported = await manager.async_dispatch("history_export", {"redact": redact})
+        row = exported["frames"][0]["observations"][0]
+        assert (row["reference_power"], row["attenuation"], row["rssi_offset"]) == (
+            reference_power,
+            attenuation,
+            offset,
+        )
+        imported = await manager.async_dispatch("history_import", {"data": json.dumps(exported, allow_nan=False)})
+        assert imported["rows"] == 1
+        assert manager.history.frames() == exported["frames"]
+    assert dict(runtime.entry.options) == before
+
+
 async def test_number_reference_power_change_invalidates_suggestions_and_proposals(runtime):
     manager = runtime.manager
     manager.proposal = _proposal(manager, {SCANNER: 1.0})

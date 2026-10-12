@@ -26,6 +26,25 @@ def _fail(message: str) -> NoReturn:
     raise ValueError(message)
 
 
+def _range_scale(delta_db: float, attenuation: float) -> float:
+    """Reject unrepresentable candidates even for supported tiny legacy exponents."""
+    try:
+        scale = finite_number(10.0 ** (delta_db / (10.0 * attenuation)), "candidate range scale", minimum=0)
+    except OverflowError:
+        _fail("candidate range exceeds numerical safety bounds")
+    if scale == 0:
+        _fail("candidate range falls below numerical safety bounds")
+    return scale
+
+
+def _scaled_distance(distance: float, scale: float) -> float:
+    """A positive captured range cannot become an unavailable zero through rounding."""
+    candidate = finite_number(distance * scale, "candidate distance", minimum=0)
+    if distance > 0 and candidate == 0:
+        _fail("candidate range falls below numerical safety bounds")
+    return candidate
+
+
 def _offsets(proposed: dict[str, float] | None) -> dict[str, float]:
     if proposed is None:
         return {}
@@ -231,11 +250,8 @@ class ReplayEngine:
                     )
                 clocks[stream] = {"stamp": observation["stamp"], "observed": observation["observed"], "origin": origin}
                 candidate_offset = offsets.get(observation["scanner_id"], observation["rssi_offset"])
-                offset_scale = 10 ** (
-                    (observation["rssi_offset"] - candidate_offset) / (10 * observation["attenuation"])
-                )
-                raw_candidate = observation["raw_distance"] * offset_scale
-                finite_number(raw_candidate, "candidate raw distance", minimum=0)
+                offset_scale = _range_scale(observation["rssi_offset"] - candidate_offset, observation["attenuation"])
+                raw_candidate = _scaled_distance(observation["raw_distance"], offset_scale)
                 if raw_candidate > 1e6:
                     _fail("candidate range exceeds the diagnostic model bound")
                 mode = modes.get(observation["device_id"])
@@ -246,7 +262,7 @@ class ReplayEngine:
                 # Re-seeding even the same mode would change its captured state
                 # and could manufacture improvement over the real current output.
                 candidate = (
-                    observation["filtered_distance"] * offset_scale
+                    _scaled_distance(observation["filtered_distance"], offset_scale)
                     if observation["filtered_distance"] is not None
                     else None
                 )
@@ -268,8 +284,9 @@ class ReplayEngine:
                     )
                     filtered_rssi = result["filtered_rssi"]
                     candidate = (
-                        raw_candidate
-                        * 10 ** ((observation["rssi"] - filtered_rssi) / (10 * observation["attenuation"]))
+                        _scaled_distance(
+                            raw_candidate, _range_scale(observation["rssi"] - filtered_rssi, observation["attenuation"])
+                        )
                         if filtered_rssi is not None
                         else None
                     )

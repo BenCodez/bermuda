@@ -38,6 +38,37 @@ def test_range_replay_raw_current_candidate_and_separate_labels():
     assert captured[0]["observations"][0]["rssi"] == -69.5
 
 
+@pytest.mark.parametrize("attenuation", [50.0, 0.05, 0.0001, 5e-324])
+def test_replay_preserves_supported_legacy_radio_baselines_without_a_candidate(attenuation):
+    captured = frames(distance=1.0, expected=1.0)
+    for frame in captured:
+        row = frame["observations"][0]
+        row.update(attenuation=attenuation, reference_power=25.0, rssi_offset=101.0, rssi=-76.0)
+    report = ReplayEngine().evaluate(captured)
+    assert report["range_metrics"]["current"]["mae_m"] == 0
+    assert report["range_metrics"]["candidate"]["mae_m"] == 0
+    assert all(row["candidate"] == 1 for row in report["observations"])
+
+
+@pytest.mark.parametrize("attenuation", [0.0001, 5e-324])
+@pytest.mark.parametrize("offset", [-1.0, 1.0])
+def test_tiny_legacy_attenuation_rejects_unrepresentable_candidates_with_validation_error(attenuation, offset):
+    captured = frames(distance=1.0, expected=1.0)
+    for frame in captured:
+        row = frame["observations"][0]
+        row.update(attenuation=attenuation, reference_power=-59.0, rssi=-59.0, rssi_offset=0.0)
+    with pytest.raises(ValueError, match="candidate range"):
+        ReplayEngine().evaluate(captured, proposed_offsets={"scanner-a": offset})
+
+
+def test_replay_rejects_a_positive_live_range_that_would_round_to_unavailable_zero():
+    captured = frames(distance=5e-324, expected=0.05)
+    for frame in captured:
+        frame["observations"][0].update(rssi_offset=0.0, attenuation=2.0)
+    with pytest.raises(ValueError, match="candidate range"):
+        ReplayEngine().evaluate(captured, proposed_offsets={"scanner-a": 20.0})
+
+
 def test_unlabelled_metrics_are_honestly_unavailable():
     report = ReplayEngine().evaluate(frames(labelled=False))
     assert report["range_metrics"] == {"raw": None, "current": None, "candidate": None}

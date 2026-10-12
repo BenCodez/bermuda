@@ -203,6 +203,9 @@ def test_import_is_atomic_bounded_and_creates_new_live_clock_epoch():
         lambda data: data.update(path="/tmp/arbitrary"),
         lambda data: data.update(session_epoch=True),
         lambda data: data["frames"][0]["observations"][0].update(rssi=float("nan")),
+        lambda data: data["frames"][0]["observations"][0].update(rssi=21),
+        lambda data: data["frames"][0]["observations"][0].update(raw_distance=1e7),
+        lambda data: data["frames"][0]["observations"][0].update(filtered_distance=1e7),
         lambda data: data["frames"][0]["observations"][0].update(stamp=-1),
         lambda data: data["frames"][0]["observations"][0].update(scanner_id=""),
         lambda data: data["frames"][0]["observations"][0].update(age=True),
@@ -271,15 +274,84 @@ def test_import_duplicate_json_keys_huge_numbers_and_deep_metadata_rejected():
         )
     bad = observation()
     bad["rssi"] = 10**1000
+    malformed = deepcopy(history.export(redact=False))
+    malformed["frames"][0]["observations"][0] = bad
     with pytest.raises(ValueError, match="finite"):
-        record(history, bad)
+        history.import_data(malformed, now=1001)
+    assert record(history, bad) == 0
     bad = observation(1001)
     nested = {}
     for _ in range(10):
         nested = {"nested": nested}
     bad["quality"] = nested
+    malformed["frames"][0]["captured_at"] = 1001
+    malformed["frames"][0]["observations"][0] = bad
     with pytest.raises(ValueError, match="deeply nested"):
-        record(history, bad)
+        history.import_data(malformed, now=1001)
+    assert record(history, bad) == 0
+    assert history.summary()["rows"] == 1
+    assert history.summary()["dropped_rows"] == 2
+
+
+@pytest.mark.parametrize("field", ["rssi_offset", "reference_power", "attenuation"])
+@pytest.mark.parametrize("value", [True, False, None, "2", float("nan"), float("inf"), float("-inf"), 10**1000])
+def test_malformed_legacy_models_are_skipped_live_and_rejected_on_import(field, value):
+    history = DiagnosticHistory(enabled=True)
+    assert record(history, observation()) == 1
+    original = history.frames()
+    invalid = observation(1001)
+    invalid[field] = value
+    data = history.export(redact=False)
+    data["frames"][0]["observations"][0][field] = value
+    with pytest.raises(ValueError, match="finite"):
+        history.import_data(data, now=1001)
+    assert history.frames() == original
+    assert record(history, invalid) == 0
+    assert history.frames() == original
+    assert history.summary()["dropped_rows"] == 1
+    assert record(history, observation(1001)) == 1
+
+
+@pytest.mark.parametrize("attenuation", [0, -1, -5e-324])
+def test_nonpositive_legacy_attenuation_is_rejected(attenuation):
+    history = DiagnosticHistory(enabled=True)
+    assert record(history, observation()) == 1
+    data = history.export(redact=False)
+    data["frames"][0]["observations"][0]["attenuation"] = attenuation
+    with pytest.raises(ValueError, match="must be positive"):
+        history.import_data(data, now=1001)
+    invalid = observation(1001)
+    invalid["attenuation"] = attenuation
+    assert record(history, invalid) == 0
+    assert history.summary()["dropped_rows"] == 1
+
+
+@pytest.mark.parametrize("selected", [None, ["beacon-a"]])
+@pytest.mark.parametrize("force", [False, True])
+def test_live_recording_isolates_unsupported_rows_and_preserves_valid_labels(selected, force):
+    history = DiagnosticHistory(enabled=not force, selected_devices=selected)
+    unsupported = observation(scanner="scanner-out-of-range", distance=1e7)
+    unselected = observation(device="beacon-b")
+    unselected["rssi"] = 21
+    labels = [truth(), truth(device="beacon-b")]
+    assert (
+        history.record(
+            [unsupported, unselected, None, observation()],
+            captured_at=1000,
+            model_version="model-1",
+            truth=labels,
+            force=force,
+        )
+        == 1
+    )
+    frame = history.frames()[0]
+    assert frame["observations"] == [observation()]
+    assert frame["truth"] == [truth()]
+    assert history.summary()["dropped_rows"] == 3
+    assert set(history._clocks) == {("beacon-a", "scanner-a")}
+    restored = DiagnosticHistory()
+    restored.import_data(history.export(redact=False), now=1001)
+    assert restored.frames() == history.frames()
 
 
 def test_full_redacted_export_round_trips_under_byte_budget():
