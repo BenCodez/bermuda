@@ -531,6 +531,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
       this._resetField(verified, existing.reference_power_verified);
       configureKind();
+      profileSave.disabled = this._busy || this._fileBusy || !this._targetAvailable(target);
     };
     target.addEventListener("change", loadProfile);
     kind.addEventListener("change", () => {
@@ -540,7 +541,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._markDraft(target);
       loadProfile();
     });
-    this._button(profiles, "Save profile", () => {
+    const profileSave = this._button(profiles, "Save profile", () => {
       if (!this._targetAvailable(target)) throw new Error("Choose an available profile target.");
       const profile = {};
       const remove = [];

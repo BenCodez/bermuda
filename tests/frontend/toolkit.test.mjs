@@ -872,6 +872,44 @@ test("profile kind changes replace a remembered target and scope drafts even whe
   assert.deepEqual(calls[0].profile, { model: "edited receiver A" });
 });
 
+for (const availableKind of ["receiver", "beacon", "none"]) test(`profile type changes update save availability with ${availableKind} targets`, async () => {
+  const server = state();
+  if (availableKind !== "receiver") server.snapshot.scanners = {};
+  if (availableKind !== "beacon") server.snapshot.devices = {};
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") calls.push(payload);
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._render();
+  for (const kind of ["beacon", "receiver", "beacon", "receiver"]) {
+    await edit(component, "Profile type", kind, "change");
+    assert.equal(button(component, "Save profile").disabled, kind !== availableKind);
+  }
+  if (availableKind === "none") {
+    await button(component, "Save profile").click();
+    assert.equal(calls.length, 0);
+    return;
+  }
+  await edit(component, "Profile type", availableKind, "change");
+  await edit(component, "model", "Synthetic profile edit");
+  await button(component, "Save profile").click();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].kind, availableKind);
+  assert.equal(calls[0].id, availableKind === "receiver" ? "receiver1" : "device1");
+  assert.deepEqual(calls[0].profile, { model: "Synthetic profile edit" });
+});
+
+for (const busyFlag of ["_busy", "_fileBusy"]) test(`profile type change retains ${busyFlag} action blocking`, async () => {
+  const component = panel(); component._render();
+  component[busyFlag] = true;
+  await edit(component, "Profile type", "beacon", "change");
+  assert.equal(button(component, "Save profile").disabled, true);
+  component[busyFlag] = false;
+  await edit(component, "Profile type", "receiver", "change");
+  assert.equal(button(component, "Save profile").disabled, false);
+});
+
 test("a profile acknowledgement cannot clear newer edits after explicit target and kind selection", async () => {
   const { server, receiverA, deviceA } = twoTargetState();
   const pending = deferred(); const calls = [];
