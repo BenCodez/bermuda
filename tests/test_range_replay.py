@@ -105,6 +105,25 @@ def test_shadow_never_mutates_live_and_requires_new_data_model_binding():
     assert not shadow.promotion_check(current_model_version="model-1")["eligible"]
 
 
+def test_shadow_reports_location_coverage_across_multiple_devices():
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={"scanner-a": 20 * math.log10(2)})
+    history = DiagnosticHistory(enabled=True)
+    for device_index, (device, locations) in enumerate(
+        (("beacon-a", ("site-a", "site-b")), ("beacon-b", ("site-c", "site-d")))
+    ):
+        for index in range(6):
+            when = 1000 + device_index * 6 + index
+            label = truth(when, device=device, location=locations[index >= 3], distance=2)
+            record(history, observation(when, device=device, distance=4), [label])
+    for frame in history.frames():
+        assert shadow.add_frame(frame)
+    check = shadow.promotion_check(current_model_version="model-1")
+    assert check["eligible"], check["reasons"]
+    assert check["new_labelled_rows"] == 12
+    assert check["new_locations"] == ["site-a", "site-b", "site-c", "site-d"]
+    assert check["new_locations"] == sorted(check["evaluation"]["report"]["per_location"])
+
+
 def test_shadow_old_data_reuse_unlabelled_insufficient_and_version_change():
     initial = frames()
     shadow = ShadowSession(initial, model_version="model-1", proposed_offsets={"scanner-a": 6})

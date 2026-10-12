@@ -652,8 +652,8 @@ class ShadowSession:
                     )
                 ):
                     reasons.append(f"range or bias regression for device {device} at location {location}")
-        for device, locations in _device_location_scanners(rows).items():
-            for location, scanner_groups in locations.items():
+        for device, device_locations in _device_location_scanners(rows).items():
+            for location, scanner_groups in device_locations.items():
                 for scanner, metrics in scanner_groups.items():
                     baseline, proposed = metrics["current"], metrics["candidate"]
                     if (
