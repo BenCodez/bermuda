@@ -54,6 +54,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._busy = false;
     this._connected = false;
     this._generation = 0;
+    this._snapshotRevision = 0;
     this._drafts = new Map();
     this._draftVersions = new Map();
     this._draftTargets = new Map();
@@ -118,8 +119,12 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._generation += 1;
   }
 
+  _isCurrent(generation) {
+    return generation === this._generation && this._connected && Boolean(this._hass) && this._hass.user?.is_admin !== false;
+  }
+
   async refresh() {
-    if (!this._hass || !this._connected || this._hass.user?.is_admin === false) return;
+    if (!this._isCurrent(this._generation)) return;
     if (this._refreshPromise) {
       this._refreshAgain = true;
       return this._refreshPromise;
@@ -128,22 +133,23 @@ export class BermudaToolkitPanel extends HTMLElement {
       do {
         this._refreshAgain = false;
         const generation = this._generation;
+        const snapshotRevision = this._snapshotRevision;
         const path = this._entryId ? `bermuda/toolkit?entry_id=${encodeURIComponent(this._entryId)}` : "bermuda/toolkit";
         try {
           const state = await this._hass.callApi("GET", path);
-          if (generation === this._generation && this._connected) {
+          if (this._isCurrent(generation) && snapshotRevision === this._snapshotRevision) {
             const previousModel = this._state?.diagnostics?.model_version;
             if (previousModel && previousModel !== state?.diagnostics?.model_version) this._invalidateResults("settings");
             this._state = state;
             this._render();
           }
         } catch (error) {
-          if (generation === this._generation && this._connected) {
+          if (this._isCurrent(generation) && snapshotRevision === this._snapshotRevision) {
             this._message = this._errorText(error);
             this._render();
           }
         }
-      } while (this._refreshAgain && this._connected);
+      } while (this._refreshAgain && this._isCurrent(this._generation));
     })();
     try { await this._refreshPromise; } finally { this._refreshPromise = null; }
   }
@@ -153,7 +159,7 @@ export class BermudaToolkitPanel extends HTMLElement {
   }
 
   async _perform(action, payload = {}, { download = false, draftNames = [] } = {}) {
-    if (this._busy || !this._hass || this._hass.user?.is_admin === false) return;
+    if (this._busy || !this._isCurrent(this._generation)) return;
     this._rememberDrafts();
     const submitted = draftNames.map(name => [name, this._draftVersions.get(name)]);
     this._busy = true;
@@ -165,7 +171,9 @@ export class BermudaToolkitPanel extends HTMLElement {
       const request = { ...payload, action, entry_id: entryId };
       if (new TextEncoder().encode(JSON.stringify(request)).length > MAX_IMPORT_BYTES) throw new Error("The JSON request including metadata exceeds 2 MiB. Use a smaller recording or settings document.");
       const result = await this._hass.callApi("POST", "bermuda/toolkit", request);
-      if (generation !== this._generation || !this._connected) return;
+      if (!this._isCurrent(generation)) return;
+      // Reads started before this acknowledgement cannot replace its accepted state.
+      this._snapshotRevision += 1;
       this._rememberDrafts();
       for (const [name, version] of submitted) {
         if (this._draftVersions.get(name) === version) {
@@ -187,9 +195,9 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (submitted.some(([name]) => this._drafts.has(name))) this._message += " Newer edits remain unsaved.";
       if (download) this._download(result, "bermuda-history.json");
       await this.refresh();
-      return result;
+      if (this._isCurrent(generation)) return result;
     } catch (error) {
-      if (generation === this._generation && this._connected) this._message = this._errorText(error);
+      if (this._isCurrent(generation)) this._message = this._errorText(error);
     } finally {
       this._busy = false;
       if (this._connected) this._render();
@@ -211,15 +219,15 @@ export class BermudaToolkitPanel extends HTMLElement {
   }
 
   async _importHistory(file) {
-    if (this._busy || this._fileBusy) return;
+    if (this._busy || this._fileBusy || !this._isCurrent(this._generation)) return;
     this._fileBusy = true;
     const generation = this._generation;
     try {
       this._render();
       const data = await readJSONFile(file);
-      if (generation === this._generation && this._connected) await this._perform("history_import", { data });
+      if (this._isCurrent(generation)) await this._perform("history_import", { data });
     } catch (error) {
-      if (generation === this._generation && this._connected) this._message = this._errorText(error);
+      if (this._isCurrent(generation)) this._message = this._errorText(error);
     } finally {
       this._fileBusy = false;
       if (this._connected) this._render();
@@ -235,11 +243,14 @@ export class BermudaToolkitPanel extends HTMLElement {
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
-  async _copy(data, { compact = false } = {}) {
+  async _copy(data, { compact = false, generation = this._generation } = {}) {
+    if (!this._isCurrent(generation)) return;
     try {
       await navigator.clipboard.writeText(compact ? JSON.stringify(data) : pretty(data));
+      if (!this._isCurrent(generation)) return;
       this._message = "Copied JSON to clipboard.";
     } catch {
+      if (!this._isCurrent(generation)) return;
       this._message = compact ? "Clipboard is unavailable. Use Export JSON to save the recording." : "Clipboard is unavailable. Select and copy the displayed diagnostics JSON in Health.";
     }
     this._render();
@@ -391,7 +402,10 @@ export class BermudaToolkitPanel extends HTMLElement {
     button.addEventListener("click", async () => {
       if ((!allowBusy && (this._busy || this._fileBusy)) || button.disabled) return;
       if (![...this.shadowRoot.querySelectorAll("button")].includes(button)) return;
-      try { await callback(); } catch (error) { this._message = this._errorText(error); this._render(); }
+      const generation = this._generation;
+      try { await callback(); } catch (error) {
+        if (this._isCurrent(generation)) { this._message = this._errorText(error); this._render(); }
+      }
     });
     parent.append(button);
     return button;
@@ -612,7 +626,11 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._button(buttons, "Clear history", () => this._perform("history_clear"));
     const redact = this._field(history, "Redact recording identifiers for sharing", "history-redact", true, { type: "checkbox" });
     this._button(buttons, "Export JSON", () => this._perform("history_export", { redact: redact.checked }, { download: true }));
-    this._button(buttons, "Copy recording", async () => { const data = await this._perform("history_export", { redact: redact.checked }); if (data) await this._copy(data, { compact: true }); });
+    this._button(buttons, "Copy recording", async () => {
+      const generation = this._generation;
+      const data = await this._perform("history_export", { redact: redact.checked });
+      if (data) await this._copy(data, { compact: true, generation });
+    });
     history.append(buttons);
     const file = this._field(history, "Import recording JSON (maximum 2 MiB)", "history-file", "", { type: "file" });
     file.accept = ".json,application/json";
@@ -669,7 +687,11 @@ export class BermudaToolkitPanel extends HTMLElement {
     const diagnostic = this._section(parent, "Diagnostics and rejection reasons", "Use full diagnostics when reporting coverage, freshness, model applicability, calibration or fingerprint rejection. Exports omit private keys.");
     this._button(diagnostic, "Load full diagnostics", () => this._perform("diagnostics"));
     const data = this._results.diagnostics || this._state.diagnostics || this._state;
-    this._button(diagnostic, "Copy full diagnostics", async () => { const full = await this._perform("diagnostics"); if (full) await this._copy(full); });
+    this._button(diagnostic, "Copy full diagnostics", async () => {
+      const generation = this._generation;
+      const full = await this._perform("diagnostics");
+      if (full) await this._copy(full, { generation });
+    });
     this._json(diagnostic, data);
     const observations = this._section(parent, "Current device observations", "RSSI, source stamps, age, status, quality, raw range and filtered range for the current snapshot.");
     this._json(observations, this._snapshot().devices);

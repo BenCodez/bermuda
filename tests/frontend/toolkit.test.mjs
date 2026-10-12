@@ -77,6 +77,18 @@ async function edit(component, label, value, event = "input") {
   return input;
 }
 
+function mockClipboard(t, writeText) {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  t.after(() => { if (descriptor) Object.defineProperty(navigator, "clipboard", descriptor); else delete navigator.clipboard; });
+}
+
+function switchContext(component, change) {
+  if (change === "entry") component.panel = { config: { entry_id: "entry-b" } };
+  else if (change === "disconnect") component.disconnectedCallback();
+  else component.hass = { user: { id: change === "user" ? "admin-b" : "admin-a", is_admin: change !== "admin" }, callApi: component._hass.callApi };
+}
+
 test("numbers preserve blank optional ranges and reject nonfinite/out-of-bound input", () => {
   assert.equal(finiteInput({ value: "" }, { optional: true }), undefined);
   assert.equal(finiteInput({ value: ".05" }, { min: .05, max: 1000 }), .05);
@@ -666,6 +678,159 @@ test("clipboard denial directs recording users to export and diagnostics users t
   assert.match(component._message, /diagnostics JSON in Health/);
   assert.match(component.shadowRoot.textContent, /synthetic/);
 });
+
+for (const [label, tab] of [["Copy full diagnostics", 4], ["Copy recording", 2]]) {
+  for (const change of ["entry", "user", "admin", "disconnect"]) {
+    test(`${label} discards a result when ${change} changes during its refresh`, async t => {
+      const copied = [];
+      mockClipboard(t, async text => { copied.push(text); });
+      const loading = deferred();
+      let gets = 0;
+      const replacement = { ...state(), entry_id: "entry-b", diagnostics: { owner: "admin-b" } };
+      const component = panel(async method => method === "POST" ? { prior_context: "private synthetic result" } : ++gets === 1 ? loading.promise : replacement);
+      component._entryId = "entry-a";
+      component._hass.user = { id: "admin-a", is_admin: true };
+      component._activeTab = tab; component._render();
+      const copying = button(component, label).click();
+      await tick();
+      assert.equal(gets, 1);
+      assert.equal(component._busy, true);
+      switchContext(component, change);
+      component._message = "Current context status";
+      loading.resolve(state());
+      await copying;
+      assert.deepEqual(copied, []);
+      assert.equal(component._message, "Current context status");
+      assert.equal(component._busy, false);
+      if (change === "entry" || change === "user") {
+        assert.equal(gets, 2, "the replacement context gets the bounded trailing read");
+        assert.equal(component._state, replacement);
+      } else assert.equal(gets, 1, "denied or disconnected contexts do not start another read");
+    });
+  }
+}
+
+for (const [change, label, tab, failure] of [
+  ["entry", "Copy full diagnostics", 4, false],
+  ["user", "Copy recording", 2, true],
+  ["admin", "Copy full diagnostics", 4, true],
+  ["disconnect", "Copy recording", 2, false],
+]) {
+  test(`${label} ${failure ? "failure" : "completion"} cannot update status after a ${change} change`, async t => {
+    const copyingText = deferred();
+    const copied = [];
+    mockClipboard(t, text => { copied.push(text); return copyingText.promise; });
+    const component = panel(async method => method === "POST" ? { synthetic: "current-context result" } : state());
+    component._hass.user = { id: "admin-a", is_admin: true };
+    component._activeTab = tab; component._render();
+    const copying = button(component, label).click();
+    await tick();
+    assert.equal(copied.length, 1, "the current context initiated the clipboard write");
+    switchContext(component, change);
+    await tick();
+    component._message = "Replacement context status";
+    let renders = 0;
+    t.mock.method(component, "_render", () => { renders += 1; });
+    if (failure) copyingText.reject(new DOMException("Denied", "NotAllowedError"));
+    else copyingText.resolve();
+    await copying;
+    assert.equal(component._message, "Replacement context status");
+    assert.equal(renders, 0);
+  });
+}
+
+for (const action of ["profile", "settings"]) {
+  for (const olderFails of [false, true]) {
+    for (const trailingFails of [false, true]) {
+      for (const newerEdit of [false, true]) {
+        test(`${action} acknowledgement survives a pre-save GET ${olderFails ? "error" : "response"}, trailing GET ${trailingFails ? "failure" : "success"}${newerEdit ? " and newer edits" : ""}`, async () => {
+          const older = deferred(), trailing = deferred();
+          const server = state();
+          server.options.receiver_profiles = { receiver1: { model: "old metadata", rssi_offset: 1 } };
+          server.options.history_window_s = 900;
+          const beforeSave = structuredClone(server);
+          let gets = 0;
+          const component = panel(async (method, path, payload) => {
+            if (method === "GET") return ++gets === 1 ? older.promise : trailing.promise;
+            if (action === "profile") {
+              server.options.receiver_profiles.receiver1 = { model: payload.profile.model, rssi_offset: 5 };
+              return { profile: structuredClone(server.options.receiver_profiles.receiver1) };
+            }
+            server.options = { ...server.options, ...payload.settings, auto_calibration: true };
+            return { options: structuredClone(server.options) };
+          });
+          component._state = structuredClone(server); component._render();
+          const label = action === "profile" ? "model" : "History window (seconds)";
+          const draftName = action === "profile" ? "profile-model" : "window";
+          const saved = action === "profile" ? "saved metadata" : "1800";
+          const newer = action === "profile" ? "newer unsaved metadata" : "2400";
+          const reading = component.refresh();
+          await edit(component, label, saved);
+          const saving = button(component, action === "profile" ? "Save profile" : "Save runtime settings").click();
+          await tick();
+          assert.equal(component._drafts.has(draftName), false);
+          if (newerEdit) await edit(component, label, newer);
+          const draftVersion = component._draftVersions.get(draftName);
+          if (olderFails) older.reject(new Error("Synthetic pre-save read failure"));
+          else older.resolve(beforeSave);
+          await tick();
+          assert.equal(gets, 2, "the save shares one bounded trailing refresh");
+          assert.match(component._message, /completed\./, "a superseded read cannot replace the save status");
+          assert.equal(action === "profile" ? component._profile("receiver", "receiver1").model : String(component._options().history_window_s), saved);
+          assert.equal(field(component, label).value, newerEdit ? newer : saved);
+          if (trailingFails) trailing.reject(new Error("Synthetic trailing refresh failure"));
+          else {
+            server.options.receiver_profiles.receiver1.rssi_offset = 7;
+            server.options.reliability_weighting = true;
+            trailing.resolve(structuredClone(server));
+          }
+          await Promise.all([reading, saving]);
+          assert.equal(gets, 2);
+          assert.equal(field(component, label).value, newerEdit ? newer : saved);
+          assert.equal(component._drafts.has(draftName), newerEdit);
+          assert.equal(component._draftVersions.get(draftName), draftVersion);
+          if (newerEdit) assert.equal(component._drafts.get(draftName), newer);
+          if (trailingFails) assert.equal(component._message, "Synthetic trailing refresh failure");
+          else {
+            assert.equal(field(component, "Receiver RSSI offset (dB)").value, "7");
+            assert.equal(field(component, "Enable reliability weighting").checked, true);
+          }
+        });
+      }
+    }
+  }
+}
+
+for (const action of ["profile", "settings"]) {
+  test(`a failed ${action} POST leaves the pending GET usable and keeps newer drafts`, async () => {
+    const loading = deferred(), posting = deferred();
+    let gets = 0;
+    const component = panel(async method => { if (method === "GET") { gets += 1; return loading.promise; } return posting.promise; });
+    component._render();
+    const label = action === "profile" ? "model" : "History window (seconds)";
+    const draftName = action === "profile" ? "profile-model" : "window";
+    const reading = component.refresh();
+    await edit(component, label, action === "profile" ? "submitted metadata" : "1800");
+    const saving = button(component, action === "profile" ? "Save profile" : "Save runtime settings").click();
+    const newer = action === "profile" ? "newer unsaved metadata" : "2400";
+    await edit(component, label, newer);
+    const draftVersion = component._draftVersions.get(draftName);
+    posting.reject(new Error("Synthetic POST failure"));
+    await saving;
+    const fresh = state();
+    fresh.options.receiver_profiles = { receiver1: { model: "external metadata", rssi_offset: 9 } };
+    fresh.options.history_window_s = 3600;
+    loading.resolve(fresh);
+    await reading;
+    assert.equal(component._state, fresh);
+    assert.equal(gets, 1);
+    assert.equal(field(component, label).value, newer);
+    assert.equal(component._drafts.get(draftName), newer);
+    assert.equal(component._draftVersions.get(draftName), draftVersion);
+    assert.equal(field(component, "Receiver RSSI offset (dB)").value, "9");
+    assert.equal(component._message, "Synthetic POST failure");
+  });
+}
 
 function twoTargetState() {
   const receiverA = "aa:bb:cc:dd:ee:11", receiverB = "aa:bb:cc:dd:ee:22";
