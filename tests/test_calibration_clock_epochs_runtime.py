@@ -34,6 +34,16 @@ async def test_reused_live_source_clocks_keep_both_measured_scenes(evidence_runt
     manager.store = MagicMock(spec=Store)
     manager.store.async_load = AsyncMock(return_value=saved)
     manager.store.async_save = AsyncMock()
+    # A genuinely different host has new advert owners and its own live clock
+    # before importing recordings; imported stamps never establish that clock.
+    value.clock.mono = SOURCE_STAMP
+    value.clock.epoch += 1.0
+    for beacon in value.beacons:
+        for scanner in value.receivers:
+            scanner.stamps[beacon.address.upper()] = SOURCE_STAMP
+            advert = BermudaAdvert(beacon, advertisement(-68), value.coordinator.options, scanner)
+            beacon.adverts[(beacon.address, scanner.address)] = advert
+            advert.calculate_data()
     if transition == "reboot":
         monkeypatch.setattr("custom_components.bermuda.toolkit._host_clock_id", lambda: "synthetic-calibration-boot-b")
         await manager.async_load()
@@ -48,14 +58,6 @@ async def test_reused_live_source_clocks_keep_both_measured_scenes(evidence_runt
 
         # The second host/session reuses precisely the same source monotonic
         # stamps, while the later UTC capture remains independently fresh.
-        value.clock.mono = SOURCE_STAMP
-        value.clock.epoch += 1.0
-        for beacon in value.beacons:
-            for scanner in value.receivers:
-                scanner.stamps[beacon.address.upper()] = SOURCE_STAMP
-                advert = BermudaAdvert(beacon, advertisement(-68), value.coordinator.options, scanner)
-                beacon.adverts[(beacon.address, scanner.address)] = advert
-                advert.calculate_data()
         labelled = await collect_evidence(value, fixed=False, noise_db=noise_db)
         assert len(labelled) == 64
         assert {row["session_epoch"] for row in labelled} == {first_epoch, first_epoch + 1}

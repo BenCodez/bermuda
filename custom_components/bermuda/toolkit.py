@@ -183,6 +183,7 @@ class ToolkitManager:
         self.trial: dict | None = None
         self.last_applied: float | None = None
         self.last_data_id: str | None = None
+        self._history_epoch_rebased_at: float | None = None
         self._last_auto = 0.0
         self._last_saved = 0.0
         self._perf = {"updates": 0, "last_update_s": 0.0, "max_update_s": 0.0, "background_skipped": 0}
@@ -273,6 +274,9 @@ class ToolkitManager:
         if saved.get("fingerprints"):
             self.fingerprints.import_state(saved["fingerprints"])
         clock = saved.get("clock", {})
+        rebased_at = saved.get("history_epoch_rebased_at")
+        if finite_number(rebased_at) and rebased_at >= 0:
+            self._history_epoch_rebased_at = rebased_at
         reset = False
         if isinstance(clock, dict):
             if self._boot_id and clock.get("boot_id"):
@@ -282,7 +286,10 @@ class ToolkitManager:
                 elapsed_source = monotonic_time_coarse() - clock["stamp"]
                 reset = elapsed_source < 0 or abs(elapsed_wall - elapsed_source) > 5
         if reset:
-            self.history.start(clear=False)
+            if self.history.new_source_session(compact=True):
+                self.last_result = {"reasons": ["history_clock_epochs_rebased"], "status": "recovered"}
+                if isinstance(saved.get("last_data_id"), str) and saved["last_data_id"]:
+                    self._history_epoch_rebased_at = time.time()
             self.history.enabled = self.settings["history_enabled"]
             self.fingerprints.new_session()
         trial = saved.get("trial")
@@ -322,6 +329,7 @@ class ToolkitManager:
             "identities": deepcopy(self._identities),
             "history": (history or self.history).export(redact=False),
             "history_clocks": (history or self.history).export_clocks(),
+            "history_epoch_rebased_at": self._history_epoch_rebased_at,
             "fingerprints": (fingerprints or self.fingerprints).export_state(),
             "trial": deepcopy(trial if replace_trial else self.trial),
             "last_applied": self.last_applied,
@@ -660,6 +668,15 @@ class ToolkitManager:
             msg = "The Bermuda entry is not loaded"
             raise RuntimeError(msg)
         return snapshot
+
+    def _history_live_snapshot(self) -> dict:
+        """Inspect import clock boundaries without advancing live quality state."""
+        states, version = self._states, self._version_cache
+        self._states = {key: copy(state) for key, state in states.items()}
+        try:
+            return self._snapshot()
+        finally:
+            self._states, self._version_cache = states, version
 
     def _current_offsets(self) -> dict:
         legacy = self.coordinator.options.get(CONF_RSSI_OFFSETS, {})
@@ -1417,6 +1434,8 @@ class ToolkitManager:
             if action == "history_import":
                 replacement = DiagnosticHistory(window_s=self.settings["history_window_s"], max_bytes=HISTORY_BYTES)
                 await self._run_worker(replacement.import_data, deepcopy(payload.get("data")), now=time.time())
+                snapshot = self._history_live_snapshot()
+                replacement.retain_live_sources(self.history, snapshot_observations(snapshot), now=snapshot["captured"])
                 replacement.enabled = self.settings["history_enabled"]
                 await self.store.async_save(self._store_payload(history=replacement))
                 self.history = replacement
@@ -1756,13 +1775,25 @@ class ToolkitManager:
                 await self._rollback(disable_auto=True)
                 return
         proposal = await self._preview()
+        consumed = self.last_data_id
+        # Renumbering retained epochs changes signatures, not received evidence.
+        # A consumed proposal still needs a genuinely newer eligible source UTC.
+        if (
+            consumed
+            and self._history_epoch_rebased_at is not None
+            and (
+                not finite_number(proposal.get("latest_observed"))
+                or proposal["latest_observed"] <= self._history_epoch_rebased_at
+            )
+        ):
+            consumed = proposal["data_id"]
         decision = self.engine.automatic_decision(
             proposal,
             now=time.time(),
             model_version=self.version(),
             current_offsets=self._current_offsets(),
             last_applied=self.last_applied,
-            last_data_id=self.last_data_id,
+            last_data_id=consumed,
             observations=self._proposal_rows,
             verified_reference_devices=self._verified_devices(),
         )

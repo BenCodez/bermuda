@@ -1,9 +1,10 @@
 """
 Bounded, detached diagnostic observations and deliberately supplied range truth.
 
-History is memory-only and starts a new source-clock epoch on each start/reset. A
-measured label belongs to one capture; fixed references must be supplied explicitly
-for each capture by the settings owner. Import accepts JSON data, never file paths.
+History retains source-clock watermarks when recording resumes; a confirmed host
+clock reset starts a new epoch. A measured label belongs to one capture; fixed
+references must be supplied explicitly for each capture by the settings owner.
+Import accepts JSON data, never file paths.
 """
 
 from __future__ import annotations
@@ -307,6 +308,8 @@ class DiagnosticHistory:
         self._sequence = 0
         self._frames: list[dict[str, Any]] = []
         self._clocks: dict[tuple[str, str], tuple[float, float]] = {}
+        self._source_clocks: dict[tuple[str, str], tuple[float, float]] = {}
+        self._live_boundaries: dict[tuple[str, str], tuple[float, float]] = {}
         self._redaction_salt = secrets.token_hex(16)
         self._frame_sizes: list[int] = []
         self._frame_budgets: list[int] = []
@@ -324,17 +327,40 @@ class DiagnosticHistory:
         return sorted({opaque_id(device, "selected device") for device in devices})
 
     def start(self, *, selected_devices: list[str] | None = None, clear: bool = True) -> None:
+        selection = self.selected_devices
         if selected_devices is not None:
             selection = self._selection(selected_devices)
             if not clear and selection != self.selected_devices:
                 _fail("changing the selected devices requires clearing history")
-            self.selected_devices = selection
         if clear:
             self.clear()
+        self.selected_devices = selection
+        self.enabled = True
+
+    def new_source_session(self, *, compact: bool = False) -> bool:
+        """Start a confirmed host-clock epoch, retaining historical frames."""
+        if type(compact) is not bool:
+            _fail("compact must be a boolean")
+        rebased = self.session_epoch >= MAX_CLOCK_EPOCH and compact
+        if self.session_epoch >= MAX_CLOCK_EPOCH and not rebased:
+            _fail("history source-clock epoch exhausted; cannot start a new session")
+        if rebased:
+            # Only a confirmed reboot may renumber exhausted epochs. Frozen
+            # packet, observation and truth data stay exactly as recorded.
+            epochs = sorted({frame["session_epoch"] for frame in self._frames})
+            next_epoch = _integer(len(epochs) + 1, "session_epoch", 1, MAX_CLOCK_EPOCH)
+            identities = {epoch: index for index, epoch in enumerate(epochs, start=1)}
+            self._frames = [{**frame, "session_epoch": identities[frame["session_epoch"]]} for frame in self._frames]
+            self.session_epoch = next_epoch
+            self._refresh_counts()
         else:
             self.session_epoch += 1
-            self._clocks.clear()
-        self.enabled = True
+        self._clocks.clear()
+        self._source_clocks.clear()
+        self._live_boundaries.clear()
+        if self._frames:
+            self._prune(self._frames[-1]["captured_at"])
+        return rebased
 
     def stop(self) -> None:
         self.enabled = False
@@ -351,6 +377,8 @@ class DiagnosticHistory:
         self._prune(current)
 
     def clear(self) -> None:
+        if self.session_epoch >= MAX_CLOCK_EPOCH:
+            _fail("history source-clock epoch exhausted; cannot clear the history")
         self._frames.clear()
         self._frame_sizes.clear()
         self._frame_budgets.clear()
@@ -358,10 +386,57 @@ class DiagnosticHistory:
         self._byte_count = 2
         self._budget_count = 2
         self._clocks.clear()
+        self._source_clocks.clear()
+        self._live_boundaries.clear()
         self._sequence = 0
         self.dropped_rows = 0
         self.session_epoch += 1
         self._redaction_salt = secrets.token_hex(16)
+
+    @staticmethod
+    def _clock_id(identifier: str) -> str:
+        """Canonicalize MAC case while retaining opaque public identifiers."""
+        parts = identifier.split(":")
+        if len(parts) == 6 and all(
+            len(part) == 2 and all(char in "0123456789abcdefABCDEF" for char in part) for part in parts
+        ):
+            return identifier.lower()
+        return identifier
+
+    @classmethod
+    def _source_key(cls, row: dict[str, Any]) -> tuple[str, str]:
+        return cls._clock_id(row.get("source_id", row["device_id"])), cls._clock_id(row["scanner_id"])
+
+    def retain_live_sources(
+        self, previous: DiagnosticHistory, observations: list[dict[str, Any]], *, now: float
+    ) -> None:
+        """Seed an imported history from trusted current-host clocks, never imported stamps."""
+        current = finite_number(now, "now", minimum=0)
+        epoch = max(self.session_epoch, previous.session_epoch + 1)
+        _integer(epoch, "session_epoch", 1, MAX_CLOCK_EPOCH)
+        sources = previous._source_clocks.copy()
+        for row in observations:
+            try:
+                device = opaque_id(row.get("source_id", row.get("device_id")), "source_id")
+                scanner = opaque_id(row.get("scanner_id"), "scanner_id")
+                stamp = finite_number(row.get("stamp"), "stamp", minimum=0)
+                observed = finite_number(row.get("observed"), "observed", minimum=0)
+                finite_number(row.get("age"), "age", minimum=0)
+            except ValueError:
+                continue
+            if stamp > 1e12 or observed > current:
+                continue
+            pair = self._clock_id(device), self._clock_id(scanner)
+            old = sources.get(pair, (0.0, 0.0))
+            sources[pair] = max(old[0], stamp), max(old[1], observed)
+        if len(sources) > self.max_rows or len(previous._clocks) > self.max_rows:
+            _fail("current live clock watermarks exceed the row budget")
+        if self._budget_count + self._header_size(session_epoch=epoch) - 2 > self.max_bytes:
+            _fail("normalized import exceeds the history byte budget")
+        self.session_epoch = epoch
+        self._clocks = previous._clocks.copy()
+        self._source_clocks = sources
+        self._live_boundaries = sources.copy()
 
     def record(
         self,
@@ -392,6 +467,7 @@ class DiagnosticHistory:
         labelled_pairs = {(label["device_id"], scanner) for label in labels for scanner in label["ranges"]}
         relocated = set()
         clocks = self._clocks.copy()
+        source_clocks = self._source_clocks.copy()
         for item in observations:
             try:
                 row = validate_observation(item, captured_at=captured, model_version=version)
@@ -401,14 +477,20 @@ class DiagnosticHistory:
                 self.dropped_rows += 1
                 continue
             pair = row["device_id"], row["scanner_id"]
+            source_pair = self._source_key(row)
             if (
                 self.selected_devices
                 and pair[0] not in self.selected_devices
                 and (not force or pair not in labelled_pairs)
             ):
                 continue
+            boundary = self._live_boundaries.get(source_pair)
+            if boundary and (row["stamp"] <= boundary[0] or row["observed"] < boundary[1]):
+                continue
             previous = clocks.get(pair)
-            if previous is None and len(clocks) >= self.max_rows:
+            if (previous is None and len(clocks) >= self.max_rows) or (
+                source_pair not in source_clocks and len(source_clocks) >= self.max_rows
+            ):
                 # Bound clock metadata as well as stored observations. Clearing
                 # the session permits a new set of independently tracked sources.
                 self.dropped_rows += 1
@@ -446,6 +528,8 @@ class DiagnosticHistory:
                 relocated.add(key)
             rows.append(row)
             clocks[pair] = row["stamp"], row["observed"]
+            old_source = source_clocks.get(source_pair, (0.0, 0.0))
+            source_clocks[source_pair] = max(old_source[0], row["stamp"]), max(old_source[1], row["observed"])
         if not rows:
             self._prune(captured)
             return 0
@@ -493,6 +577,9 @@ class DiagnosticHistory:
         # rows, so an old packet does not become new evidence after eviction.
         for row in rows:
             self._clocks[row["device_id"], row["scanner_id"]] = row["stamp"], row["observed"]
+            pair = self._source_key(row)
+            old_source = self._source_clocks.get(pair, (0.0, 0.0))
+            self._source_clocks[pair] = max(old_source[0], row["stamp"]), max(old_source[1], row["observed"])
         self._frames.append(frame)
         self._frame_sizes.append(json_size(frame))
         self._frame_budgets.append(self._frame_budget(frame))
@@ -618,7 +705,45 @@ class DiagnosticHistory:
                 [device, scanner, stamp, observed]
                 for (device, scanner), (stamp, observed) in sorted(self._clocks.items())
             ],
+            "source_clocks": [
+                [source, scanner, stamp, observed]
+                for (source, scanner), (stamp, observed) in sorted(self._source_clocks.items())
+            ],
+            "live_boundaries": [
+                [source, scanner, stamp, observed]
+                for (source, scanner), (stamp, observed) in sorted(self._live_boundaries.items())
+            ],
         }
+
+    def _restore_clock_rows(
+        self, rows: Any, existing: dict[tuple[str, str], tuple[float, float]], *, now: float, physical: bool = False
+    ) -> dict[tuple[str, str], tuple[float, float]]:
+        if type(rows) is not list or len(rows) > self.max_rows:
+            _fail("local clock watermarks exceed the row budget")
+        restored = existing.copy()
+        seen = set()
+        for row in rows:
+            if type(row) is not list or len(row) != 4:
+                _fail("local clock watermarks require device, scanner, stamp and observed")
+            pair = opaque_id(row[0], "clock device_id"), opaque_id(row[1], "clock scanner_id")
+            if physical:
+                pair = self._clock_id(pair[0]), self._clock_id(pair[1])
+            if pair in seen:
+                _fail("local clock watermarks contain duplicate sources")
+            seen.add(pair)
+            stamp = finite_number(row[2], "clock stamp", minimum=0)
+            observed = finite_number(row[3], "clock observed", minimum=0)
+            if stamp > 1e12:
+                _fail("source stamp exceeds its permitted clock bound")
+            if observed > now:
+                _fail("local clock watermarks cannot contain future observations")
+            previous = restored.get(pair)
+            if previous and (stamp < previous[0] or observed < previous[1]):
+                _fail("local clock watermarks cannot move existing evidence backwards")
+            restored[pair] = stamp, observed
+        if len(restored) > self.max_rows:
+            _fail("combined local clock watermarks exceed the row budget")
+        return restored
 
     def restore_clocks(self, data: dict[str, Any], *, now: float) -> None:
         """
@@ -629,36 +754,27 @@ class DiagnosticHistory:
         must be at least as recent as existing evidence in the same session.
         """
         current = finite_number(now, "now", minimum=0)
-        if type(data) is not dict or set(data) != {"session_epoch", "clocks"}:
+        if (
+            type(data) is not dict
+            or not {"session_epoch", "clocks"} <= data.keys()
+            or data.keys() - {"session_epoch", "clocks", "source_clocks", "live_boundaries"}
+        ):
             _fail("unsupported local history clock fields")
         epoch = _integer(data["session_epoch"], "session_epoch", 1, MAX_CLOCK_EPOCH)
         if epoch != self.session_epoch:
             _fail("local clock watermarks must match the resumed history session")
-        rows = data["clocks"]
-        if type(rows) is not list or len(rows) > self.max_rows:
-            _fail("local clock watermarks exceed the row budget")
-        restored = self._clocks.copy()
-        seen = set()
-        for row in rows:
-            if type(row) is not list or len(row) != 4:
-                _fail("local clock watermarks require device, scanner, stamp and observed")
-            pair = opaque_id(row[0], "clock device_id"), opaque_id(row[1], "clock scanner_id")
-            if pair in seen:
-                _fail("local clock watermarks contain duplicate sources")
-            seen.add(pair)
-            stamp = finite_number(row[2], "clock stamp", minimum=0)
-            observed = finite_number(row[3], "clock observed", minimum=0)
-            if stamp > 1e12:
-                _fail("source stamp exceeds its permitted clock bound")
-            if observed > current:
-                _fail("local clock watermarks cannot contain future observations")
-            previous = restored.get(pair)
-            if previous and (stamp < previous[0] or observed < previous[1]):
-                _fail("local clock watermarks cannot move existing evidence backwards")
-            restored[pair] = stamp, observed
-        if len(restored) > self.max_rows:
-            _fail("combined local clock watermarks exceed the row budget")
-        self._clocks = restored
+        clocks = self._restore_clock_rows(data["clocks"], self._clocks, now=current)
+        sources = self._restore_clock_rows(
+            data.get("source_clocks", []), self._source_clocks, now=current, physical=True
+        )
+        boundaries = self._restore_clock_rows(
+            data.get("live_boundaries", []), self._live_boundaries, now=current, physical=True
+        )
+        for pair, boundary in boundaries.items():
+            source = sources.get(pair)
+            if source is None or boundary[0] > source[0] or boundary[1] > source[1]:
+                _fail("live boundaries must be covered by trusted source clock watermarks")
+        self._clocks, self._source_clocks, self._live_boundaries = clocks, sources, boundaries
 
     def import_data(self, payload: dict[str, Any] | str, *, now: float, resume: bool = False) -> None:
         """
@@ -690,7 +806,9 @@ class DiagnosticHistory:
             _fail("unsupported history schema version")
         if payload["redacted"] is not True:
             _fail("only redacted histories can be imported")
-        epoch = _integer(payload["session_epoch"], "session_epoch", 1, MAX_CLOCK_EPOCH - 1)
+        epoch = _integer(
+            payload["session_epoch"], "session_epoch", 1, MAX_CLOCK_EPOCH if resume else MAX_CLOCK_EPOCH - 1
+        )
         selection = self._selection(payload["selected_devices"])
         raw_frames = payload["frames"]
         if type(raw_frames) is not list or len(raw_frames) > self.max_frames:
@@ -750,5 +868,15 @@ class DiagnosticHistory:
             for (clock_epoch, device, scanner), clock in clocks.items()
             if resume and clock_epoch == epoch
         }
+        self._source_clocks = {}
+        self._live_boundaries = {}
+        if resume:
+            for frame in frames:
+                if frame["session_epoch"] != epoch:
+                    continue
+                for row in frame["observations"]:
+                    pair = self._source_key(row)
+                    previous = self._source_clocks.get(pair, (0.0, 0.0))
+                    self._source_clocks[pair] = max(previous[0], row["stamp"]), max(previous[1], row["observed"])
         self.dropped_rows = 0
         self._refresh_counts()

@@ -133,7 +133,7 @@ def test_clock_reset_requires_new_epoch_and_no_fictitious_repeats_after_eviction
     assert record(history, observation(1001, stamp=51)) == 1
     assert record(history, observation(1002, stamp=50)) == 0
     epoch = history.session_epoch
-    history.start(clear=False)
+    history.new_source_session()
     assert history.session_epoch != epoch
     assert record(history, observation(1002, stamp=1)) == 1
 
@@ -411,14 +411,14 @@ def test_trusted_same_host_resume_restores_deduplication_and_only_current_epoch_
     assert record(resumed, observation(1001, stamp=100)) == 0
     assert record(resumed, observation(1001, stamp=99)) == 0
     assert record(resumed, observation(1001, stamp=101)) == 1
-    history.start(clear=False)
+    history.new_source_session()
     assert record(history, observation(1001, stamp=10)) == 1
     resumed.import_data(history.export(redact=False), now=1002, resume=True)
     assert record(resumed, observation(1002, stamp=9)) == 0
     assert record(resumed, observation(1002, device="beacon-b", stamp=1)) == 1
     assert record(resumed, observation(1002, stamp=11)) == 1
     # A deliberate new live session permits a genuine lower source clock.
-    resumed.start(clear=False)
+    resumed.new_source_session()
     assert record(resumed, observation(1003, stamp=1)) == 1
 
 
@@ -484,7 +484,7 @@ def test_clock_watermarks_are_detached_bounded_local_metadata_not_public_history
     history = DiagnosticHistory(enabled=True, max_rows=2)
     record(history, observation())
     markers = history.export_clocks()
-    assert set(markers) == {"session_epoch", "clocks"}
+    assert set(markers) == {"session_epoch", "clocks", "source_clocks", "live_boundaries"}
     assert len(markers["clocks"]) <= history.max_rows
     markers["clocks"][0][2] = 999
     assert history.export_clocks()["clocks"][0][2] == 1000

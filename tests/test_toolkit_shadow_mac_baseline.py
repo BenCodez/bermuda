@@ -81,7 +81,9 @@ async def test_imported_source_baseline_requires_new_two_location_filter_evidenc
         manager.shadow.evaluate()["report"]["observations"][0]["device_id"]
         == imported[0]["observations"][0]["device_id"]
     )
-    assert (await capture("cached-site"))["captured"] == 2
+    with pytest.raises(ValueError, match="wait for fresh source"):
+        await capture("cached-site")
+    assert manager.history.frames() == imported
     assert manager.shadow.summary()["new_frames"] == 0
     assert manager.shadow.promotion_check(current_model_version=manager.version())["new_labelled_rows"] == 0
 
