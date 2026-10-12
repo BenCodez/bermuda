@@ -239,15 +239,20 @@ test("runtime settings and receiver limits send their values through native cont
   await edit(component, "Maximum distance (m)", "5");
   await button(component, "Save receiver limit").click();
   assert.deepEqual(calls[1].settings, { receiver_limits: { receiver1: 5 } });
+  assert.equal(calls[1].patch_maps, true);
   await edit(component, "Filter", "pet", "change");
   await button(component, "Save filter mode").click();
   assert.deepEqual(calls[2].settings, { filters: { device1: "pet" } });
+  assert.equal(calls[2].patch_maps, true);
   await edit(component, "Fixed reference map (JSON)", '{"device1":{"location_id":"reference","ranges":{"receiver1":3},"accuracy_m":0.1}}');
   await button(component, "Save fixed references").click();
   assert.equal(calls[3].settings.fixed_references.device1.ranges.receiver1, 3);
   await edit(component, "Source → binding object map (JSON)", '{"receiver1":{"device_registry_id":"registry1"}}');
   await button(component, "Save scanner bindings").click();
   assert.deepEqual(calls[4].settings.scanner_bindings, { receiver1: { device_registry_id: "registry1" } });
+  assert.equal("patch_maps" in calls[0], false);
+  assert.equal("patch_maps" in calls[3], false);
+  assert.equal("patch_maps" in calls[4], false);
 });
 
 test("history, replay and shadow buttons dispatch complete actions with safe exports", async () => {
@@ -660,4 +665,80 @@ test("clipboard denial directs recording users to export and diagnostics users t
   await component._copy(component._results.diagnostics);
   assert.match(component._message, /diagnostics JSON in Health/);
   assert.match(component.shadowRoot.textContent, /synthetic/);
+});
+
+function twoTargetState() {
+  const receiverA = "aa:bb:cc:dd:ee:11", receiverB = "aa:bb:cc:dd:ee:22";
+  const deviceA = "private_" + "a".repeat(32), deviceB = "private_" + "b".repeat(32);
+  const server = state();
+  server.options.receiver_limits = { [receiverA]: 0, [receiverB]: 7 };
+  server.options.filters = { [deviceA]: "legacy", [deviceB]: "pet" };
+  server.snapshot.scanners = Object.fromEntries([receiverA, receiverB].map(id => [id, { scanner_id: id, name: "Synthetic receiver" }]));
+  server.snapshot.devices = Object.fromEntries([deviceA, deviceB].map(id => [id, { device_id: id, name: "Synthetic beacon" }]));
+  return { server, receiverA, receiverB, deviceA, deviceB };
+}
+
+function applySettingRequest(server, payload) {
+  for (const [name, value] of Object.entries(payload.settings)) {
+    server.options[name] = payload.patch_maps && ["receiver_limits", "filters"].includes(name) ? { ...server.options[name], ...value } : value;
+  }
+  return { options: structuredClone(server.options) };
+}
+
+test("single-target map patches preserve concurrent edits to other receivers and public devices", async () => {
+  const { server, receiverA, receiverB, deviceA, deviceB } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload); return applySettingRequest(server, payload);
+  });
+  component._state = structuredClone(server); component._render();
+  server.options.receiver_limits[receiverB] = 17;
+  await edit(component, "Maximum distance (m)", "10");
+  await button(component, "Save receiver limit").click();
+  assert.deepEqual(calls[0].settings, { receiver_limits: { [receiverA]: 10 } });
+  assert.equal(calls[0].patch_maps, true);
+  assert.deepEqual(server.options.receiver_limits, { [receiverA]: 10, [receiverB]: 17 });
+  assert.equal(component._state.options.receiver_limits[receiverB], 17);
+  server.options.filters[deviceB] = "stationary";
+  await edit(component, "Filter", "pet", "change");
+  await button(component, "Save filter mode").click();
+  assert.deepEqual(calls[1].settings, { filters: { [deviceA]: "pet" } });
+  assert.equal(calls[1].patch_maps, true);
+  assert.deepEqual(server.options.filters, { [deviceA]: "pet", [deviceB]: "stationary" });
+  assert.equal(component._state.options.filters[deviceB], "stationary");
+  assert.deepEqual(Object.keys(calls[1].settings.filters), [deviceA]);
+});
+
+test("map acknowledgements preserve newer target drafts and failed saves keep their revisions", async () => {
+  const { server, receiverA, receiverB, deviceA, deviceB } = twoTargetState();
+  const pending = deferred(); const calls = [];
+  let failRefresh = false;
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") { if (failRefresh) throw new Error("Synthetic refresh failure"); return structuredClone(server); }
+    calls.push(payload); await pending.promise; return applySettingRequest(server, payload);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Maximum distance (m)", "10");
+  const saving = button(component, "Save receiver limit").click();
+  await edit(component, "Receiver", receiverB, "change");
+  await edit(component, "Maximum distance (m)", "18");
+  server.options.receiver_limits[receiverB] = 17;
+  failRefresh = true; pending.resolve(); await saving;
+  assert.deepEqual(calls[0].settings, { receiver_limits: { [receiverA]: 10 } });
+  assert.equal(component._state.options.receiver_limits[receiverB], 17);
+  assert.equal(field(component, "Maximum distance (m)").value, "18");
+  assert.equal(component._drafts.get("limit"), "18");
+  const rejected = deferred();
+  component._hass.callApi = async method => method === "GET" ? structuredClone(server) : rejected.promise;
+  await edit(component, "Filter", "pet", "change");
+  const failedSave = button(component, "Save filter mode").click();
+  await edit(component, "Filter", "stationary", "change");
+  server.options.filters[deviceB] = "stationary";
+  rejected.reject(new Error("Synthetic map save failure")); await failedSave;
+  await component.refresh();
+  assert.equal(server.options.filters[deviceA], "legacy");
+  assert.equal(field(component, "Filter").value, "stationary");
+  assert.equal(component._drafts.get("filter-mode"), "stationary");
+  assert.equal(component._state.options.filters[deviceB], "stationary");
 });

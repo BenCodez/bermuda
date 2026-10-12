@@ -143,6 +143,7 @@ class ToolkitManager:
         self._version_cache: str | None = None
         self._boot_id: str | None = None
         self._identities: dict[str, dict] = {}
+        self._identities_ready = True
         self._identity_dirty = False
         self._states: dict[tuple[str, str], FilterState] = {}
         self._quality: dict[tuple[str, str], dict] = {}
@@ -171,6 +172,11 @@ class ToolkitManager:
     def closed(self) -> bool:
         """Let public lookup refuse a coordinator during unload."""
         return self._closed
+
+    @property
+    def scanner_identity_ready(self) -> bool:
+        """Defer permanent entity identity choices during persisted state loading."""
+        return self._identities_ready
 
     @property
     def fingerprint_area_selection(self) -> bool:
@@ -222,10 +228,11 @@ class ToolkitManager:
     async def async_load(self) -> None:
         """Load only validated bounded local state before scanner identity resolution."""
         self._available = False
+        self._identities_ready = False
         self._boot_id = await self.hass.async_add_executor_job(_host_clock_id)
         saved = await self.store.async_load()
         if not isinstance(saved, dict):
-            self._available = True
+            self._finish_identity_loading()
             return
         saved = await self._recover_options(saved)
         identities = saved.get("identities", {})
@@ -270,6 +277,19 @@ class ToolkitManager:
                 field == "last_data_id" and isinstance(value, str)
             ):
                 setattr(self, field, value)
+        self._finish_identity_loading()
+
+    def _finish_identity_loading(self) -> None:
+        """Resolve receivers discovered during loading before platforms create IDs."""
+        self._identities_ready = True
+        try:
+            for scanner in tuple(getattr(self.coordinator, "get_scanners", ())):
+                resolve = getattr(scanner, "async_as_scanner_resolve_device_entries", None)
+                if callable(resolve):
+                    resolve()
+        except BaseException:
+            self._identities_ready = False
+            raise
         self._available = True
 
     def _store_payload(
@@ -411,6 +431,8 @@ class ToolkitManager:
 
     def scanner_identity(self, source: str, proposed_uid: str) -> dict:
         """Keep exactly evidenced historic entity identities when improving bindings."""
+        if not self._identities_ready:
+            return {}
         key = source.lower()
         if key not in self._identities:
             from .api import scanner_identity_from_registry_entry  # noqa: PLC0415
@@ -1150,6 +1172,33 @@ class ToolkitManager:
                 if not isinstance(change, dict):
                     msg = "settings must be an object"
                     raise ValueError(msg)
+                patch_maps = payload.get("patch_maps", False)
+                if type(patch_maps) is not bool:
+                    msg = "patch_maps must be a boolean"
+                    raise ValueError(msg)
+                if patch_maps:
+                    if set(change) - {"receiver_limits", "filters"}:
+                        msg = "Only receiver limits and device filters support map patches"
+                        raise ValueError(msg)
+                    patched = {}
+                    for field, updates in change.items():
+                        # Normalize just the patch, then merge into the current
+                        # server map under the action lock. MAC case aliases
+                        # update their existing slot; opaque IDs remain exact.
+                        normalized_updates = _settings({field: updates})[field]
+                        merged = deepcopy(self.settings[field])
+                        aliases = {key: key for key in merged}
+                        touched = set()
+                        for key, value in normalized_updates.items():
+                            slot = receiver_value(aliases, key, key)
+                            if slot in touched and merged[slot] != value:
+                                msg = "Map patch contains conflicting receiver aliases"
+                                raise ValueError(msg)
+                            merged[slot] = value
+                            aliases[slot] = slot
+                            touched.add(slot)
+                        patched[field] = merged
+                    change = patched
                 options = deepcopy(dict(self.entry.options))
                 options[OPTIONS_KEY] = _settings({**self.settings, **change})
                 await self._persist_options(options)

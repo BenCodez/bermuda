@@ -373,9 +373,15 @@ class BermudaDevice:
         """Retain entity identity through re-resolution and managed reloads."""
         if self._scanner_identity_resolved:
             return
+        toolkit = getattr(self._coordinator, "toolkit", None)
+        if getattr(toolkit, "scanner_identity_ready", True) is False:
+            # Bluetooth callbacks may discover receivers while their persisted
+            # identities are still loading. Keep packets and binding metadata,
+            # then freeze the identity when that state is available.
+            return
         self.unique_id = proposed_id
         self.entity_id_address = network_address or self.address
-        identity_hook = getattr(getattr(self._coordinator, "toolkit", None), "scanner_identity", None)
+        identity_hook = getattr(toolkit, "scanner_identity", None)
         if callable(identity_hook):
             identity = identity_hook(self.address, proposed_id)
             if isinstance(identity, Mapping):

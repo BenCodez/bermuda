@@ -27,6 +27,63 @@ def observation(t=1000.0, *, device="beacon-a", scanner="scanner-a", distance=3.
     }
 
 
+def integer_history_payload(*, frame_count=575, receivers=10, device="d", scanner_prefix="r", epoch=1, labelled=False):
+    """Build quantized synthetic observations with real integer-to-float expansion."""
+    captured = []
+    for index in range(frame_count):
+        when = 1000 + index
+        rows = [
+            {
+                "device_id": device,
+                "scanner_id": f"{scanner_prefix}{receiver}",
+                "observed": when,
+                "stamp": index + 1,
+                "rssi": -79,
+                "rssi_offset": 0,
+                "reference_power": -59,
+                "attenuation": 2,
+                "raw_distance": 10,
+                "filtered_distance": 6,
+                "age": 0,
+                "status": "current",
+                "quality": {},
+                "model_version": "m",
+            }
+            for receiver in range(receivers)
+        ]
+        labels = (
+            [
+                {
+                    "source": "measured",
+                    "device_id": device,
+                    "location_id": "synthetic-site",
+                    "ranges": {row["scanner_id"]: 10 for row in rows},
+                    "accuracy_m": 0,
+                    "observed": when,
+                    "independent": True,
+                }
+            ]
+            if labelled
+            else []
+        )
+        captured.append(
+            {
+                "sequence": index + 1,
+                "captured_at": when,
+                "session_epoch": epoch,
+                "model_version": "m",
+                "observations": rows,
+                "truth": labels,
+            }
+        )
+    return {"schema_version": 1, "session_epoch": epoch, "selected_devices": [], "redacted": True, "frames": captured}
+
+
+def wire_bytes(value):
+    """Measure actual compact UTF-8 serialization independently from history counters."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
 def truth(t=1000.0, *, device="beacon-a", location="site-a", distance=2.0, source="measured"):
     return {
         "source": source,
@@ -415,3 +472,95 @@ def test_local_clock_restore_never_drops_resumed_watermarks_and_caps_merged_sour
         history.restore_clocks(
             {"session_epoch": epoch, "clocks": [["a", "s", 1, 1], ["b", "s", 1, 1], ["c", "s", 1, 1]]}, now=1001
         )
+
+
+@pytest.mark.parametrize("device", ["device-abcdef", "d"])
+def test_manager_sized_raw_integer_import_rejects_normalized_or_redacted_overflow_without_publication(device):
+    from custom_components.bermuda.toolkit import HISTORY_BYTES
+
+    payload = integer_history_payload(device=device)
+    raw = wire_bytes(payload)
+    assert len(raw) < HISTORY_BYTES == 1_500_000
+    oracle = DiagnosticHistory()
+    oracle.import_data(payload, now=2000)
+    canonical_size = len(wire_bytes(oracle.export(redact=False)))
+    redacted_size = len(wire_bytes(oracle.export()))
+    assert redacted_size > HISTORY_BYTES
+    assert (canonical_size > HISTORY_BYTES) is (device == "device-abcdef")
+    history = DiagnosticHistory(enabled=True, max_bytes=HISTORY_BYTES, selected_devices=["beacon-a"])
+    record(history, observation(1999), [truth(1999)])
+    original, clocks, summary = history.export(redact=False), history.export_clocks(), history.summary()
+    with pytest.raises(ValueError, match="normalized import exceeds"):
+        history.import_data(raw.decode("utf-8"), now=2000)
+    assert history.export(redact=False) == original
+    assert history.export_clocks() == clocks
+    assert history.summary() == summary
+
+
+@pytest.mark.parametrize("device,scanner", [("d", "r"), ("🔵" * 200, "接收器" * 60)])
+def test_exact_normalized_byte_boundary_supports_both_exports_trusted_resume_and_utf8_ids(device, scanner):
+    payload = integer_history_payload(
+        frame_count=1, receivers=1, device=device, scanner_prefix=scanner, epoch=9, labelled=True
+    )
+    payload["selected_devices"] = [device]
+    oracle = DiagnosticHistory()
+    oracle.import_data(payload, now=1001)
+    canonical, redacted = oracle.export(redact=False), oracle.export()
+    boundary = max(len(wire_bytes(canonical)), len(wire_bytes(redacted)))
+    assert boundary >= 512
+    history = DiagnosticHistory(max_bytes=boundary)
+    history.import_data(payload, now=1001)
+    assert history.session_epoch == 10
+    assert max(len(wire_bytes(history.export(redact=False))), len(wire_bytes(history.export()))) == boundary
+    for redact in (False, True):
+        exported = history.export(redact=redact)
+        trusted = DiagnosticHistory(max_bytes=boundary)
+        trusted.import_data(exported, now=1001, resume=True)
+        assert trusted.frames() == exported["frames"]
+        assert len(wire_bytes(trusted.export(redact=False))) <= boundary
+        assert len(wire_bytes(trusted.export())) <= boundary
+    rejecting = DiagnosticHistory(enabled=True, max_bytes=boundary - 1)
+    record(rejecting, observation())
+    original = rejecting.export(redact=False)
+    with pytest.raises(ValueError, match="normalized import exceeds"):
+        rejecting.import_data(payload, now=1001)
+    assert rejecting.export(redact=False) == original
+
+
+def test_import_budget_accounts_for_live_epoch_header_digit_growth():
+    payload = integer_history_payload(
+        frame_count=1, receivers=1, device="id_" + "a" * 24, scanner_prefix="id_" + "b" * 24, epoch=9
+    )
+    payload["frames"][0]["observations"][0]["quality"] = {"note": "synthetic diagnostic padding"}
+    trusted = DiagnosticHistory()
+    trusted.import_data(payload, now=1001, resume=True)
+    payload = trusted.export(redact=False)
+    boundary = max(len(wire_bytes(payload)), len(wire_bytes(trusted.export())))
+    assert boundary >= 512
+    imported = DiagnosticHistory(max_bytes=boundary)
+    with pytest.raises(ValueError, match="normalized import exceeds"):
+        imported.import_data(payload, now=1001)
+    assert imported.frames() == [] and imported.session_epoch == 1
+    resumed = DiagnosticHistory(max_bytes=boundary)
+    resumed.import_data(payload, now=1001, resume=True)
+    assert resumed.session_epoch == 9
+
+
+def test_producer_and_imported_near_manager_byte_limit_round_trip_without_widening_budget():
+    from custom_components.bermuda.toolkit import HISTORY_BYTES
+
+    producer = DiagnosticHistory(enabled=True, max_bytes=HISTORY_BYTES)
+    payload = integer_history_payload(frame_count=480)
+    for frame in payload["frames"]:
+        assert producer.record(frame["observations"], captured_at=frame["captured_at"], model_version="m") == 10
+    for redact in (False, True):
+        exported = producer.export(redact=redact)
+        assert len(wire_bytes(exported)) <= HISTORY_BYTES
+        imported = DiagnosticHistory(max_bytes=HISTORY_BYTES)
+        imported.import_data(exported, now=2000)
+        assert imported.summary()["rows"] == 4800
+        assert len(wire_bytes(imported.export(redact=False))) <= HISTORY_BYTES
+        assert len(wire_bytes(imported.export())) <= HISTORY_BYTES
+        resumed = DiagnosticHistory(max_bytes=HISTORY_BYTES)
+        resumed.import_data(imported.export(redact=False), now=2000, resume=True)
+        assert resumed.frames() == imported.frames()

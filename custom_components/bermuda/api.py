@@ -47,6 +47,7 @@ MAX_OBSERVATIONS: Final = 4096
 MAX_HISTORY: Final = 5
 MAX_ALIASES: Final = 32
 MAX_TEXT: Final = 512
+SOURCE_CLOCK_TOLERANCE_S: Final = 0.8
 _PRIVATE_KEY_RE: Final = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
@@ -258,8 +259,10 @@ def _advert_measurement(
     age = nowstamp - stamp if stamp is not None and stamp > 0 else None
     observed = _number(metadata.get("observed", getattr(advert, "observed", None)))
     clock = "source_epoch" if observed is not None else "derived_monotonic"
-    if observed is None and age is not None and age >= 0:
-        observed = observed_now - age
+    if observed is None and age is not None and age >= -SOURCE_CLOCK_TOLERANCE_S:
+        # Coarse source and receiver clocks can differ slightly. Keep the raw
+        # stamp for deduplication, but never publish derived UTC in the future.
+        observed = observed_now - max(0.0, age)
     rssi = _number(getattr(advert, "rssi", None))
     raw_distance = _number(getattr(advert, "rssi_distance_raw", None))
     filtered_distance = _number(getattr(advert, "rssi_distance", None))
@@ -272,7 +275,7 @@ def _advert_measurement(
     reasons = []
     if age is None:
         reasons.append("missing_source_stamp")
-    elif age < -0.8:
+    elif age < -SOURCE_CLOCK_TOLERANCE_S:
         reasons.append("source_clock_in_future")
     elif age > timeout:
         reasons.append("stale_observation")
@@ -307,7 +310,7 @@ def _advert_measurement(
         "observed": observed,
         "observed_clock": clock,
         "stamp": stamp,
-        "age": max(0.0, age) if age is not None and age >= -0.8 else age,
+        "age": max(0.0, age) if age is not None and age >= -SOURCE_CLOCK_TOLERANCE_S else age,
         "status": status,
         "rssi": rssi,
         "raw_rssi": rssi,

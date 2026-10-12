@@ -270,13 +270,13 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._fieldDefaults.set(input.dataset.draft, this._draftValue(input));
   }
 
-  _saveSettings(settings, inputs) {
+  _saveSettings(settings, inputs, { patchMaps = false } = {}) {
     if (!Object.keys(settings).length) {
       this._message = "No unsaved settings changes.";
       this._render();
       return;
     }
-    return this._perform("settings", { settings }, { draftNames: inputs.map(input => input.dataset.draft) });
+    return this._perform("settings", { settings, ...(patchMaps ? { patch_maps: true } : {}) }, { draftNames: inputs.map(input => input.dataset.draft) });
   }
 
   _field(parent, label, name, value = "", options = {}) {
@@ -411,12 +411,12 @@ export class BermudaToolkitPanel extends HTMLElement {
     const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
     const limit = this._field(receiver, "Maximum distance (m)", "limit", options.receiver_limits?.[scanner.value] ?? 0, { type: "number", min: 0, max: 1000, step: .1 });
     scanner.addEventListener("change", () => { this._resetField(limit, this._options().receiver_limits?.[scanner.value] ?? 0); });
-    this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { ...this._options().receiver_limits, [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit]), { disabled: !this._scanners().length });
+    this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true }), { disabled: !this._scanners().length });
     const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
     const device = this._select(filters, "Device", "filter-device", this._devices());
     const mode = this._select(filters, "Filter", "filter-mode", ["legacy", "pet", "stationary"].map(x => [x, x]), options.filters?.[device.value] || "legacy");
     device.addEventListener("change", () => { this._resetField(mode, this._options().filters?.[device.value] || "legacy"); });
-    this._button(filters, "Save filter mode", () => this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { ...this._options().filters, [device.value]: mode.value } } : {}, [mode]), { disabled: !this._devices().length });
+    this._button(filters, "Save filter mode", () => this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true }), { disabled: !this._devices().length });
     const profiles = this._section(parent, "Hardware and radio profile", "Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance. Leave a numeric field empty to inherit the existing model.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());

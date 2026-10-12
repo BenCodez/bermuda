@@ -527,15 +527,17 @@ class DiagnosticHistory:
     def _frame_budget(self, frame: dict[str, Any]) -> int:
         return max(json_size(frame), json_size(self._redact_frame(frame)))
 
-    def _header_size(self) -> int:
+    def _header_size(self, *, session_epoch: int | None = None, selected_devices: list[str] | None = None) -> int:
+        epoch = self.session_epoch if session_epoch is None else session_epoch
+        selection = self.selected_devices if selected_devices is None else selected_devices
         base = {
             "schema_version": SCHEMA_VERSION,
-            "session_epoch": self.session_epoch,
-            "selected_devices": self.selected_devices,
+            "session_epoch": epoch,
+            "selected_devices": selection,
             "redacted": True,
             "frames": [],
         }
-        redacted = {**base, "selected_devices": [self._pseudonym(device) for device in self.selected_devices]}
+        redacted = {**base, "selected_devices": [self._pseudonym(device) for device in selection]}
         return max(json_size(base), json_size(redacted))
 
     def _refresh_counts(self) -> None:
@@ -720,11 +722,22 @@ class DiagnosticHistory:
                 if previous and (row["stamp"] <= previous[0] or row["observed"] < previous[1]):
                     _fail("import contains duplicate or backwards source clocks")
                 clocks[key] = row["stamp"], row["observed"]
+        imported_epoch = epoch if resume else epoch + 1
+        # Numeric normalization and identifier redaction can enlarge valid raw
+        # JSON. Apply the producer's canonical/redacted budget to detached data,
+        # including the new live epoch's header, before replacing any history.
+        normalized_budget = (
+            sum(self._frame_budget(frame) for frame in frames)
+            + max(0, len(frames) - 1)
+            + self._header_size(session_epoch=imported_epoch, selected_devices=selection)
+        )
+        if normalized_budget > self.max_bytes:
+            _fail("normalized import exceeds the history byte budget")
         self._frames = frames
         self.selected_devices = selection
         # Trusted local reloads retain evidence clocks. A user import instead
         # starts a distinct live epoch and never trusts another host's stamps.
-        self.session_epoch = epoch if resume else epoch + 1
+        self.session_epoch = imported_epoch
         self._sequence = previous_sequence
         self._clocks = {
             (device, scanner): clock
