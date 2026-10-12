@@ -2,7 +2,7 @@
 
 Home Assistant administrators can open **Bermuda toolkit** in the sidebar after Bermuda loads. The panel reads the selected integration entry and uses Home Assistant authentication for every request. Refresh updates the source packet ages; it does not make old readings fresh.
 
-The **Settings** tab contains optional automatic calibration, reliability weighting, fingerprint area selection, device filter modes, and receiver distance limits. A receiver limit of `0` follows the existing global limit. Legacy filter mode keeps normal Bermuda behavior. Saving one receiver limit or filter patches that target only, preserving other targets' latest settings. Hardware and antenna details are descriptive metadata; only explicitly entered radio model parameters change range calculations.
+The **Settings** tab contains optional automatic calibration, reliability weighting, fingerprint area selection, device filter modes, and receiver distance limits. A receiver limit of `0` follows the existing global limit. Legacy filter mode keeps normal Bermuda behavior. Saving one receiver limit or filter patches that target only, preserving other targets' latest settings. Hardware and antenna details are descriptive metadata; only explicitly entered radio model parameters change range calculations. Clearing a beacon's reference-power override in the panel also clears its verification.
 
 To restore an inherited profile model, clear the corresponding numeric field and save the profile. Empty metadata fields are removed too. The API accepts partial profile changes and an explicit removal list:
 

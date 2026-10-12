@@ -910,6 +910,59 @@ for (const busyFlag of ["_busy", "_fileBusy"]) test(`profile type change retains
   assert.equal(button(component, "Save profile").disabled, false);
 });
 
+test("clearing verified beacon reference power also clears its verification and restores inheritance", async () => {
+  const server = state();
+  server.options.beacon_profiles = { device1: { reference_power: -58, reference_power_verified: true, model: "Known hardware" } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") {
+      calls.push(payload);
+      const merged = { ...server.options.beacon_profiles[payload.id], ...payload.profile };
+      for (const key of payload.remove) delete merged[key];
+      assert.ok(!merged.reference_power_verified || Object.hasOwn(merged, "reference_power"));
+      server.options.beacon_profiles[payload.id] = merged;
+      return { profile: merged };
+    }
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Profile type", "beacon", "change");
+  assert.equal(field(component, "Reference power independently verified").checked, true);
+  await edit(component, "Reference power at 1 m (dBm)", "");
+  await button(component, "Save profile").click();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].remove, ["reference_power"]);
+  assert.deepEqual(calls[0].profile, { reference_power_verified: false });
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "");
+  assert.equal(field(component, "Reference power independently verified").checked, false);
+  assert.equal(field(component, "model").value, "Known hardware");
+});
+
+test("an inheritance acknowledgement preserves newer reference power and verification edits", async () => {
+  const server = state();
+  server.options.beacon_profiles = { device1: { reference_power: -58, reference_power_verified: true } };
+  const pending = deferred(); const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") { calls.push(payload); return pending.promise; }
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Profile type", "beacon", "change");
+  await edit(component, "Reference power at 1 m (dBm)", "");
+  const saving = button(component, "Save profile").click();
+  assert.equal(calls[0].profile.reference_power_verified, false);
+  await edit(component, "Reference power at 1 m (dBm)", "-55");
+  await edit(component, "Reference power independently verified", false, "change");
+  await edit(component, "Reference power independently verified", true, "change");
+  server.options.beacon_profiles.device1 = { reference_power_verified: false };
+  pending.resolve({ profile: server.options.beacon_profiles.device1 });
+  await saving;
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "-55");
+  assert.equal(field(component, "Reference power independently verified").checked, true);
+  assert.equal(component._drafts.get("profile-reference_power"), "-55");
+  assert.equal(component._drafts.get("profile-verified"), true);
+});
+
 test("a profile acknowledgement cannot clear newer edits after explicit target and kind selection", async () => {
   const { server, receiverA, deviceA } = twoTargetState();
   const pending = deferred(); const calls = [];

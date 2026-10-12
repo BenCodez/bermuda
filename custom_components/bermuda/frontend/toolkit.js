@@ -553,6 +553,10 @@ export class BermudaToolkitPanel extends HTMLElement {
         else remove.push(key);
       }
       if (!verified.disabled && this._drafts.has(verified.dataset.draft)) { profile.reference_power_verified = verified.checked; edited.push(verified); }
+      if (kind.value === "beacon" && remove.includes("reference_power")) {
+        profile.reference_power_verified = false;
+        if (!edited.includes(verified)) edited.push(verified);
+      }
       if (!edited.length) { this._message = "No unsaved profile changes."; this._render(); return; }
       return this._perform("profile", { kind: kind.value, id: target.value, profile, remove }, { draftNames: edited.map(input => input.dataset.draft) });
     }, { disabled: !this._targetAvailable(target) });
