@@ -1,0 +1,255 @@
+"""Synthetic bounded diagnostic recording and import tests."""
+
+from copy import deepcopy
+import json
+
+import pytest
+
+from custom_components.bermuda.recording import DiagnosticHistory
+
+
+def observation(t=1000.0, *, device="beacon-a", scanner="scanner-a", distance=3.0, stamp=None):
+    return {
+        "device_id": device,
+        "scanner_id": scanner,
+        "observed": t,
+        "stamp": t if stamp is None else stamp,
+        "rssi": -69.5,
+        "rssi_offset": 0.0,
+        "reference_power": -59.0,
+        "attenuation": 2.0,
+        "raw_distance": distance,
+        "filtered_distance": distance,
+        "age": 0.0,
+        "status": "current",
+        "quality": {},
+        "model_version": "model-1",
+    }
+
+
+def truth(t=1000.0, *, device="beacon-a", location="site-a", distance=2.0, source="measured"):
+    return {
+        "source": source,
+        "device_id": device,
+        "location_id": location,
+        "ranges": {"scanner-a": distance},
+        "accuracy_m": 0.1,
+        "observed": t,
+        "independent": True,
+    }
+
+
+def record(history, row, labels=None):
+    return history.record([row], captured_at=row["observed"], model_version="model-1", truth=labels)
+
+
+def test_history_disabled_and_explicit_label_capture():
+    history = DiagnosticHistory()
+    assert record(history, observation()) == 0
+    assert history.record([observation()], captured_at=1000, model_version="model-1", truth=[truth()], force=True) == 1
+    assert history.enabled is False
+    with pytest.raises(ValueError, match="requires independent truth"):
+        history.record([observation(1001)], captured_at=1001, model_version="model-1", force=True)
+
+
+def test_detached_selected_fresh_observations_and_dedup():
+    history = DiagnosticHistory(enabled=True, selected_devices=["beacon-a"])
+    row = observation()
+    assert record(history, row, [truth()]) == 1
+    row["quality"]["mutated"] = True
+    assert record(history, observation(1001, stamp=1000)) == 0
+    assert record(history, observation(1001, device="beacon-b")) == 0
+    stale = observation(1001)
+    stale["status"] = "stale"
+    assert record(history, stale) == 0
+    assert history.frames()[0]["observations"][0]["quality"] == {}
+    returned = history.frames()
+    returned[0]["truth"].clear()
+    assert history.frames()[0]["truth"]
+    assert record(history, observation(1002)) == 1
+    assert history.frames()[-1]["truth"] == []
+
+
+def test_clock_reset_requires_new_epoch_and_no_fictitious_repeats_after_eviction():
+    history = DiagnosticHistory(enabled=True, max_frames=1)
+    assert record(history, observation(1000, stamp=50)) == 1
+    assert record(history, observation(1001, stamp=51)) == 1
+    assert record(history, observation(1002, stamp=50)) == 0
+    epoch = history.session_epoch
+    history.start(clear=False)
+    assert history.session_epoch != epoch
+    assert record(history, observation(1002, stamp=1)) == 1
+
+
+def test_time_frame_row_byte_and_clock_metadata_bounds():
+    history = DiagnosticHistory(enabled=True, window_s=2, max_frames=2, max_rows=2, max_bytes=1500)
+    for t in range(1000, 1010):
+        record(history, observation(t))
+    assert len(history.frames()) <= 2
+    assert history.summary()["rows"] <= 2
+    assert history.summary()["bytes"] <= 1500
+    assert history.frames()[0]["captured_at"] >= 1007
+    assert history.dropped_rows > 0
+    record(history, observation(1010, device="b"))
+    assert record(history, observation(1011, device="c")) == 0
+    assert len(history._clocks) <= 2
+
+
+def test_instant_truth_cannot_label_future_samples_fixed_truth_explicit():
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation(), [truth()])
+    record(history, observation(1001))
+    assert not history.frames()[1]["truth"]
+    with pytest.raises(ValueError, match="belong to this capture"):
+        record(history, observation(1010), [truth()])
+    assert record(history, observation(1010), [truth(source="fixed_reference")]) == 1
+    with pytest.raises(ValueError, match="independent"):
+        bad = truth(1011)
+        bad["independent"] = False
+        record(history, observation(1011), [bad])
+
+
+def test_redacted_export_keeps_cross_links_and_never_retains_private_keys():
+    history = DiagnosticHistory(enabled=True, selected_devices=["beacon-a"])
+    row = observation()
+    row["quality"] = {"IRK": "synthetic-secret", "nested": {"privateKey": "synthetic-private", "variance": 3}}
+    record(history, row, [truth()])
+    data = history.export()
+    text = json.dumps(data)
+    assert "beacon-a" not in text and "scanner-a" not in text and "site-a" not in text
+    assert "synthetic-secret" not in text and "synthetic-private" not in text
+    frame = data["frames"][0]
+    assert frame["observations"][0]["device_id"] == frame["truth"][0]["device_id"] == data["selected_devices"][0]
+    assert frame["observations"][0]["scanner_id"] in frame["truth"][0]["ranges"]
+    assert history.export(redact=False)["frames"][0]["observations"][0]["device_id"] == "beacon-a"
+    assert "synthetic-private" not in json.dumps(history.frames())
+
+
+def test_import_is_atomic_bounded_and_creates_new_live_clock_epoch():
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation(), [truth()])
+    exported = history.export(redact=False)
+    restored = DiagnosticHistory(enabled=True)
+    restored.import_data(json.dumps(exported), now=1001)
+    assert restored.frames() == history.frames()
+    assert restored.session_epoch > history.session_epoch
+    assert record(restored, observation(1001, stamp=1)) == 1
+    original = restored.frames()
+    with pytest.raises(ValueError, match="future"):
+        restored.import_data(exported, now=999)
+    assert restored.frames() == original
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda data: data.update(path="/tmp/arbitrary"),
+        lambda data: data.update(session_epoch=True),
+        lambda data: data["frames"][0]["observations"][0].update(rssi=float("nan")),
+        lambda data: data["frames"][0]["observations"][0].update(stamp=-1),
+        lambda data: data["frames"][0]["observations"][0].update(scanner_id=""),
+        lambda data: data["frames"][0]["observations"][0].update(age=True),
+        lambda data: data["frames"][0]["observations"][0].update(observed_clock="unknown_clock"),
+        lambda data: data["frames"][0]["truth"][0].update(source="predicted_area"),
+        lambda data: data["frames"][0]["truth"][0]["ranges"].update(**{"scanner-a": -1}),
+    ],
+)
+def test_import_rejects_abuse(change):
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation(), [truth()])
+    data = deepcopy(history.export(redact=False))
+    change(data)
+    with pytest.raises(ValueError):
+        DiagnosticHistory().import_data(data, now=1001)
+
+
+def test_import_rejects_paths_nonfinite_nested_metadata_and_duplicate_source():
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation())
+    data = history.export(redact=False)
+    with pytest.raises(ValueError, match="JSON data"):
+        history.import_data("/tmp/history.json", now=1001)
+    with pytest.raises(ValueError):
+        history.import_data(json.dumps(data).replace('"rssi": -69.5', '"rssi": NaN'), now=1001)
+    second = deepcopy(data["frames"][0])
+    second["sequence"] = 2
+    second["captured_at"] = 1001
+    data["frames"].append(second)
+    with pytest.raises(ValueError, match="duplicate"):
+        history.import_data(data, now=1001)
+
+
+def test_clearing_reset_on_reload_and_import_are_explicit():
+    first = DiagnosticHistory(enabled=True)
+    record(first, observation())
+    assert DiagnosticHistory().frames() == []
+    epoch = first.session_epoch
+    first.clear()
+    assert first.frames() == [] and first.session_epoch > epoch
+
+
+def test_explicit_capture_moves_an_unlabelled_packet_without_duplicate_evidence():
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation())
+    row = observation()
+    row["age"] = 1
+    assert history.record([row], captured_at=1001, model_version="model-1", truth=[truth(1001)], force=True) == 1
+    assert len(history.frames()) == 1
+    assert history.frames()[0]["observations"][0]["stamp"] == 1000
+    assert history.frames()[0]["truth"][0]["observed"] == 1001
+    restored = DiagnosticHistory()
+    restored.import_data(history.export(), now=1001)
+    assert restored.summary()["rows"] == 1
+    with pytest.raises(ValueError, match="already has independent truth"):
+        history.record([row], captured_at=1002, model_version="model-1", truth=[truth(1002)], force=True)
+
+
+def test_import_duplicate_json_keys_huge_numbers_and_deep_metadata_rejected():
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation())
+    serialized = json.dumps(history.export())
+    with pytest.raises(ValueError, match="duplicate object keys"):
+        history.import_data(
+            serialized.replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1'), now=1001
+        )
+    bad = observation()
+    bad["rssi"] = 10**1000
+    with pytest.raises(ValueError, match="finite"):
+        record(history, bad)
+    bad = observation(1001)
+    nested = {}
+    for _ in range(10):
+        nested = {"nested": nested}
+    bad["quality"] = nested
+    with pytest.raises(ValueError, match="deeply nested"):
+        record(history, bad)
+
+
+def test_full_redacted_export_round_trips_under_byte_budget():
+    history = DiagnosticHistory(enabled=True, max_bytes=1500)
+    for index in range(10):
+        record(history, observation(1000 + index), [truth(1000 + index)])
+    assert len(json.dumps(history.export(), separators=(",", ":")).encode()) <= 1500
+    restored = DiagnosticHistory(max_bytes=1500)
+    restored.import_data(history.export(), now=1010)
+    assert restored.summary()["rows"] == history.summary()["rows"]
+
+
+def test_explicit_capture_bypasses_selection_only_for_its_independently_labelled_pairs():
+    history = DiagnosticHistory(selected_devices=["beacon-a"])
+    rows = [
+        observation(device="beacon-b"),
+        observation(device="beacon-c"),
+        observation(device="beacon-b", scanner="scanner-unlabelled"),
+    ]
+    assert (
+        history.record(rows, captured_at=1000, model_version="model-1", truth=[truth(device="beacon-b")], force=True)
+        == 1
+    )
+    assert history.selected_devices == ["beacon-a"]
+    assert history.frames()[0]["observations"][0]["device_id"] == "beacon-b"
+    restored = DiagnosticHistory(selected_devices=["beacon-a"])
+    restored.import_data(history.export(), now=1001)
+    assert restored.summary()["rows"] == 1
+    with pytest.raises(ValueError, match="already has independent truth"):
+        history.record(rows, captured_at=1000, model_version="model-1", truth=[truth(device="beacon-b")], force=True)

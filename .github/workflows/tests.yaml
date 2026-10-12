@@ -111,3 +111,9 @@ jobs:
             -n auto \
             -p no:sugar \
             tests
+      - name: Set up Node for toolkit panel tests
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Toolkit panel behavior tests
+        run: node --test tests/frontend/toolkit.test.mjs

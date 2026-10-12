@@ -7,6 +7,7 @@ https://github.com/agittins/bermuda
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ from homeassistant.helpers.entity_registry import async_migrate_entries
 
 from .const import _LOGGER, CONF_DEVICES, DOMAIN, PLATFORMS, STARTUP_MESSAGE
 from .coordinator import BermudaDataUpdateCoordinator
+from .toolkit_http import async_register_toolkit, async_unregister_toolkit
 from .util import mac_math_offset, mac_norm
 
 if TYPE_CHECKING:
@@ -39,24 +41,35 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 async def async_setup_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> bool:
     """Set up this integration using UI."""
+    from .toolkit import ToolkitManager  # noqa: PLC0415 - manager is loaded with the config entry
+
     if hass.data.get(DOMAIN) is None:
         _LOGGER.info(STARTUP_MESSAGE)
     coordinator = BermudaDataUpdateCoordinator(hass, entry)
+    coordinator.toolkit = ToolkitManager(coordinator)
     entry.runtime_data = BermudaData(coordinator)
 
-    async def on_failure():
-        _LOGGER.debug("Coordinator last update failed, rasing ConfigEntryNotReady")
+    try:
+        await coordinator.toolkit.async_load()
+        await coordinator.async_refresh()
+    except asyncio.CancelledError:
+        await _async_close_toolkit(hass, entry)
+        raise
+    except Exception as ex:
+        _LOGGER.exception("Bermuda initial refresh failed")
+        await _async_close_toolkit(hass, entry)
+        raise ConfigEntryNotReady from ex
+    if not coordinator.last_update_success:
+        _LOGGER.debug("Coordinator last update failed, raising ConfigEntryNotReady")
+        await _async_close_toolkit(hass, entry)
         raise ConfigEntryNotReady
 
     try:
-        await coordinator.async_refresh()
-    except Exception as ex:  # noqa: BLE001
-        _LOGGER.exception(ex)
-        await on_failure()
-    if not coordinator.last_update_success:
-        await on_failure()
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await async_register_toolkit(hass, entry)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await _async_close_toolkit(hass, entry)
+        raise
 
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
@@ -152,9 +165,27 @@ async def async_unload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> 
     """Handle removal of an entry."""
     if unload_result := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         _LOGGER.debug("Unloaded platforms.")
+        await _async_close_toolkit(hass, entry)
     return unload_result
 
 
+async def _async_close_toolkit(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:
+    """Finish toolkit retirement even if saving its optional history fails."""
+    coordinator = getattr(getattr(entry, "runtime_data", None), "coordinator", None)
+    toolkit = getattr(coordinator, "toolkit", None)
+    try:
+        if toolkit is not None:
+            await toolkit.async_close()
+    except Exception:  # noqa: BLE001 - platform retirement has already completed
+        _LOGGER.exception("Bermuda toolkit cleanup failed")
+    finally:
+        await async_unregister_toolkit(hass, entry.entry_id)
+
+
 async def async_reload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:
-    """Reload config entry."""
+    """Apply toolkit options in place; preserve reloads for other integration options."""
+    coordinator = getattr(getattr(entry, "runtime_data", None), "coordinator", None)
+    toolkit = getattr(coordinator, "toolkit", None)
+    if toolkit is not None and await toolkit.async_options_changed(entry):
+        return
     hass.config_entries.async_schedule_reload(entry.entry_id)

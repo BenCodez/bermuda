@@ -280,7 +280,19 @@ class BermudaAdvert:
         else:
             ref_power = self.ref_power
 
-        distance = rssi_to_metres(self.rssi + self.conf_rssi_offset, ref_power, self.conf_attenuation)
+        offset = self.conf_rssi_offset
+        attenuation = self.conf_attenuation
+        toolkit = getattr(getattr(self._device, "_coordinator", None), "toolkit", None)
+        model_hook = getattr(toolkit, "effective_advert_model", None)
+        if callable(model_hook):
+            model = model_hook(self)
+            if isinstance(model, dict):
+                offset = model.get("rssi_offset", offset)
+                ref_power = model.get("reference_power", ref_power)
+                attenuation = model.get("attenuation", attenuation)
+        # Profiles change the conversion inputs; received RSSI/history remain
+        # unmodified and filtered RSSI never enters this raw measurement field.
+        distance = rssi_to_metres(self.rssi + offset, ref_power, attenuation)
         self.rssi_distance_raw = distance
         if reading_is_new:
             # Add a new historical reading
@@ -367,6 +379,12 @@ class BermudaAdvert:
         """
         new_stamp = self.new_stamp  # should have been set by update()
         self.new_stamp = None  # Clear so we know if an update is missed next cycle
+
+        toolkit = getattr(getattr(self._device, "_coordinator", None), "toolkit", None)
+        process_hook = getattr(toolkit, "process_advert", None)
+        if callable(process_hook) and process_hook(self, new_stamp) is True:
+            self._trim_history()
+            return
 
         if self.rssi_distance is None and new_stamp is not None:
             # DEVICE HAS ARRIVED!
@@ -485,7 +503,10 @@ class BermudaAdvert:
             else:
                 self.rssi_distance = self.rssi_distance_raw
 
-        # Trim our history lists
+        self._trim_history()
+
+    def _trim_history(self) -> None:
+        """Bound source histories even when an optional filter handles this cycle."""
         del self.hist_distance[HIST_KEEP_COUNT:]
         del self.hist_interval[HIST_KEEP_COUNT:]
         del self.hist_rssi[HIST_KEEP_COUNT:]
@@ -498,7 +519,7 @@ class BermudaAdvert:
         # linting and typing can catch errors.
         out = {}
         for var, val in vars(self).items():
-            if val in [self.options]:
+            if val == self.options:
                 # skip certain vars that we don't want in the dump output.
                 continue
             if val in [self.options, self._device, self.scanner_device]:

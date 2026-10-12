@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from statistics import median
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
+from .api import public_device_id
 from .const import (
     _LOGGER,
     ADDR_TYPE_IBEACON,
@@ -80,6 +82,7 @@ async def async_setup_entry(
             entities.append(BermudaSensorRssi(coordinator, entry, address))
             entities.append(BermudaSensorAreaLastSeen(coordinator, entry, address))
             entities.append(BermudaSensorAreaSwitchReason(coordinator, entry, address))
+            entities.append(BermudaSensorAreaSuggestion(coordinator, entry, address))
 
             # _LOGGER.debug("Sensor received new_device signal for %s", address)
             # We set update before add to False because we are being
@@ -462,7 +465,10 @@ class BermudaSensorScannerRange(BermudaSensorRange):
     @property
     def unique_id(self):
         # Retaining legacy wifi mac for unique_id
-        return f"{self._device.unique_id}_{self._scanner.address_wifi_mac or self._scanner.address}_range"
+        scanner_identity = (
+            getattr(self._scanner, "entity_id_address", None) or self._scanner.address_wifi_mac or self._scanner.address
+        )
+        return f"{self._device.unique_id}_{scanner_identity}_range"
 
     @property
     def name(self):
@@ -505,7 +511,10 @@ class BermudaSensorScannerRangeRaw(BermudaSensorScannerRange):
         # Using address_wifi_mac as a legacy action, because esphome changed from
         # sending WIFI MAC to BLE MAC as its source address, in ESPHome 2025.3.0
         #
-        return f"{self._device.unique_id}_{self._scanner.address_wifi_mac or self._scanner.address}_range_raw"
+        scanner_identity = (
+            getattr(self._scanner, "entity_id_address", None) or self._scanner.address_wifi_mac or self._scanner.address
+        )
+        return f"{self._device.unique_id}_{scanner_identity}_range_raw"
 
     @property
     def name(self):
@@ -572,6 +581,89 @@ class BermudaSensorAreaLastSeen(BermudaSensor, RestoreSensor):
         if (sensor_data := await self.async_get_last_sensor_data()) is not None:
             self._attr_native_value = str(sensor_data.native_value)
             self._device.area_last_seen = str(sensor_data.native_value)
+
+
+class BermudaSensorAreaSuggestion(BermudaSensor):
+    """Optional supervised fingerprint advisory, separate from the live area."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_icon = "mdi:map-marker-question"
+
+    @property
+    def unique_id(self):
+        return f"{self._device.unique_id}_area_suggestion"
+
+    @property
+    def name(self):
+        return "Suggested Area"
+
+    def _suggestion(self) -> dict[str, Any]:
+        manager = getattr(self.coordinator, "toolkit", None)
+        hook = getattr(manager, "area_suggestion", None)
+        suggestion = hook(self._device) if callable(hook) else None
+        return suggestion if isinstance(suggestion, dict) else {}
+
+    def _suggested_area(self, suggestion: dict[str, Any]):
+        area_id = suggestion.get("suggested_area")
+        if suggestion.get("accepted") is True and isinstance(area_id, str):
+            return self.ar.async_get_area(area_id)
+        return None
+
+    @property
+    def native_value(self):
+        suggestion = self._suggestion()
+        area = self._suggested_area(suggestion)
+        return area.name if area is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        suggestion = self._suggestion()
+        area = self._suggested_area(suggestion)
+        confidence = suggestion.get("confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+            or not math.isfinite(confidence)
+        ):
+            confidence = None
+        reasons = suggestion.get("reasons", [])
+        if isinstance(reasons, list):
+            reasons = [reason.get("code") if isinstance(reason, dict) else reason for reason in reasons[:16]]
+            reasons = [reason[:256] for reason in reasons if isinstance(reason, str)]
+        else:
+            reasons = []
+        if suggestion.get("accepted") is True and area is None:
+            reasons = [*reasons, "invalid_home_assistant_area"]
+        if not suggestion:
+            reasons = ["fingerprint_model_unavailable"]
+        coverage = suggestion.get("coverage")
+        if isinstance(coverage, dict):
+            coverage = {
+                key: value
+                for key, value in coverage.items()
+                if key in {"fresh_scanners", "required_scanners", "trained_scanners", "missing_scanners"}
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= 128
+            }
+        elif (
+            isinstance(coverage, (int, float))
+            and not isinstance(coverage, bool)
+            and 0 <= coverage <= 1
+            and math.isfinite(coverage)
+        ):
+            coverage = float(coverage)
+        else:
+            coverage = None
+        return {
+            "device_id": public_device_id(self._device),
+            "suggested_area_id": area.id if area is not None else None,
+            "confidence": confidence,
+            "coverage": coverage,
+            "rejection_reasons": reasons,
+        }
 
 
 class BermudaGlobalSensor(BermudaGlobalEntity, SensorEntity):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
@@ -108,6 +110,12 @@ def _ref_power_default(options) -> float:
     return _form_default(options.get(CONF_REF_POWER, DEFAULT_REF_POWER), DEFAULT_REF_POWER)
 
 
+def _markdown_label(value: str) -> str:
+    """Escape dynamic labels inside HA's Markdown tables."""
+    value = html.escape(str(value), quote=False).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", value)
+
+
 class BermudaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for bermuda."""
 
@@ -179,6 +187,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         self._last_scanner = None
         self._last_attenuation = None
         self._last_scanner_info = None
+        self._calibration_scanner_labels: dict[str, str] | None = None
+        self._calibration_scanner_identities: dict[str, tuple[str | None, str | None, str | None]] = {}
 
     async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
         """Manage the options."""
@@ -222,7 +232,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             # Remove centre octets from mac for condensed, privatised display
             shortmac = mac_redact(scanner.get("address", "ERR"))
             scanner_table += (
-                f"| {scanner.get('name', 'NAME_ERR')}| [{shortmac}]"
+                f"| {_markdown_label(scanner.get('name', 'NAME_ERR'))}| [{shortmac}]"
                 f"| {status} {(scanner.get('last_stamp_age', DISTANCE_INFINITE)):.2f} seconds ago.|\n"
             )
         messages["status"] += scanner_table
@@ -474,7 +484,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
             # Build a markdown table showing distance and rssi history for the
             # selected device / scanner combination
-            results_str = f"| {device.name} |"
+            results_str = f"| {_markdown_label(device.name)} |"
             # Limit the number of columns to what's available up to a max of 5.
             cols = min(5, len(distances), len(scanner.hist_rssi))
             for i in range(cols):
@@ -514,40 +524,35 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         Distances are recalculated and displayed each time the user presses
         Submit, and they check "Save and Close" to save the config.
         """
+        self._freeze_calibration_scanner_labels()
+        labels = self._calibration_scanner_labels or {}
+        errors = {}
         if user_input is not None:
-            if user_input[CONF_SAVE_AND_CLOSE]:
-                # Convert the name-based dict to use MAC addresses
-                rssi_offset_by_address = {}
-                for address in self.coordinator.scanner_list:
-                    scanner_name = self.coordinator.devices[address].name
-                    val = user_input[CONF_SCANNER_INFO][scanner_name]
-                    # Clip to keep in sensible range, fixes #497
-                    rssi_offset_by_address[address] = max(min(val, 127), -127)
-
-                self.options.update({CONF_RSSI_OFFSETS: rssi_offset_by_address})
-                # Per previous step, returning elsewhere in the flow after updating the entry doesn't
-                # seem to work, so we'll just save and close the flow.
-                # # Let's update the options - but we don't want to call create entry as that will close the flow.
-                # self.hass.config_entries.async_update_entry(self.config_entry, options=self.options)
-                # # Reset last device so that the next step doesn't think it exists.
-                # self._last_device = None
-                # self._last_scanner_info = None
-                # return await self.async_step_init()
-
-                # Save the config entry and close the flow.
-                return await self._update_options()
-
-            # It's a refresh, basically...
-            self._last_scanner_info = user_input[CONF_SCANNER_INFO]
-            self._last_device = user_input[CONF_DEVICES]
+            submitted = user_input.get(CONF_SCANNER_INFO)
+            if self._calibration_scanner_roster_changed():
+                errors["base"] = "scanner_changed"
+            elif (
+                not isinstance(submitted, dict)
+                or set(submitted) != set(labels)
+                or any(not usable_number(value) for value in submitted.values())
+            ):
+                errors[CONF_SCANNER_INFO] = "invalid_scanner_offsets"
+            if not errors:
+                self._last_scanner_info = {
+                    label: max(min(float(value), 127), -127) for label, value in submitted.items()
+                }
+                self._last_device = user_input.get(CONF_DEVICES)
+                if user_input.get(CONF_SAVE_AND_CLOSE):
+                    # Update only the frozen selection, preserving offline and
+                    # newly discovered scanners' unrelated saved offsets.
+                    rssi_offset_by_address = dict(self.options.get(CONF_RSSI_OFFSETS, {}))
+                    for label, address in labels.items():
+                        rssi_offset_by_address[address] = self._last_scanner_info[label]
+                    self.options.update({CONF_RSSI_OFFSETS: rssi_offset_by_address})
+                    return await self._update_options()
 
         saved_rssi_offsets = self.options.get(CONF_RSSI_OFFSETS, {})
-        rssi_offset_dict = {}
-
-        # Sorted by name so the list is stable and a given scanner is easy to find.
-        for scanner in self._scanner_addresses_by_name():
-            scanner_name = self.coordinator.devices[scanner].name
-            rssi_offset_dict[scanner_name] = saved_rssi_offsets.get(scanner, 0)
+        rssi_offset_dict = {label: saved_rssi_offsets.get(address, 0) for label, address in labels.items()}
         data_schema = {
             vol.Required(
                 CONF_DEVICES,
@@ -559,21 +564,22 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             ): ObjectSelector(),
             vol.Optional(CONF_SAVE_AND_CLOSE, default=False): vol.Coerce(bool),
         }
-        if user_input is None:
+        if user_input is None or errors:
             return self.async_show_form(
                 step_id="calibration2_scanners",
                 data_schema=vol.Schema(data_schema),
+                errors=errors,
                 description_placeholders={"suffix": "After you click Submit, the new distances will be shown here."},
             )
+        device = None
         if isinstance(self._last_device, str):
             device = self._get_bermuda_device_from_registry(self._last_device)
         results_str = ""
         if device is not None and isinstance(self._last_scanner_info, dict):
             results = {}
             # Gather new estimates for distances using rssi hist and the new offset.
-            for scanner in self._scanner_addresses_by_name():
-                scanner_name = self.coordinator.devices[scanner].name
-                cur_offset = self._last_scanner_info.get(scanner_name, 0)
+            for scanner_name, scanner in labels.items():
+                cur_offset = self._last_scanner_info[scanner_name]
                 if (scanneradvert := device.get_scanner(scanner)) is not None:
                     results[scanner_name] = [
                         rssi_to_metres(
@@ -590,7 +596,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             for scanner_name, distances in sorted(
                 results.items(), key=lambda item: item[1][0] if item[1] else DISTANCE_INFINITE
             ):
-                results_str += f"\n|{scanner_name}|"
+                results_str += f"\n|{_markdown_label(scanner_name)}|"
                 for i in range(5):
                     # We round to 2 places (1cm) and pad to fit nn.nn
                     try:
@@ -604,6 +610,41 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             data_schema=vol.Schema(data_schema),
             description_placeholders={"suffix": results_str},
         )
+
+    def _freeze_calibration_scanner_labels(self) -> None:
+        """Freeze display labels to addresses for the lifetime of this form."""
+        if self._calibration_scanner_labels is not None:
+            return
+        addresses = self._scanner_addresses_by_name()
+        names = [str(self.coordinator.devices[address].name) for address in addresses]
+        labels = {}
+        for address, name in zip(addresses, names, strict=True):
+            label = name if names.count(name) == 1 else f"{name} [{address}]"
+            # An actual scanner name can resemble a disambiguated label.
+            while label in labels:
+                label = f"{label} [{address}]"
+            labels[label] = address
+            scanner = self.coordinator.devices[address]
+            self._calibration_scanner_identities[address] = (
+                getattr(scanner, "unique_id", None),
+                getattr(scanner, "entry_id", None),
+                getattr(scanner, "address_wifi_mac", None),
+            )
+        self._calibration_scanner_labels = labels
+
+    def _calibration_scanner_roster_changed(self) -> bool:
+        """Do not apply a frozen edit to a missing or newly bound receiver."""
+        for address, identity in self._calibration_scanner_identities.items():
+            scanner = self.coordinator.devices.get(address)
+            if scanner is None or address not in self.coordinator.scanner_list:
+                return True
+            if identity != (
+                getattr(scanner, "unique_id", None),
+                getattr(scanner, "entry_id", None),
+                getattr(scanner, "address_wifi_mac", None),
+            ):
+                return True
+        return False
 
     def _scanner_addresses_by_name(self) -> list[str]:
         """Return the scanner addresses, sorted (case-insensitively) by scanner name."""

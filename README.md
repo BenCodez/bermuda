@@ -1,27 +1,43 @@
-# Bermuda BLE Trilateration, patched
+# Bermuda BLE Trilateration: BenCodez measurement toolkit fork
 
-## TL;DR
+This custom fork adds measurement, independently labelled calibration and diagnostics to [Bermuda by Ashley Gittins](https://github.com/agittins/bermuda), with the 18 fixes inherited from [davidcoulson/bermuda-patched](https://github.com/davidcoulson/bermuda-patched). It is not an official upstream release. The integration domain remains `bermuda`; existing devices, entity identities and settings remain compatible, and legacy tracking stays the default.
 
-- **Bermuda with bug fixes that are waiting in upstream's queue.** Nothing else: same integration, same options, same stored data.
-- **Fixes the problems people keep reporting:** proxies shown with the wrong name or no area (the "Some Bluetooth Proxies don't have an AREA" repair), changing a proxy's area that does nothing until a reload, update cycles that abort, IRKs written to logs, and a lookup Home Assistant removes in 2027.9.
-- **Temporary by design.** Each fix below is an open pull request on [agittins/bermuda](https://github.com/agittins/bermuda). As each one is merged there, it is dropped here; when they all are, this repository is retired.
+Open the administrator **Bermuda toolkit** sidebar panel after installation. Read the [measurement toolkit guide](docs/measurement-toolkit.md) for controls, measured calibration, defaults, limits and privacy, or the [panel reference](docs/toolkit-panel.md) for a shorter walkthrough.
 
-**Why it exists:** pull requests to Bermuda take a long time to be merged, and some of these bugs make the integration hard to use in the meantime: proxies matched to the wrong device, repairs that never clear, crashes in the update loop. This build lets you run the fixes now, with an easy way back.
+## Twelve additions
 
-## Switch from regular Bermuda
+1. **Stable measurement API:** source IDs/stamps, raw RSSI, raw/filtered range, quality and effective models without hundreds of distance entities.
+2. **Reliable scanner matching:** explicit Bluetooth/config-entry bindings, preserved scanner identities and duplicate-name calibration selectors.
+3. **Scanner health:** packet freshness, cadence, last-valid data and structured rejection reasons.
+4. **Live corrections:** calibration preview, explicit apply and saved applicable rollback.
+5. **Guided measured calibration:** slant distances in metres, independent locations/beacons and held-out validation.
+6. **Safe automatic calibration:** opt-in independent evidence, capped steps, cooldown and regression rollback.
+7. **Receiver/beacon profiles:** hardware notes and explicit radio parameters, with inherited defaults.
+8. **Receiver reliability and radius limits:** optional election weights and local limits while preserving distant raw observations.
+9. **Per-device filtering:** optional pet/stationary policies that reject spikes and accept sustained movement; legacy remains default.
+10. **Bounded history, replay and shadow:** locally saved labelled snapshots, redacted exports and explicit validated promotion.
+11. **Supervised room fingerprints:** independent user labels, unknown/ambiguity rejection, advisory Suggested Area and optional guarded live selection.
+12. **Runtime performance diagnostics:** completed update timing, observation counts, bounded workers and skipped background cycles.
 
-Your Bermuda configuration, devices and settings stay as they are.
+Automatic calibration, reliability weighting, fingerprint live area selection and continuous recording are **off by default**. Hardware descriptions and antenna ratings do not create invented calibration corrections. Explicit measured captures and configured fixed references can save bounded local evidence while continuous recording is off. Range error measures ranging, not map position accuracy.
 
-1. **Remove the original:** in HACS, open *Bermuda BLE Trilateration* → ⋮ → **Remove**. Do *not* delete the integration under Settings → Devices & services; that is what keeps your configuration.
-2. **Add this repository:** HACS → ⋮ → **Custom repositories** → paste `https://github.com/davidcoulson/bermuda-patched`, choose type **Integration**, then **Add**. Or use this button, which opens it in your HACS:
+## Install this fork with HACS
 
-   [![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=davidcoulson&repository=bermuda-patched&category=Integration)
-3. **Install it:** search HACS for *Bermuda BLE Trilateration (patched)* → **Download**.
-4. **Restart Home Assistant.** Bermuda loads as before; HACS shows the version as `0.8.7-patched.N`.
+Use the custom repository **`https://github.com/BenCodez/bermuda`**, category **Integration**:
 
-**To switch back,** do the same in reverse: remove the patched one in HACS, download the original *Bermuda BLE Trilateration*, and restart.
+[![Open this fork in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
-## What's fixed
+For a new installation, add that repository in **HACS → Custom repositories**, download its Bermuda package, restart Home Assistant and add **Bermuda BLE Trilateration** under **Settings → Devices & services**.
+
+To replace upstream or bermuda-patched while preserving your installation:
+
+1. In HACS, remove the previously downloaded Bermuda package. **Keep the existing Bermuda integration entries under Settings → Devices & services**; do not delete their devices/entities/settings.
+2. Add the BenCodez custom repository above and download its Bermuda package. Check the repository owner when similarly named entries appear.
+3. Restart Home Assistant. The existing `bermuda` entries load the fork and keep their established entity identities and option keys.
+
+The HACS repository/package selection changes; Home Assistant's integration configuration entries stay in place. Only one downloaded implementation can occupy `custom_components/bermuda`, so install this as a replacement, not a parallel integration. To return to upstream, replace only the HACS package with the upstream package and restart, retaining the Home Assistant integration entries. Existing legacy options remain in their original namespace.
+
+## Patched baseline: 18 inherited fixes
 
 | Fix | Upstream PR |
 |---|---|
@@ -44,13 +60,15 @@ Your Bermuda configuration, devices and settings stay as they are.
 | Deleting a tracked device stops tracking it (iBeacon ids were split at an underscore, and the device list re-enabled it every cycle) | [#868](https://github.com/agittins/bermuda/pull/868) |
 | Fewer recorder rows: Distance is republished only when it moves by max(0.2 m, 10%), and Floor no longer carries the area attributes | [#869](https://github.com/agittins/bermuda/pull/869) |
 
-Problems with this build: [this repository's issues](https://github.com/davidcoulson/bermuda-patched/issues). Everything else, including all the documentation below, is the original's.
+The fixes above come from the patched baseline and credited upstream pull requests. They are separate from this fork's twelve toolkit additions; their inclusion does not imply an official upstream release. Report fork-specific problems in [BenCodez/bermuda issues](https://github.com/BenCodez/bermuda/issues).
+
+The following general Bermuda documentation and artwork are retained from upstream. The upstream wiki explains shared tracking setup; the [measurement toolkit guide](docs/measurement-toolkit.md) describes this fork's additions.
 
 ---
 
 ![Bermuda Logo](img/logo@2x.png)
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+[![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 # Bermuda BLE Trilateration
 
@@ -59,14 +77,14 @@ Problems with this build: [this repository's issues](https://github.com/davidcou
 - (eventually) Triangulate device positions! Like, on a map. Maybe.
 
 
-[![GitHub Release][releases-shield]][releases]
+[![Upstream Bermuda Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
 [![License][license-shield]](LICENSE)
 [![HomeAssistant Minimum Version][haminverbadge]][haminver]
 [![pre-commit][pre-commit-shield]][pre-commit]
 [![Black][black-shield]][black]
 [![hacs][hacsbadge]][hacs]
-[![Project Maintenance][maintenance-shield]][user_profile]
+[![Upstream Project Maintenance][maintenance-shield]][user_profile]
 [![Discord][discord-shield]][discord]
 [![Community Forum][forum-shield]][forum]
 
@@ -99,7 +117,7 @@ Bermuda aims to let you track any bluetooth device, and have Home Assistant tell
 - Some bluetooth BLE devices you want to track. Phones, smart watches, beacon tiles, thermometers etc.
 
 - Bermuda! I strongly recommend installing Bermuda via HACS:
-  [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+  [![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 ## Documentation and help
 
@@ -185,10 +203,9 @@ a fair amount of ESPresense's wheel.
 
 ## Installation
 
-You can install Bermuda by opening HACS on your Home Assistant instance and searching for "Bermuda".
-Alternatively you can click the button below to be automatically redirected.
+Install this fork through its HACS custom repository as described in [Install this fork with HACS](#install-this-fork-with-hacs). Searching the default catalog can instead select upstream Bermuda. The button below opens the BenCodez repository.
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+[![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 You should now be able to add the `Bermuda BLE Trilateration` integration. Once you have done that,
 you need to restart Home Assistant, then in `Settings`, `Devices & Services` choose `Add Integration`
@@ -233,11 +250,11 @@ Code template was mainly taken from [@Ludeeus](https://github.com/ludeeus)'s [in
 [buymecoffee]: https://www.buymeacoffee.com/AshleyGittins
 [buymecoffeebadge]: https://img.shields.io/badge/buy%20me%20a%20coffee-Caffeinate-green.svg?style=for-the-badge
 
-[commits-shield]: https://img.shields.io/github/commit-activity/y/agittins/bermuda.svg?style=for-the-badge
-[commits]: https://github.com/agittins/bermuda/commits/main
+[commits-shield]: https://img.shields.io/github/commit-activity/y/BenCodez/bermuda.svg?style=for-the-badge
+[commits]: https://github.com/BenCodez/bermuda/commits/main
 
 [hacs]: https://hacs.xyz
-[hacsbadge]: https://img.shields.io/badge/HACS-Default-green.svg?style=for-the-badge
+[hacsbadge]: https://img.shields.io/badge/HACS-Custom-blue.svg?style=for-the-badge
 
 [haminver]: https://github.com/agittins/bermuda/commits/main/hacs.json
 [haminverbadge]: https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fagittins%2Fbermuda%2Fraw%2Fmain%2Fhacs.json&query=%24.homeassistant&style=for-the-badge&logo=homeassistant&logoColor=%2311BDF2&label=Minimum%20HA%20Version

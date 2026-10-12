@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import perf_counter
 from typing import TYPE_CHECKING, cast
 
 import aiofiles
@@ -95,7 +96,7 @@ from .const import (
     SIGNAL_SCANNERS_CHANGED,
     UPDATE_INTERVAL,
 )
-from .util import mac_explode_formats, mac_norm
+from .util import mac_explode_formats, mac_norm, usable_number
 
 if TYPE_CHECKING:
     from habluetooth import BluetoothServiceInfoBleak
@@ -658,6 +659,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER_SPAM_LESS.warning("update_still_running", "Previous update still running, skipping this cycle.")
             return False
         self.update_in_progress = True
+        update_started = perf_counter()
 
         try:  # so we can still clean up update_in_progress
             nowstamp = monotonic_time_coarse()
@@ -666,6 +668,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             result_gather_adverts = self._async_gather_advert_data()
 
             self.update_metadevices()
+
+            prepare_update = getattr(getattr(self, "toolkit", None), "prepare_update", None)
+            if callable(prepare_update):
+                prepare_update()
 
             # Calculate per-device data
             #
@@ -724,6 +730,12 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self.stamp_last_update_started = nowstamp
         self.stamp_last_update = monotonic_time_coarse()
         self.last_update_success = True
+        toolkit = getattr(self, "toolkit", None)
+        after_update = getattr(toolkit, "after_update", None)
+        if callable(after_update):
+            # This synchronous hook owns its bounded background work. It sees
+            # only completed batches, after distances/areas/pruning are final.
+            after_update(max(0.0, perf_counter() - update_started))
         return result_gather_adverts
 
     def _async_gather_advert_data(self):
@@ -1355,6 +1367,29 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
         _max_radius = self.options.get(CONF_MAX_RADIUS, DEFAULT_MAX_RADIUS)
         nowstamp = monotonic_time_coarse()
+        toolkit = getattr(self, "toolkit", None)
+        limit_hook = getattr(toolkit, "receiver_limit", None)
+        has_limit_hook = getattr(toolkit, "receiver_has_limit", None)
+        weight_hook = getattr(toolkit, "weighted_distance", None)
+
+        def receiver_limit(advert: BermudaAdvert) -> float:
+            return limit_hook(advert.scanner_address, _max_radius) if callable(limit_hook) else _max_radius
+
+        def comparison_distance(advert: BermudaAdvert, distance: float) -> float:
+            weighted = weight_hook(advert, distance) if callable(weight_hook) else distance
+            return weighted if usable_number(weighted) and weighted > 0 else distance
+
+        if incumbent is not None and callable(limit_hook):
+            incumbent_limit = receiver_limit(incumbent)
+            explicit_limit = (
+                has_limit_hook(incumbent.scanner_address) is True
+                if callable(has_limit_hook)
+                else incumbent_limit != _max_radius
+            )
+            # Legacy never capped the incumbent. Enforce explicit receiver caps
+            # without changing default hysteresis when the cap follows global.
+            if explicit_limit and incumbent.rssi_distance is not None and incumbent.rssi_distance > incumbent_limit:
+                incumbent = None
 
         tests = self.AreaTests()
         tests.device = device.name
@@ -1393,7 +1428,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 continue
 
             # If we are too far away or don't have an area, we cannot win...
-            if challenger.rssi_distance is None or challenger.rssi_distance > _max_radius or challenger.area_id is None:
+            if (
+                challenger.rssi_distance is None
+                or challenger.rssi_distance > receiver_limit(challenger)
+                or challenger.area_id is None
+            ):
                 continue
 
             # At this point the challenger is a vaild contender...
@@ -1422,7 +1461,9 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             # end.
 
             # If we ARE NOT ACTUALLY CLOSER(!) we can not win.
-            if incumbent.rssi_distance < challenger.rssi_distance:
+            incumbent_distance = comparison_distance(incumbent, incumbent.rssi_distance)
+            challenger_distance = comparison_distance(challenger, challenger.rssi_distance)
+            if incumbent_distance < challenger_distance:
                 # we are not even closer!
                 continue
 
@@ -1430,7 +1471,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             tests.same_area = incumbent.area_id == challenger.area_id
             tests.areas = (incumbent.area_name or "", challenger.area_name or "")
             tests.scannername = (incumbent.name, challenger.name)
-            tests.distance = (incumbent.rssi_distance, challenger.rssi_distance)
+            tests.distance = (incumbent_distance, challenger_distance)
             # tests.velocity = (
             #     next((val for val in closest_scanner.hist_velocity), 0),
             #     next((val for val in scanner.hist_velocity), 0),
@@ -1449,8 +1490,8 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
             # Calculate the percentage difference between the challenger and incumbent's distances
-            _pda = challenger.rssi_distance
-            _pdb = incumbent.rssi_distance
+            _pda = challenger_distance
+            _pdb = incumbent_distance
             tests.pcnt_diff = abs(_pda - _pdb) / ((_pda + _pdb) / 2)
 
             # Same area. Confirm freshness and distance.
@@ -1473,11 +1514,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             pdiff_historical = 0.15  # Percentage difference required to win on historical test
             if len(challenger.hist_distance_by_interval) > min_history:  # we have enough history, let's go..
                 tests.hist_min_max = (
-                    min(
-                        incumbent.hist_distance_by_interval[:history_window]
+                    comparison_distance(
+                        incumbent, min(incumbent.hist_distance_by_interval[:history_window])
                     ),  # The closest that the incumbent has been
-                    max(
-                        challenger.hist_distance_by_interval[:history_window]
+                    comparison_distance(
+                        challenger, max(challenger.hist_distance_by_interval[:history_window])
                     ),  # The **furthest** we have been in that time
                 )
                 if (
@@ -1513,6 +1554,30 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
         # Apply the newly-found closest scanner (or apply None if we didn't find one)
         device.apply_scanner_selection(incumbent)
+
+        suggestion_hook = getattr(toolkit, "area_suggestion", None)
+        if callable(suggestion_hook):
+            suggestion = suggestion_hook(device)
+            confidence = suggestion.get("confidence") if isinstance(suggestion, dict) else None
+            if (
+                getattr(toolkit, "fingerprint_area_selection", False) is True
+                and isinstance(suggestion, dict)
+                and suggestion.get("enabled", True) is True
+                and suggestion.get("accepted") is True
+                and usable_number(confidence)
+                and 0.9 <= confidence <= 1.0
+            ):
+                area_id = suggestion.get("suggested_area")
+                if isinstance(area_id, str) and self.ar.async_get_area(area_id) is not None:
+                    device._update_area_and_floor(area_id)  # noqa: SLF001 - update the device's existing area metadata.
+                    device.area_last_seen = device.area_name
+                    device.area_last_seen_id = device.area_id
+                    device.area_last_seen_icon = device.area_icon
+                    if incumbent is None or incumbent.area_id != area_id:
+                        # A fingerprint does not measure distance to this area.
+                        # Retain the actual incumbent for the next legacy race.
+                        device.area_distance = None
+                        device.area_rssi = None
 
     def _refresh_scanners(self, force=False):
         """
