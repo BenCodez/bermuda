@@ -178,7 +178,11 @@ async def test_prepared_rejected_intent_never_replays_when_conflict_repair_fails
     assert dict(disk.entry.options) == old
 
 
-async def test_accepted_phase_failure_compensates_live_trial_distances_and_histories(disk, monkeypatch):
+@pytest.mark.parametrize("core_flushed", [False, True])
+@pytest.mark.parametrize("background_saved", [False, True])
+async def test_accepted_phase_failure_compensates_live_trial_distances_and_histories(
+    disk, monkeypatch, core_flushed, background_saved
+):
     manager, advert = disk.manager, disk.advert
     before_options = deepcopy(dict(disk.entry.options))
     before_distance = advert.rssi_distance
@@ -193,6 +197,8 @@ async def test_accepted_phase_failure_compensates_live_trial_distances_and_histo
         nonlocal calls
         calls += 1
         if calls == 2:
+            if core_flushed:
+                await flush_core(disk)
             raise WriteError("accepted phase fails")
         await actual(data)
 
@@ -206,9 +212,82 @@ async def test_accepted_phase_failure_compensates_live_trial_distances_and_histo
     assert advert.hist_distance == pytest.approx(before_history)
     assert advert.hist_distance_by_interval == pytest.approx(before_filtered)
     assert disk.device.options is device_options is disk.coordinator.options
+    if background_saved:
+        await manager.store.async_save(manager._store_payload())
     recovered = await restart_from_disk(disk)
     assert recovered.trial is None
     assert disk.entry.options[CONF_RSSI_OFFSETS] == before_options[CONF_RSSI_OFFSETS]
+    await recovered.store.async_save(recovered._store_payload())
+    recovered = await restart_from_disk(disk)
+    assert recovered.trial is None
+    assert dict(disk.entry.options) == before_options
+    await flush_core(disk)
+    again = await restart_from_disk(disk)
+    assert again.trial is None
+    assert dict(disk.entry.options) == before_options
+
+
+@pytest.mark.parametrize("next_commit_fails", [False, True])
+async def test_failed_provisional_commit_recovers_prior_unflushed_accepted_trial(disk, monkeypatch, next_commit_fails):
+    manager = disk.manager
+    await apply(disk)
+    before_options = deepcopy(dict(disk.entry.options))
+    before_trial = deepcopy(manager.trial)
+    actual = manager.store._async_write_data
+    calls = 0
+
+    async def fail_accept(data):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await flush_core(disk)
+            raise WriteError("accepted phase fails after core flush")
+        if calls == 4 and next_commit_fails:
+            raise WriteError("next accepted phase fails before core compensation flushes")
+        await actual(data)
+
+    monkeypatch.setattr(manager.store, "_async_write_data", fail_accept)
+    with pytest.raises(OSError):
+        await manager.async_dispatch("settings", {"settings": {"receiver_limits": {SCANNER: 30.0}}})
+    assert dict(disk.entry.options) == before_options
+    recovered = await restart_from_disk(disk)
+    assert dict(disk.entry.options) == before_options
+    assert recovered.settings["receiver_limits"] == {}
+    assert recovered.trial == before_trial
+    disk.manager = recovered
+    if next_commit_fails:
+        with pytest.raises(OSError):
+            await recovered.async_dispatch("settings", {"settings": {"receiver_limits": {SCANNER: 9.0}}})
+    else:
+        await recovered.async_dispatch("settings", {"settings": {"receiver_limits": {SCANNER: 9.0}}})
+    latest = await restart_from_disk(disk)
+    assert latest.settings["receiver_limits"] == ({} if next_commit_fails else {SCANNER: 9.0})
+    assert latest.trial == before_trial
+    assert disk.entry.options[CONF_RSSI_OFFSETS] == before_options[CONF_RSSI_OFFSETS]
+
+
+async def test_prepared_compensation_preserves_later_external_options(disk, monkeypatch):
+    actual = disk.manager.store._async_write_data
+    calls = 0
+    external = None
+
+    async def fail_accept(data):
+        nonlocal calls, external
+        calls += 1
+        if calls == 2:
+            external = deepcopy(dict(disk.entry.options))
+            external[CONF_RSSI_OFFSETS] = {SCANNER: 7.0}
+            disk.hass.config_entries.async_update_entry(disk.entry, options=external)
+            await flush_core(disk)
+            raise WriteError("accepted phase fails after external edit")
+        await actual(data)
+
+    monkeypatch.setattr(disk.manager.store, "_async_write_data", fail_accept)
+    with pytest.raises(OSError):
+        await apply(disk)
+    recovered = await restart_from_disk(disk)
+    assert dict(disk.entry.options) == external
+    assert recovered.trial is None
 
 
 async def test_cancelled_public_caller_still_finishes_commit_and_busy_guard(disk, monkeypatch):

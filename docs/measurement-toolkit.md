@@ -68,6 +68,8 @@ Duplicates and out-of-order stamps do not add measurements. A missing packet age
 
 The [toolkit manager](../custom_components/bermuda/toolkit.py) persists rollback evidence before publishing an options change. Applied receiver offsets use the existing offset controls; an explicit receiver profile offset replaces that receiver's legacy offset, rather than adding it twice. Numeric model changes recompute range without changing the packet stamp or overwriting received RSSI. After selection updates, distance entities publish the corrected value once even when the change falls inside the normal jitter deadband or the first read is delayed.
 
+When using BPS, a Bermuda model change also changes the distances BPS receives. Keep BPS automatic calibration disabled while validating Bermuda changes at measured positions. Existing BPS correction factors remain in place; they are not transferred or reset by this fork. If you move a correction from BPS into Bermuda, reset only the affected BPS factors after verifying the transfer, then collect fresh readings and test the map positions again. Avoid running both automatic calibrators against the same receivers.
+
 ### 5. Guided calibration at independently measured locations
 
 Use **Calibration → Capture independent measured truth**:

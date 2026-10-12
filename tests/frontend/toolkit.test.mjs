@@ -14,7 +14,7 @@ class Element {
   }
   attachShadow() { this.shadowRoot = new Element("shadow"); return this.shadowRoot; }
   append(...children) { for (const child of children) { child.parent = this; this.children.push(child); } }
-  replaceChildren(...children) { this.children = []; this.append(...children); }
+  replaceChildren(...children) { this.children = []; if (this.tagName === "select") delete this._value; this.append(...children); }
   remove() { this.parent.children = this.parent.children.filter(child => child !== this); }
   set textContent(value) { this._text = value; this.children = []; }
   get textContent() { return String(this._text || "") + this.children.map(child => child.textContent).join(""); }
@@ -30,7 +30,7 @@ class Element {
   }
   get value() {
     if (this.type === "file" && this.files?.length) return `C:\\fakepath\\${this.files[0].name || "synthetic-recording.json"}`;
-    if (this.tagName === "select") return this.children.some(child => child.value === this._value) ? this._value : this.children[0]?.value || "";
+    if (this.tagName === "select") return this._value === undefined ? this.children[0]?.value || "" : this.children.some(child => child.value === this._value) ? this._value : "";
     return this._value ?? this.attributes.value ?? "";
   }
   setAttribute(key, value) { this.attributes[key] = String(value); if (key === "id") this.id = value; }
@@ -684,6 +684,239 @@ function applySettingRequest(server, payload) {
   }
   return { options: structuredClone(server.options) };
 }
+
+test("removed receivers cannot redirect limit drafts and reappearance requires a fresh edit", async () => {
+  const { server, receiverA, receiverB } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload); return applySettingRequest(server, payload);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Maximum distance (m)", "30");
+  await edit(component, "History window (seconds)", "1800");
+  const removed = server.snapshot.scanners[receiverA];
+  delete server.snapshot.scanners[receiverA];
+  await component.refresh();
+  assert.equal(field(component, "Receiver").value, receiverB);
+  assert.equal(field(component, "Maximum distance (m)").value, "7");
+  await button(component, "Save receiver limit").click();
+  assert.equal(calls.length, 0);
+  server.snapshot.scanners = { [receiverA]: removed, ...server.snapshot.scanners };
+  await component.refresh();
+  assert.equal(field(component, "Receiver").value, receiverB);
+  await edit(component, "Receiver", receiverA, "change");
+  assert.equal(field(component, "Maximum distance (m)").value, "0");
+  await button(component, "Save receiver limit").click();
+  assert.equal(calls.length, 0);
+  await edit(component, "Maximum distance (m)", "12");
+  await component.refresh();
+  await button(component, "Save receiver limit").click();
+  assert.deepEqual(calls[0].settings, { receiver_limits: { [receiverA]: 12 } });
+  assert.equal(field(component, "History window (seconds)").value, "1800");
+});
+
+test("removed devices cannot redirect filter drafts or restore them on reappearance", async () => {
+  const { server, deviceA, deviceB } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload); return applySettingRequest(server, payload);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Device", deviceA, "change");
+  await edit(component, "Filter", "stationary", "change");
+  const removed = server.snapshot.devices[deviceA];
+  delete server.snapshot.devices[deviceA];
+  await component.refresh();
+  assert.equal(field(component, "Device").value, deviceB);
+  assert.equal(field(component, "Filter").value, "pet");
+  await button(component, "Save filter mode").click();
+  assert.equal(calls.length, 0);
+  server.snapshot.devices = { [deviceA]: removed, ...server.snapshot.devices };
+  await component.refresh();
+  assert.equal(field(component, "Device").value, deviceB);
+  await edit(component, "Device", deviceA, "change");
+  assert.equal(field(component, "Filter").value, "legacy");
+  await button(component, "Save filter mode").click();
+  assert.equal(calls.length, 0);
+  await edit(component, "Filter", "pet", "change");
+  await component.refresh();
+  await button(component, "Save filter mode").click();
+  assert.deepEqual(calls[0].settings, { filters: { [deviceA]: "pet" } });
+});
+
+for (const kind of ["receiver", "beacon"]) {
+  test(`removed ${kind} profile targets cannot redirect radio, metadata or verification drafts`, async () => {
+    const { server, receiverA, receiverB, deviceA, deviceB } = twoTargetState();
+    const [idA, idB] = kind === "receiver" ? [receiverA, receiverB] : [deviceA, deviceB];
+    const roster = kind === "receiver" ? "scanners" : "devices";
+    const key = kind === "receiver" ? "rssi_offset" : "reference_power";
+    const label = kind === "receiver" ? "Receiver RSSI offset (dB)" : "Reference power at 1 m (dBm)";
+    server.options[`${kind}_profiles`] = {
+      [idA]: { model: "saved A", [key]: 1, reference_power_verified: false },
+      [idB]: { model: "saved B", [key]: 2, reference_power_verified: false },
+    };
+    const calls = [];
+    const component = panel(async (method, path, payload) => {
+      if (method === "POST") calls.push(payload);
+      return structuredClone(server);
+    });
+    component._state = structuredClone(server); component._render();
+    await edit(component, "Profile type", kind, "change");
+    await edit(component, "Profile target", idA, "change");
+    await edit(component, label, "10");
+    await edit(component, "model", "unsaved A");
+    if (kind === "beacon") await edit(component, "Reference power independently verified", true);
+    const removed = server.snapshot[roster][idA];
+    delete server.snapshot[roster][idA];
+    await component.refresh();
+    assert.equal(field(component, "Profile target").value, idB);
+    assert.equal(field(component, label).value, "2");
+    assert.equal(field(component, "model").value, "saved B");
+    assert.equal(field(component, "Reference power independently verified").checked, false);
+    await button(component, "Save profile").click();
+    assert.equal(calls.length, 0);
+    server.snapshot[roster] = { [idA]: removed, ...server.snapshot[roster] };
+    await component.refresh();
+    assert.equal(field(component, "Profile target").value, idB);
+    await edit(component, "Profile target", idA, "change");
+    assert.equal(field(component, label).value, "1");
+    assert.equal(field(component, "model").value, "saved A");
+    await button(component, "Save profile").click();
+    assert.equal(calls.length, 0);
+    await edit(component, label, "20");
+    await component.refresh();
+    await button(component, "Save profile").click();
+    assert.equal(calls[0].kind, kind);
+    assert.equal(calls[0].id, idA);
+    assert.deepEqual(calls[0].profile, { [key]: 20 });
+  });
+}
+
+test("roster changes preserve a present implicit target and its drafts despite reordered choices", async () => {
+  const { server, receiverA, receiverB, deviceA, deviceB } = twoTargetState();
+  const component = panel(async () => structuredClone(server));
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Maximum distance (m)", "30");
+  await edit(component, "Filter", "stationary", "change");
+  await edit(component, "model", "unsaved A");
+  server.snapshot.scanners = { [receiverB]: server.snapshot.scanners[receiverB], [receiverA]: server.snapshot.scanners[receiverA] };
+  server.snapshot.devices = { [deviceB]: server.snapshot.devices[deviceB], [deviceA]: server.snapshot.devices[deviceA] };
+  await component.refresh();
+  assert.equal(field(component, "Receiver").value, receiverA);
+  assert.equal(field(component, "Maximum distance (m)").value, "30");
+  assert.equal(field(component, "Device").value, deviceA);
+  assert.equal(field(component, "Filter").value, "stationary");
+  assert.equal(field(component, "Profile target").value, receiverA);
+  assert.equal(field(component, "model").value, "unsaved A");
+});
+
+test("target removal while settings are hidden clears drafts before the target reappears", async () => {
+  const { server, receiverA, deviceA } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") calls.push(payload);
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Maximum distance (m)", "30");
+  await edit(component, "Filter", "stationary", "change");
+  await edit(component, "model", "unsaved A");
+  component._activeTab = 4; component._render();
+  const scanners = server.snapshot.scanners, devices = server.snapshot.devices;
+  server.snapshot.scanners = {}; server.snapshot.devices = {};
+  await component.refresh();
+  server.snapshot.scanners = scanners; server.snapshot.devices = devices;
+  await component.refresh();
+  component._activeTab = 0; component._render();
+  assert.equal(field(component, "Receiver").value, receiverA);
+  assert.equal(field(component, "Device").value, deviceA);
+  assert.equal(field(component, "Maximum distance (m)").value, "0");
+  assert.equal(field(component, "Filter").value, "legacy");
+  assert.equal(field(component, "model").value, "");
+  for (const label of ["Save receiver limit", "Save filter mode", "Save profile"]) await button(component, label).click();
+  assert.equal(calls.length, 0);
+});
+
+test("profile kind changes replace a remembered target and scope drafts even when IDs overlap", async () => {
+  const { server, receiverA, receiverB } = twoTargetState();
+  server.snapshot.devices = Object.fromEntries([receiverA, receiverB].map(id => [id, { device_id: id, name: "Synthetic beacon" }]));
+  server.options.receiver_profiles = { [receiverA]: { model: "receiver A" }, [receiverB]: { model: "receiver B" } };
+  server.options.beacon_profiles = { [receiverA]: { model: "beacon A" }, [receiverB]: { model: "beacon B" } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") calls.push(payload);
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Profile target", receiverB, "change");
+  await edit(component, "model", "unsaved receiver B");
+  await edit(component, "Profile type", "beacon", "change");
+  assert.equal(field(component, "Profile target").value, receiverA);
+  assert.equal(field(component, "model").value, "beacon A");
+  await edit(component, "model", "edited beacon A");
+  await component.refresh();
+  assert.equal(field(component, "Profile target").value, receiverA);
+  assert.equal(field(component, "model").value, "edited beacon A");
+  await edit(component, "Profile type", "receiver", "change");
+  assert.equal(field(component, "Profile target").value, receiverA);
+  assert.equal(field(component, "model").value, "receiver A");
+  await button(component, "Save profile").click();
+  assert.equal(calls.length, 0);
+  await edit(component, "model", "edited receiver A");
+  await component.refresh();
+  await button(component, "Save profile").click();
+  assert.equal(calls[0].kind, "receiver");
+  assert.equal(calls[0].id, receiverA);
+  assert.deepEqual(calls[0].profile, { model: "edited receiver A" });
+});
+
+test("a profile acknowledgement cannot clear newer edits after explicit target and kind selection", async () => {
+  const { server, receiverA, deviceA } = twoTargetState();
+  const pending = deferred(); const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload); return pending.promise;
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "model", "submitted receiver A");
+  const saving = button(component, "Save profile").click();
+  await edit(component, "Profile type", "beacon", "change");
+  await edit(component, "model", "newer beacon A");
+  pending.resolve({ profile: { model: "submitted receiver A" } });
+  await saving;
+  assert.equal(calls[0].id, receiverA);
+  assert.equal(calls[0].kind, "receiver");
+  assert.equal(field(component, "Profile target").value, deviceA);
+  assert.equal(field(component, "model").value, "newer beacon A");
+  assert.equal(component._drafts.get("profile-model"), "newer beacon A");
+});
+
+test("detached target controls cannot overwrite or discard a replacement target's newer drafts", async () => {
+  const { server, receiverA, receiverB, deviceA } = twoTargetState();
+  const component = panel(async () => structuredClone(server));
+  component._state = structuredClone(server); component._render();
+  const prior = Object.fromEntries(["Receiver", "Maximum distance (m)", "Device", "Filter", "Profile type", "Profile target", "model"].map(label => [label, field(component, label)]));
+  delete server.snapshot.scanners[receiverA]; delete server.snapshot.devices[deviceA];
+  await component.refresh();
+  await edit(component, "Maximum distance (m)", "18");
+  await edit(component, "Filter", "stationary", "change");
+  await edit(component, "model", "newer receiver B");
+  prior.Receiver.value = receiverA; await prior.Receiver.dispatch("change");
+  prior["Maximum distance (m)"].value = "30"; await prior["Maximum distance (m)"].dispatch("input");
+  prior.Device.value = deviceA; await prior.Device.dispatch("change");
+  prior.Filter.value = "legacy"; await prior.Filter.dispatch("change");
+  prior["Profile target"].value = receiverA; await prior["Profile target"].dispatch("change");
+  prior["Profile type"].value = "beacon"; await prior["Profile type"].dispatch("change");
+  prior.model.value = "stale receiver A"; await prior.model.dispatch("input");
+  await component.refresh();
+  assert.equal(field(component, "Receiver").value, receiverB);
+  assert.equal(field(component, "Maximum distance (m)").value, "18");
+  assert.equal(field(component, "Filter").value, "stationary");
+  assert.equal(field(component, "Profile target").value, receiverB);
+  assert.equal(field(component, "model").value, "newer receiver B");
+});
 
 test("single-target map patches preserve concurrent edits to other receivers and public devices", async () => {
   const { server, receiverA, receiverB, deviceA, deviceB } = twoTargetState();

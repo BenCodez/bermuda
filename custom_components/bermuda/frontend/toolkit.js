@@ -56,6 +56,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._generation = 0;
     this._drafts = new Map();
     this._draftVersions = new Map();
+    this._draftTargets = new Map();
     this._draftRevision = 0;
     this._results = {};
     this._captureNeedsPreview = false;
@@ -75,6 +76,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._content = null;
       this._drafts.clear();
       this._draftVersions.clear();
+      this._draftTargets.clear();
       this._results = {};
       this._captureNeedsPreview = false;
       this._message = denied ? "Administrator access is required." : "";
@@ -95,6 +97,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._content = null;
       this._drafts.clear();
       this._draftVersions.clear();
+      this._draftTargets.clear();
       this._results = {};
       this._message = "";
       this._captureNeedsPreview = false;
@@ -261,9 +264,33 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _trackDraft(input) {
     const generation = this._generation;
-    const remember = () => { if (generation === this._generation) this._markDraft(input); };
+    const content = this._content;
+    const remember = () => { if (generation === this._generation && content === this._content) this._markDraft(input); };
     input.addEventListener("input", remember);
     input.addEventListener("change", remember);
+  }
+
+  _bindTargetDrafts(name, kind, id, fields) {
+    const previous = this._draftTargets.get(name);
+    if (previous && (previous.kind !== kind || previous.id !== id)) {
+      for (const field of fields) {
+        this._drafts.delete(field);
+        this._draftVersions.delete(field);
+      }
+    }
+    this._draftTargets.set(name, { kind, id, fields });
+  }
+
+  _discardUnavailableTargetDrafts() {
+    const rosters = { receiver: this._scanners(), beacon: this._devices() };
+    for (const [name, target] of this._draftTargets) {
+      if (rosters[target.kind].some(([id]) => id === target.id)) continue;
+      for (const field of [name, ...target.fields]) {
+        this._drafts.delete(field);
+        this._draftVersions.delete(field);
+      }
+      this._draftTargets.delete(name);
+    }
   }
 
   _resetField(input, value) {
@@ -310,7 +337,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     const select = node("select");
     select.dataset.draft = name;
     for (const [id, text] of choices) select.append(node("option", text, { value: id }));
-    const saved = this._drafts.has(name) ? this._drafts.get(name) : value;
+    const saved = this._drafts.has(name) ? this._drafts.get(name) : this._draftTargets.get(name)?.id ?? value;
     if (choices.some(([id]) => id === saved)) select.value = saved;
     this._trackDraft(select);
     wrapper.append(select);
@@ -357,6 +384,7 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _render() {
     this._rememberDrafts();
+    this._discardUnavailableTargetDrafts();
     this.shadowRoot.replaceChildren();
     const style = node("style", `
       :host{display:block;padding:20px;color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family, sans-serif)}
@@ -415,21 +443,34 @@ export class BermudaToolkitPanel extends HTMLElement {
     });
     const receiver = this._section(parent, "Receiver maximum distance", "A value of 0 follows Bermuda’s existing global maximum distance.");
     const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
+    this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
     const limit = this._field(receiver, "Maximum distance (m)", "limit", receiverValue(options.receiver_limits, scanner.value, 0), { type: "number", min: 0, max: 1000, step: .1 });
-    scanner.addEventListener("change", () => { this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0)); });
+    scanner.addEventListener("change", () => {
+      if (parent !== this._content) return;
+      this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
+      this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0));
+    });
     this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true }), { disabled: !this._scanners().length });
     const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
     const device = this._select(filters, "Device", "filter-device", this._devices());
+    this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
     const mode = this._select(filters, "Filter", "filter-mode", ["legacy", "pet", "stationary"].map(x => [x, x]), options.filters?.[device.value] || "legacy");
-    device.addEventListener("change", () => { this._resetField(mode, this._options().filters?.[device.value] || "legacy"); });
+    device.addEventListener("change", () => {
+      if (parent !== this._content) return;
+      this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
+      this._resetField(mode, this._options().filters?.[device.value] || "legacy");
+    });
     this._button(filters, "Save filter mode", () => this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true }), { disabled: !this._devices().length });
     const profiles = this._section(parent, "Hardware and radio profile", "Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance. Leave a numeric field empty to inherit the existing model.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
     const profileInputs = {};
+    const profileKeys = ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"];
+    const profileDrafts = [...profileKeys.map(key => `profile-${key}`), "profile-verified"];
+    this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
     const current = this._profile(kind.value, target.value);
     const numericLabels = { height_m: "Receiver / beacon mounting height (m)", antenna_gain_dbi: "Antenna gain (dBi; metadata)", distance_accuracy_m: "Distance accuracy (m; metadata)", rssi_offset: "Receiver RSSI offset (dB)", reference_power: "Reference power at 1 m (dBm)", attenuation: "Path-loss exponent" };
-    for (const key of ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"]) {
+    for (const key of profileKeys) {
       const numeric = ["height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"].includes(key);
       profileInputs[key] = this._field(profiles, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, current[key] ?? "", { type: numeric ? "number" : "text", step: numeric ? .1 : undefined });
     }
@@ -437,6 +478,8 @@ export class BermudaToolkitPanel extends HTMLElement {
     const configureKind = () => { profileInputs.rssi_offset.disabled = kind.value !== "receiver"; verified.disabled = kind.value !== "beacon"; };
     configureKind();
     const loadProfile = () => {
+      if (parent !== this._content) return;
+      this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
       const existing = this._profile(kind.value, target.value);
       for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
       this._resetField(verified, existing.reference_power_verified);
@@ -444,8 +487,10 @@ export class BermudaToolkitPanel extends HTMLElement {
     };
     target.addEventListener("change", loadProfile);
     kind.addEventListener("change", () => {
+      if (parent !== this._content) return;
       target.replaceChildren();
       for (const [id, name] of kind.value === "beacon" ? this._devices() : this._scanners()) target.append(node("option", name, { value: id }));
+      this._markDraft(target);
       loadProfile();
     });
     this._button(profiles, "Save profile", () => {

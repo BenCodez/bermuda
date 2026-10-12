@@ -339,12 +339,19 @@ class ToolkitManager:
     def _valid_journal(value: Any) -> bool:
         """Require bounded local provenance before replaying an options transition."""
         try:
+            ancestor, depth = value, 0
+            while isinstance(ancestor, dict) and "fallback" in ancestor:
+                depth += 1
+                if depth > MAX_COMMIT_ANCHORS:
+                    return False
+                ancestor = ancestor["fallback"]
             return (
                 isinstance(value, dict)
                 and value.get("phase") in ("prepared", "accepted")
                 and isinstance(value.get("desired"), dict)
                 and isinstance(value.get("before"), dict)
                 and isinstance(value.get("after"), dict)
+                and ("previous_options" not in value or isinstance(value["previous_options"], dict))
                 and isinstance(value.get("anchors"), list)
                 and 0 < len(value["anchors"]) <= MAX_COMMIT_ANCHORS
                 and all(isinstance(anchor, str) and len(anchor) == 64 for anchor in value["anchors"])
@@ -363,11 +370,30 @@ class ToolkitManager:
             return saved
         current = deepcopy(dict(self.entry.options))
         selected = journal
-        same_marker = current.get(OPTIONS_KEY, {}).get(COMMIT_KEY) == journal["desired"][OPTIONS_KEY][COMMIT_KEY]
-        if journal["phase"] == "prepared" and not same_marker:
+        compensating = False
+        if journal["phase"] == "prepared":
+            previous = journal.get("previous_options")
+            if isinstance(previous, dict) and _same_options(current, journal["desired"]):
+                # HA may have flushed provisional options before the accepted
+                # witness failed. A prepared action was never acknowledged;
+                # compensate its exact options without overwriting later edits.
+                journal = deepcopy(journal)
+                journal["anchors"] = [_options_digest(current, self.entry.modified_at.isoformat())]
+                self._options_journal = journal
+                compensating = True
+                self.hass.config_entries.async_update_entry(self.entry, options=deepcopy(previous))
+                self._reconcile_options(previous)
+                current = deepcopy(previous)
             fallback = journal.get("fallback")
-            if not self._valid_journal(fallback) or fallback["phase"] != "accepted":
+            if not self._valid_journal(fallback):
                 return {**saved, **deepcopy(journal["before"])}
+            if fallback["phase"] == "prepared":
+                recovered = await self._recover_options(
+                    {**saved, **deepcopy(journal["before"]), "options_journal": fallback}
+                )
+                if compensating:
+                    self._options_journal = journal
+                return recovered
             saved = {
                 **saved,
                 **{
@@ -397,7 +423,9 @@ class ToolkitManager:
             backup = selected.get("backup_trial")
             if isinstance(backup, dict) and self._trial_offsets_match(backup, current):
                 recovered = {**recovered, "trial": backup}
-        self._options_journal = deepcopy(selected)
+        # Keep compensation recoverable through diagnostic writes or another
+        # accepted action before HA's delayed rollback reaches its own file.
+        self._options_journal = deepcopy(journal if compensating else selected)
         metadata = {
             key: deepcopy(recovered[key]) for key in ("trial", "last_applied", "last_data_id") if key in recovered
         }
@@ -752,9 +780,16 @@ class ToolkitManager:
         digest = _options_digest(baseline_options, baseline_modified)
         if digest not in anchors:
             anchors.append(digest)
-        journal = {"phase": "prepared", "anchors": anchors, "desired": options, "before": before, "after": after}
+        journal = {
+            "phase": "prepared",
+            "anchors": anchors,
+            "desired": options,
+            "previous_options": baseline_options,
+            "before": before,
+            "after": after,
+        }
         journal["backup_trial"] = deepcopy(before.get("trial") or (previous_journal or {}).get("backup_trial"))
-        if previous_journal and previous_journal.get("phase") == "accepted" and not acknowledged:
+        if previous_journal and not acknowledged:
             journal["fallback"] = previous_journal
         if not self._valid_journal(journal):
             msg = "Wait for Home Assistant options to finish saving before another toolkit change"
@@ -778,15 +813,18 @@ class ToolkitManager:
         if replace_trial:
             self.trial = deepcopy(trial)
         self.last_applied, self.last_data_id = after["last_applied"], after["last_data_id"]
-        accepted = {key: deepcopy(value) for key, value in journal.items() if key != "fallback"}
+        accepted = {
+            key: deepcopy(value) for key, value in journal.items() if key not in ("fallback", "previous_options")
+        }
         accepted["phase"] = "accepted"
         accepted["desired_anchor"] = _options_digest(options, self.entry.modified_at.isoformat())
         self._options_journal = accepted
         try:
             await self.store.async_save(self._store_payload())
         except (OSError, asyncio.CancelledError):
-            self._options_journal = previous_journal
+            self._options_journal = deepcopy(journal)
             if _same_options(dict(self.entry.options), options):
+                self._options_journal["desired_anchor"] = _options_digest(options, self.entry.modified_at.isoformat())
                 self.hass.config_entries.async_update_entry(self.entry, options=baseline_options)
                 self._reconcile_options(baseline_options)
                 self.trial, self.last_applied, self.last_data_id = (
