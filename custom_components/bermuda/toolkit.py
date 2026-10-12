@@ -15,6 +15,7 @@ from typing import Any
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .api import async_get_advert_snapshot, public_device_id, snapshot_observations
 from .calibration import CalibrationEngine, range_from_rssi
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DISTANCE_INFINITE,
     DOMAIN,
+    SIGNAL_SCANNERS_CHANGED,
 )
 from .fingerprints import FingerprintModel
 from .profiles import effective_model, finite_number, model_version, normalize_toolkit_settings, receiver_value
@@ -688,6 +690,7 @@ class ToolkitManager:
     ) -> None:
         """Durably prepare and acknowledge a recoverable normal HA options update."""
         baseline_options = deepcopy(dict(self.entry.options))
+        previous_bindings = deepcopy(self.settings["scanner_bindings"])
         baseline_modified = self.entry.modified_at.isoformat()
         previous_journal = deepcopy(self._options_journal)
         before = self._trial_state()
@@ -780,6 +783,17 @@ class ToolkitManager:
                     restored.enabled = self.settings["history_enabled"]
                     self.history = restored
             raise
+        self._notify_scanner_binding_change(previous_bindings)
+
+    def _notify_scanner_binding_change(self, previous_bindings: dict) -> None:
+        """Backfill receiver entities only after their binding is accepted."""
+        if (
+            not self._closed
+            and self._available
+            and self._identities_ready
+            and previous_bindings != self.settings["scanner_bindings"]
+        ):
+            async_dispatcher_send(self.hass, SIGNAL_SCANNERS_CHANGED)
 
     def _adopt_settings(self, settings: dict, options: dict) -> None:
         previous = self.version()
@@ -872,6 +886,7 @@ class ToolkitManager:
             old_other = {key: value for key, value in self._saved_options.items() if key not in excluded}
             new_other = {key: value for key, value in new.items() if key not in excluded}
             if new != self._saved_options:
+                previous_bindings = deepcopy(self.settings["scanner_bindings"])
                 backup = (self._options_journal or {}).get("backup_trial")
                 if self.trial is None and isinstance(backup, dict) and self._trial_offsets_match(backup, new):
                     self.trial = deepcopy(backup)
@@ -885,13 +900,16 @@ class ToolkitManager:
                     latest = deepcopy(dict(entry.options))
                     self._adopt_settings(_settings(latest.get(OPTIONS_KEY)), latest)
                     self._saved_options = latest
+                    self._notify_scanner_binding_change(previous_bindings)
                     self.last_result = {"reasons": ["external_options_witness_unavailable"]}
                     new_other = {key: value for key, value in latest.items() if key not in excluded}
                 else:
                     latest = deepcopy(dict(entry.options))
                     if not _same_options(latest, self._saved_options):
+                        previous_bindings = deepcopy(self.settings["scanner_bindings"])
                         self._adopt_settings(_settings(latest.get(OPTIONS_KEY)), latest)
                         self._saved_options = latest
+                        self._notify_scanner_binding_change(previous_bindings)
                     new_other = {key: value for key, value in latest.items() if key not in excluded}
             if old_other != new_other:
                 return False
@@ -1029,12 +1047,29 @@ class ToolkitManager:
         options[CONF_RSSI_OFFSETS] = deepcopy(previous.get(CONF_RSSI_OFFSETS, {}))
         prior = _settings(previous.get(OPTIONS_KEY))
         settings = deepcopy(self.settings)
-        for key, profile in settings["receiver_profiles"].items():
-            old = prior["receiver_profiles"].get(key, {})
-            if "rssi_offset" in old:
-                profile["rssi_offset"] = old["rssi_offset"]
+        profiles = settings["receiver_profiles"]
+        prior_profiles = prior["receiver_profiles"]
+        for scanner in self.trial["offsets"]:
+            # Profiles may have been deleted or MAC-case renamed after apply
+            # removed their numeric override. Match only the receiver identity;
+            # retain current metadata and never restore old hardware descriptions.
+            aliases = [key for key in profiles if receiver_value({scanner: True}, key, False)]
+            old = receiver_value(prior_profiles, scanner, {})
+            for key in aliases:
+                profiles[key].pop("rssi_offset", None)
+            if "rssi_offset" not in old:
+                continue
+            if scanner in aliases:
+                target = scanner
+            elif len(aliases) == 1:
+                target = aliases[0]
+            elif aliases:
+                msg = "Ambiguous receiver profile aliases prevent rollback"
+                raise RuntimeError(msg)
             else:
-                profile.pop("rssi_offset", None)
+                keys = {key: key for key in prior_profiles}
+                target = receiver_value(keys, scanner, scanner)
+            profiles.setdefault(target, {})["rssi_offset"] = old["rssi_offset"]
         settings["filters"] = prior["filters"]
         if disable_auto:
             settings["auto_calibration"] = False

@@ -547,6 +547,17 @@ class BermudaDevice:
                 self._hascanner.name,
                 self._hascanner.source,
             )
+            # A removed or compensated binding must not retain its last registry
+            # winner. Its source and frozen entity identities remain unchanged.
+            had_association = (
+                self.entry_id is not None or self.address_wifi_mac is not None or self.scanner_binding is not None
+            )
+            self.entry_id = None
+            self.address_wifi_mac = None
+            self.address_ble_mac = self.address
+            self.scanner_binding = None
+            if had_association:
+                self._apply_scanner_registry_metadata(None, None, None, None)
             return
 
         # We found the device entry and have created our scannerdevice,
