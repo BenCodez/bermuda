@@ -8,7 +8,7 @@ import json
 import math
 import time
 import uuid
-from copy import deepcopy
+from copy import copy, deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -579,8 +579,11 @@ class ToolkitManager:
 
     def snapshot_metadata(self, device_id: str, scanner_id: str, advert: Any) -> dict:
         """Publish effective settings and source-clock quality, independently of capture time."""
+        # Untracked source aliases can expose the canonical owner's advert.
+        # Report the model that actually produced its ranges and filter state.
+        device_id = self._device_id(advert)
         state = self._states.get((device_id, scanner_id))
-        model = self.effective_advert_model(advert, device_id)
+        model = self.effective_advert_model(advert)
         reference = self.settings["fixed_references"].get(device_id, {})
         quality = (
             state.snapshot(
@@ -863,6 +866,9 @@ class ToolkitManager:
             async_dispatcher_send(self.hass, SIGNAL_SCANNERS_CHANGED)
 
     def _adopt_settings(self, settings: dict, options: dict) -> None:
+        # A selected alias may not have reached the next coordinator batch yet.
+        # Establish its independent output before freezing the previous models.
+        self.prepare_update()
         previous = self.version()
         binding_changed = settings["scanner_bindings"] != self.settings["scanner_bindings"]
         previous_filters = self.settings["filters"]
@@ -1493,18 +1499,132 @@ class ToolkitManager:
             msg = "Unknown measurement action"
             raise ValueError(msg)
 
+    @staticmethod
+    def _project_output(advert: Any, old_model: dict, new_model: dict) -> None:
+        """Move derived distance state between models without changing packet state."""
+        if finite_number(getattr(advert, "rssi", None)):
+            advert.rssi_distance_raw = rssi_to_metres(
+                advert.rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
+            )
+        advert.rssi_distance = _rebase_distance(getattr(advert, "rssi_distance", None), old_model, new_model)
+        for field in ("hist_distance", "hist_distance_by_interval"):
+            history = getattr(advert, field, None)
+            if isinstance(history, list):
+                history[:] = [_rebase_distance(value, old_model, new_model) for value in history]
+
+    @staticmethod
+    def _copy_source_reading(target: Any, source: Any, *, new_view: bool) -> None:
+        """Copy packet evidence without sharing mutable histories or renewing its clock."""
+        if target.scanner_device is not source.scanner_device:
+            target.apply_new_scanner(source.scanner_device)
+        fresh = source.new_stamp is not None and (
+            new_view or not finite_number(target.stamp) or source.new_stamp > target.stamp
+        )
+        for field in ("rssi", "stamp", "tx_power", "stale_update_count"):
+            setattr(target, field, getattr(source, field))
+        for field in (
+            "hist_rssi",
+            "hist_stamp",
+            "hist_interval",
+            "local_name",
+            "manufacturer_data",
+            "service_data",
+            "service_uuids",
+        ):
+            setattr(target, field, list(getattr(source, field)))
+        if fresh:
+            target.new_stamp = source.new_stamp
+        elif target.new_stamp != source.stamp:
+            target.new_stamp = None
+
     def prepare_update(self) -> None:
-        """Resolve tracked canonical owners before processing shared metadevice readings."""
+        """Give simultaneous tracked aliases independent outputs from one physical reading."""
         configured = {public_device_id(key).lower() for key in self.coordinator.options.get(CONF_DEVICES, [])}
-        owners = {}
+        groups = {}
         for key, device in self.coordinator.devices.items():
-            if getattr(device, "create_sensor", False) or public_device_id(key).lower() in configured:
-                for advert in getattr(device, "adverts", {}).values():
-                    owners[advert] = public_device_id(key)
-        previous, self._owners = self._owners, owners
-        for advert, owner in owners.items():
-            if previous.get(advert) != owner and finite_number(getattr(advert, "rssi", None)):
-                advert._update_raw_distance(reading_is_new=False)  # noqa: SLF001
+            owner = public_device_id(key)
+            tracked = getattr(device, "create_sensor", False) or owner.lower() in configured
+            for pair, advert in getattr(device, "adverts", {}).items():
+                source = getattr(advert, "_source_advert", advert)
+                groups.setdefault(source, []).append((device, pair, advert, owner, tracked))
+        previous = self._owners
+        owners = {}
+        outputs = []
+        refresh_raw = set()
+        for source, entries in groups.items():
+            tracked = {owner: (device, advert) for device, _pair, advert, owner, selected in entries if selected}
+            source_owner = public_device_id(source.device_address)
+            primary = source_owner if source_owner in tracked else next(iter(tracked), source_owner)
+            old_model = self.effective_advert_model(source)
+            if previous.get(source, source_owner) != primary:
+                refresh_raw.add(source)
+            # If an independent alias becomes the sole owner, preserve its
+            # accepted output rather than restoring the other owner's pipeline.
+            surviving = tracked.get(primary, (None, source))[1]
+            if surviving is not source and getattr(surviving, "_source_advert", None) is source:
+                refresh_raw.add(source)
+                old_model = self.effective_advert_model(surviving)
+                for field in (
+                    "ref_power",
+                    "rssi_distance",
+                    "hist_distance",
+                    "hist_distance_by_interval",
+                    "hist_velocity",
+                ):
+                    value = getattr(surviving, field)
+                    setattr(source, field, list(value) if isinstance(value, list) else value)
+            if tracked:
+                owners[source] = primary
+                if len(tracked) > 1:
+                    source.ref_power = tracked[primary][0].ref_power
+            outputs.append((source, old_model))
+            views = {}
+            for device, pair, advert, owner, selected in entries:
+                target = source
+                if selected and owner != primary:
+                    target = views.get(owner)
+                    if target is None:
+                        target = advert if getattr(advert, "_source_advert", None) is source else copy(source)
+                        new_view = target is not advert
+                        view_model = old_model if new_view else self.effective_advert_model(target)
+                        if new_view:
+                            for field, value in vars(target).items():
+                                if isinstance(value, list):
+                                    setattr(target, field, list(value))
+                            target._source_advert = source  # noqa: SLF001
+                        self._copy_source_reading(target, source, new_view=new_view)
+                        target.ref_power = device.ref_power
+                        owners[target] = owner
+                        outputs.append((target, view_model))
+                        views[owner] = target
+                if advert is not target:
+                    device.adverts[pair] = target
+                    if getattr(device, "area_advert", None) is advert:
+                        device.area_advert = target
+        self._owners = owners
+        for advert, old_model in outputs:
+            new_model = self.effective_advert_model(advert)
+            if old_model != new_model:
+                self._project_output(advert, old_model, new_model)
+            if getattr(advert, "_source_advert", None) is not None or advert in refresh_raw:
+                # Raw histories always come from the physical packets, converted
+                # with this owner's model; cached copies add no source samples.
+                advert.hist_distance[:] = [
+                    rssi_to_metres(
+                        rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
+                    )
+                    for rssi in advert.hist_rssi
+                ]
+                if finite_number(advert.rssi):
+                    advert.rssi_distance_raw = rssi_to_metres(
+                        advert.rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
+                    )
+        # Ownership metadata follows only current device/source references.
+        removed = {(owner, advert.scanner_address) for advert, owner in previous.items()}
+        active = {(owner, advert.scanner_address) for advert, owner in owners.items()}
+        for key in removed - active:
+            self._states.pop(key, None)
+            self._quality.pop(key, None)
 
     def after_update(self, duration_s: float) -> None:
         """Measure completed batches and schedule at most one background recorder."""

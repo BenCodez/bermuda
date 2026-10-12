@@ -837,6 +837,11 @@ class BermudaDevice:
         updates, as they need to apply their own ref_power if necessary.
         """
         if new_ref_power != self.ref_power:
+            # The Number can change before the next coordinator batch. Split
+            # simultaneous tracked aliases before this owner's direct update.
+            prepare = getattr(getattr(self._coordinator, "toolkit", None), "prepare_update", None)
+            if callable(prepare):
+                prepare()
             # it's actually changed, proceed...
             self.ref_power = new_ref_power
             nearest_distance = 9999  # running tally to find closest scanner

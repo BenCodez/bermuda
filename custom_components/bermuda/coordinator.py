@@ -1153,6 +1153,16 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # iBeacon devices should already have their metadevices created, so nothing more to
         # set up for them.
 
+        # A shared physical source can serve independently calibrated tracked
+        # owners. Only a sole owner retains the legacy meta-to-source power copy.
+        tracked_sources = {}
+        configured = getattr(self, "options", {}).get(CONF_DEVICES, [])
+        for device in getattr(self, "devices", {}).values():
+            if device.create_sensor or device.address.upper() in configured:
+                sources = device.metadevice_sources if device.address in self.metadevices else [device.address]
+                for address in sources:
+                    tracked_sources.setdefault(address, set()).add(device.address)
+
         for metadevice in self.metadevices.values():
             # Find every known source device and copy their adverts in.
 
@@ -1207,7 +1217,16 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 # Copy every ADVERT_TUPLE into our metadevice
                 for advert_tuple in source_device.adverts:
-                    metadevice.adverts[advert_tuple] = source_device.adverts[advert_tuple]
+                    source_advert = source_device.adverts[advert_tuple]
+                    current = metadevice.adverts.get(advert_tuple)
+                    # A second tracked owner keeps its own derived ranges/filter
+                    # history. The physical source still owns packet acquisition.
+                    if getattr(current, "_source_advert", None) is not source_advert:
+                        metadevice.adverts[advert_tuple] = source_advert
+                        if current is not None and metadevice.area_advert is current:
+                            # A replaced physical source must pass normal area
+                            # eligibility; its retired output cannot stay incumbent.
+                            metadevice.area_advert = None
 
                 # Update last_seen if the source is newer.
                 if metadevice.last_seen < source_device.last_seen:
@@ -1229,7 +1248,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 # Note we are setting the ref_power on the source_device, not the
                 # individual scanner entries (it will propagate to them though)
-                if source_device.ref_power != metadevice.ref_power:
+                if len(tracked_sources.get(source_address, ())) < 2 and source_device.ref_power != metadevice.ref_power:
                     source_device.set_ref_power(metadevice.ref_power)
 
                 # anything that isn't already set to something interesting, overwrite

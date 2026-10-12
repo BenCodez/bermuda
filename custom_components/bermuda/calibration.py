@@ -103,7 +103,7 @@ def _residual(row: Mapping) -> float:
 def _balanced_median(rows: list[dict], value_key: str) -> float:
     cells = defaultdict(list)
     for row in rows:
-        cells[(row["device_id"], row["location_id"])].append(row[value_key])
+        cells[(row["target_id"], row["location_id"])].append(row[value_key])
     return median(median(values) for values in cells.values())
 
 
@@ -144,16 +144,82 @@ def _metrics(rows: list[dict], offsets: Mapping) -> dict:
 def _groups(rows: list[dict], offsets: Mapping, key: str) -> dict:
     groups = defaultdict(list)
     for row in rows:
-        groups[row[key]].append(row)
+        identifiers = row["device_ids"] if key == "device_id" else (row[key],)
+        for identifier in identifiers:
+            groups[identifier].append(row)
     return {identifier: _metrics(group, offsets) for identifier, group in sorted(groups.items())}
 
 
 def _receiver_key(identifier: str) -> str:
-    """Normalize MAC case only; every other scanner source remains opaque."""
+    """Normalize MAC case only; every other identifier remains opaque."""
     parts = identifier.split(":")
     if len(parts) == 6 and all(len(part) == 2 and all(c in "0123456789abcdefABCDEF" for c in part) for part in parts):
         return identifier.lower()
     return identifier
+
+
+def _packet_key(row: Mapping) -> tuple:
+    """Resolve legacy and current packet identities through their target group."""
+    return row["packet_target_id"], row["scanner_id"], row["stamp"]
+
+
+def _target_groups(rows: list[dict]) -> None:
+    """Link aliases and rotating sources in the common public ID namespace."""
+    parents = {}
+    sizes = {}
+
+    def find(node: str) -> str:
+        parents.setdefault(node, node)
+        sizes.setdefault(node, 1)
+        root = node
+        while parents[root] != root:
+            root = parents[root]
+        while parents[node] != node:
+            parent = parents[node]
+            parents[node] = root
+            node = parent
+        return root
+
+    for row in rows:
+        device = _receiver_key(row["device_id"])
+        if "source_id" in row:
+            # Explicit source IDs also identify older raw-device recordings that
+            # predate source_id. Opaque IDs match exactly; MAC case is canonical.
+            source = row["source_id"]
+            left, right = find(device), find(source)
+            if left != right:
+                if sizes[left] < sizes[right]:
+                    left, right = right, left
+                parents[right] = left
+                sizes[left] += sizes[right]
+        else:
+            find(device)
+    devices = defaultdict(set)
+    sources = defaultdict(set)
+    for row in rows:
+        root = find(_receiver_key(row["device_id"]))
+        devices[root].add(_receiver_key(row["device_id"]))
+        if "source_id" in row:
+            sources[root].add(row["source_id"])
+    targets = {root: min(identifiers) for root, identifiers in devices.items()}
+    packets = {root: min(sources[root] or identifiers) for root, identifiers in devices.items()}
+    for row in rows:
+        root = find(_receiver_key(row["device_id"]))
+        row["target_id"] = targets[root]
+        # Missing source IDs cannot make an additional packet from a linked
+        # alias. Reused clocks across rotating sources are ambiguous: deduplicate
+        # matching evidence, and reject contradictions below instead of guessing.
+        row["packet_target_id"] = packets[root]
+
+
+def _holdout_target(rows: list[dict], holdouts: Mapping) -> str | None:
+    """Resolve a reported logical holdout through the current alias component."""
+    devices = holdouts.get("device_ids", [holdouts.get("device_id")])
+    identifiers = {_receiver_key(value) for value in devices if isinstance(value, str)}
+    targets = {
+        row["target_id"] for row in rows if any(_receiver_key(value) in identifiers for value in row["device_ids"])
+    }
+    return next(iter(targets)) if len(targets) == 1 else None
 
 
 class CalibrationEngine:
@@ -174,10 +240,10 @@ class CalibrationEngine:
         if not finite_number(now) or not isinstance(model_version, str) or not model_version:
             msg = "A finite capture time and explicit model_version are required"
             raise ValueError(msg)
-        verified = set(verified_reference_devices)
+        verified = {_receiver_key(value) for value in verified_reference_devices if isinstance(value, str)}
         rejected = Counter()
-        result = []
-        seen = set()
+        candidates = []
+        links = []
         for index, source in enumerate(observations):
             if index >= self.policy.max_observations:
                 rejected["observation_limit"] += 1
@@ -185,15 +251,17 @@ class CalibrationEngine:
             if not isinstance(source, Mapping):
                 rejected["invalid_observation"] += 1
                 continue
+            # A rejected signal cannot separate aliases whose source relationship
+            # is still explicit. These rows contribute no samples or verification.
+            if all(
+                isinstance(source.get(key), str) and source[key] and len(source[key]) <= 256
+                for key in ("device_id", "source_id")
+            ):
+                links.append({"device_id": source["device_id"], "source_id": _receiver_key(source["source_id"])})
             reason = self._rejection(source, now, model_version)
             if reason:
                 rejected[reason] += 1
                 continue
-            identity = (source["device_id"], source["scanner_id"], source.get("stamp", source["observed"]))
-            if identity in seen:
-                rejected["duplicate_source_stamp"] += 1
-                continue
-            seen.add(identity)
             row = {
                 key: source[key]
                 for key in (
@@ -209,10 +277,14 @@ class CalibrationEngine:
                     "model_version",
                 )
             }
+            row["scanner_id"] = _receiver_key(row["scanner_id"])
+            if source.get("source_id") is not None:
+                row["source_id"] = _receiver_key(source["source_id"])
+            row["device_ids"] = (row["device_id"],)
             row["stamp"] = source.get("stamp", source["observed"])
             row["accuracy_m"] = source.get("accuracy_m", 0.0)
             row["verified"] = (
-                source["device_id"] in verified
+                _receiver_key(source["device_id"]) in verified
                 or source.get("reference_power_verified") is True
                 or source.get("quality", {}).get("reference_power_verified") is True
             )
@@ -223,7 +295,34 @@ class CalibrationEngine:
                     continue
             row["required_offset"] = _residual(row)
             row["required_delta"] = row["required_offset"] - row["rssi_offset"]
-            result.append(row)
+            candidates.append(row)
+        _target_groups(links + candidates)
+        packets = defaultdict(list)
+        for row in candidates:
+            packets[_packet_key(row)].append(row)
+        result = []
+        fields = (
+            "location_id",
+            "rssi",
+            "reference_power",
+            "attenuation",
+            "expected_distance",
+            "accuracy_m",
+            "rssi_offset",
+            "model_version",
+        )
+        for packet in packets.values():
+            first = packet[0]
+            if any(any(row[key] != first[key] for key in fields) for row in packet[1:]):
+                rejected["conflicting_source_packet"] += len(packet)
+                continue
+            if len(packet) > 1:
+                rejected["duplicate_source_stamp"] += len(packet) - 1
+            first["device_ids"] = tuple(sorted({row["device_id"] for row in packet}))
+            first["device_id"] = first["device_ids"][0]
+            first["verified"] = any(row["verified"] for row in packet)
+            first["observed"] = min(row["observed"] for row in packet)
+            result.append(first)
         return result, dict(rejected)
 
     def _rejection(self, row: Mapping, now: float, model_version: str) -> str | None:  # noqa: PLR0911
@@ -231,6 +330,11 @@ class CalibrationEngine:
             value = row.get(key)
             if not isinstance(value, str) or not value or len(value) > 256:
                 return "missing_independent_label"
+        physical_source = row.get("source_id")
+        if physical_source is not None and (
+            not isinstance(physical_source, str) or not physical_source or len(physical_source) > 256
+        ):
+            return "invalid_source_id"
         source = row.get("truth_source")
         if (
             row.get("independent") is not True
@@ -315,14 +419,14 @@ class CalibrationEngine:
                 offsets[scanner] = proposal
         else:
             receivers = sorted(by_scanner)
-            devices = {row["device_id"] for row in rows}
+            devices = {row["target_id"] for row in rows}
             if len(receivers) < 2 or len(devices) < self.policy.min_relative_devices:
                 return {}, ["unverified_reference_power"]
             # Require a complete target/receiver graph: an unknown transmitter
             # must be compared by the same receivers, not silently imputed.
             cells = defaultdict(list)
             for row in rows:
-                cells[(row["device_id"], row["scanner_id"])].append(row)
+                cells[(row["target_id"], row["scanner_id"])].append(row)
             if any((device, scanner) not in cells for device in devices for scanner in receivers):
                 return {}, ["insufficient_shared_target_coverage"]
             relative = defaultdict(list)
@@ -372,10 +476,7 @@ class CalibrationEngine:
         if verified_rows:
             rejected["unverified_reference_power"] = len(rows) - len(verified_rows)
             rows = verified_rows
-        payload = [
-            [row[key] for key in ("device_id", "scanner_id", "stamp", "observed", "location_id", "rssi")]
-            for row in rows
-        ]
+        payload = [[*_packet_key(row), row["observed"], row["location_id"], row["rssi"]] for row in rows]
         data_id = hashlib.sha256(json.dumps(sorted(payload), separators=(",", ":")).encode()).hexdigest()[:24]
         result = {
             "eligible": False,
@@ -392,22 +493,27 @@ class CalibrationEngine:
             "coverage": {
                 "samples": len(rows),
                 "receivers": sorted({row["scanner_id"] for row in rows}),
-                "devices": sorted({row["device_id"] for row in rows}),
+                "devices": sorted({device for row in rows for device in row["device_ids"]}),
+                "targets": sorted({row["target_id"] for row in rows}),
                 "locations": sorted({row["location_id"] for row in rows}),
             },
             "metrics": {},
         }
+        target_devices = defaultdict(set)
+        for row in rows:
+            target_devices[row["target_id"]].update(row["device_ids"])
+        result["target_groups"] = {target: sorted(devices) for target, devices in sorted(target_devices.items())}
         locations = result["coverage"]["locations"]
-        devices = result["coverage"]["devices"]
+        devices = result["coverage"]["targets"]
         needed_devices = 2 if mode == "absolute" else self.policy.min_relative_devices + 1
         if len(locations) < 2 or len(devices) < needed_devices:
             result["reasons"] = ["insufficient_independent_locations_or_targets"]
             result["metrics"]["all"] = _metrics(rows, {})
             return result
         location, device = locations[-1], devices[-1]
-        training = [row for row in rows if row["location_id"] != location and row["device_id"] != device]
+        training = [row for row in rows if row["location_id"] != location and row["target_id"] != device]
         held_location = [row for row in rows if row["location_id"] == location]
-        held_target = [row for row in rows if row["device_id"] == device]
+        held_target = [row for row in rows if row["target_id"] == device]
         offsets, reasons = self._fit(training, mode)
         expected_scanners = set(result["coverage"]["receivers"])
         if set(offsets) != expected_scanners:
@@ -416,7 +522,14 @@ class CalibrationEngine:
             counts = Counter(row["scanner_id"] for row in holdout)
             if any(counts[scanner] < self.policy.min_holdout_samples for scanner in expected_scanners):
                 reasons.append(f"insufficient_{label}_holdout")
-        result["holdouts"] = {"location_id": location, "device_id": device, "training_samples": len(training)}
+        held_devices = result["target_groups"][device]
+        result["holdouts"] = {
+            "location_id": location,
+            "device_id": held_devices[-1],
+            "device_ids": held_devices,
+            "target_id": device,
+            "training_samples": len(training),
+        }
         result["offsets"] = offsets
         baselines = {row["scanner_id"]: row["rssi_offset"] for row in rows}
         if any(abs(row["rssi_offset"] - baselines[row["scanner_id"]]) > 1e-6 for row in rows):
@@ -430,6 +543,7 @@ class CalibrationEngine:
             "all": _metrics(rows, offsets),
             "per_receiver": _groups(rows, offsets, "scanner_id"),
             "per_device": _groups(rows, offsets, "device_id"),
+            "per_target": _groups(rows, offsets, "target_id"),
             "per_location": _groups(rows, offsets, "location_id"),
         }
         if offsets:
@@ -453,7 +567,7 @@ class CalibrationEngine:
             required = max(self.policy.minimum_improvement_m, before * self.policy.minimum_improvement_fraction)
             if before - after < required:
                 reasons.append(f"no_validated_improvement:{name}")
-        for name in ("per_receiver", "per_device", "per_location"):
+        for name in ("per_receiver", "per_device", "per_target", "per_location"):
             for identifier, metric in metrics[name].items():
                 before, after = metric["current_mae_m"], metric["proposed_mae_m"]
                 if before is None or after is None:
@@ -548,13 +662,35 @@ class CalibrationEngine:
                 if proposal.get("mode") == "absolute":
                     rows = [row for row in rows if row["verified"]]
                 holdouts = proposal.get("holdouts", {})
+                target_id = _holdout_target(rows, holdouts)
                 location = [row for row in rows if row["location_id"] == holdouts.get("location_id")]
-                target = [row for row in rows if row["device_id"] == holdouts.get("device_id")]
+                target = [row for row in rows if row["target_id"] == target_id]
+                training = [
+                    row
+                    for row in rows
+                    if row["location_id"] != holdouts.get("location_id") and row["target_id"] != target_id
+                ]
+                mode = proposal.get("mode")
+                needed_targets = 2 if mode == "absolute" else self.policy.min_relative_devices + 1
+                if (
+                    len({row["location_id"] for row in rows}) < 2
+                    or len({row["target_id"] for row in rows}) < needed_targets
+                ):
+                    reasons.append("insufficient_independent_locations_or_targets")
+                fitted, fit_reasons = self._fit(training, mode)
+                reasons.extend(fit_reasons)
+                if set(fitted) != set(offsets) or {row["scanner_id"] for row in rows} != set(offsets):
+                    reasons.append("insufficient_training_receiver_coverage")
+                for label, holdout in (("location", location), ("target", target)):
+                    counts = Counter(row["scanner_id"] for row in holdout)
+                    if any(counts[scanner] < self.policy.min_holdout_samples for scanner in offsets):
+                        reasons.append(f"insufficient_{label}_holdout")
                 step_metrics = {
                     "location_holdout": _metrics(location, offsets),
                     "target_holdout": _metrics(target, offsets),
                     "per_receiver": _groups(rows, offsets, "scanner_id"),
                     "per_device": _groups(rows, offsets, "device_id"),
+                    "per_target": _groups(rows, offsets, "target_id"),
                     "per_location": _groups(rows, offsets, "location_id"),
                 }
                 reasons.extend(self._validation_reasons(step_metrics))
@@ -616,7 +752,6 @@ class CalibrationEngine:
             proposals[key] = float(value)
         selected = []
         missing = object()
-        seen = set()
         for row in rows:
             key = _receiver_key(row["scanner_id"])
             if key not in proposals:
@@ -627,17 +762,12 @@ class CalibrationEngine:
             if not finite_number(previous):
                 msg = "A used previous trial offset must be finite and cannot be a boolean"
                 raise ValueError(msg)
-            identity = (row["device_id"], key, row["stamp"])
-            if identity in seen:
-                rejected["duplicate_source_stamp"] = rejected.get("duplicate_source_stamp", 0) + 1
-                continue
-            seen.add(identity)
             copy = dict(row)
             copy["scanner_id"] = key
             copy["rssi_offset"] = float(previous)
             selected.append(copy)
         locations = {row["location_id"] for row in selected}
-        devices = {row["device_id"] for row in selected}
+        devices = {row["target_id"] for row in selected}
         counts = Counter(row["scanner_id"] for row in selected)
         sufficient = (
             len(locations) >= 2
@@ -649,11 +779,12 @@ class CalibrationEngine:
             "all": _metrics(selected, proposals),
             "per_receiver": _groups(selected, proposals, "scanner_id"),
             "per_device": _groups(selected, proposals, "device_id"),
+            "per_target": _groups(selected, proposals, "target_id"),
             "per_location": _groups(selected, proposals, "location_id"),
         }
         regressions = []
         if sufficient:
-            for group in ("per_receiver", "per_device", "per_location"):
+            for group in ("per_receiver", "per_device", "per_target", "per_location"):
                 for identifier, metric in metrics[group].items():
                     before, after = metric["current_mae_m"], metric["proposed_mae_m"]
                     if before is None or after is None:

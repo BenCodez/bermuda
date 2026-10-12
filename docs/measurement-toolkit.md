@@ -84,6 +84,8 @@ Use **Calibration → Capture independent measured truth**:
 
 Calibration gates on `quality.signal_reliability` (freshness, RSSI noise, sample support and filter acceptance), while live election `quality.reliability` also includes any measured range-accuracy penalty; older recordings without the separate signal field retain their recorded reliability gate.
 
+Linked MAC, iBeacon and IRK identities count as one calibration target, including when a beacon rotates its source address. Duplicate physical packets cannot supply extra holdout evidence.
+
 An advertised TX-power label is not automatically a measured reference RSSI at 1 m. Only mark **Reference power independently verified** when the entered reference has been measured or independently calibrated. With unknown transmitter reference power, calibration can propose relative receiver corrections using consistent multi-beacon evidence and a zero-mean correction gauge. This path needs at least three fitting beacons plus a separate held-out beacon, at least two receivers and multiple locations. It cannot absorb one beacon's unknown transmitter bias into a global receiver correction. Weak, noisy, insufficient or regressing evidence remains pending/rejected.
 
 ### 6. Safe automatic calibration
