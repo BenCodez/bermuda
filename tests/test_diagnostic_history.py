@@ -331,3 +331,87 @@ def test_history_window_reconfiguration_validates_before_mutating(window, now):
     with pytest.raises(ValueError):
         history.reconfigure(window_s=window, now=now)
     assert history.window_s == 10 and history.frames() == original
+
+
+def test_local_clock_watermarks_preserve_evicted_current_source_dedup_on_same_host_reload():
+    history = DiagnosticHistory(enabled=True, max_frames=1)
+    record(history, observation(device="beacon-a"))
+    record(history, observation(1001, device="beacon-b"))
+    assert history.frames()[0]["observations"][0]["device_id"] == "beacon-b"
+    cached = observation(device="beacon-a")
+    cached["age"] = 2
+    assert history.record([cached], captured_at=1002, model_version="model-1") == 0
+    markers = history.export_clocks()
+    assert len(markers["clocks"]) == 2
+    restored = DiagnosticHistory(enabled=True, max_frames=1)
+    restored.import_data(history.export(redact=False), now=1002, resume=True)
+    restored.restore_clocks(markers, now=1002)
+    assert restored.export_clocks() == markers
+    assert restored.record([cached], captured_at=1002, model_version="model-1") == 0
+    assert record(restored, observation(1003, device="beacon-a")) == 1
+
+
+def test_clock_watermarks_are_detached_bounded_local_metadata_not_public_history_fields():
+    history = DiagnosticHistory(enabled=True, max_rows=2)
+    record(history, observation())
+    markers = history.export_clocks()
+    assert set(markers) == {"session_epoch", "clocks"}
+    assert len(markers["clocks"]) <= history.max_rows
+    markers["clocks"][0][2] = 999
+    assert history.export_clocks()["clocks"][0][2] == 1000
+    for redact in (False, True):
+        public = history.export(redact=redact)
+        assert set(public) == {"schema_version", "session_epoch", "selected_devices", "redacted", "frames"}
+        assert "clocks" not in public and "history_clocks" not in public
+        with pytest.raises(ValueError, match="unsupported history import fields"):
+            history.import_data({**public, "history_clocks": history.export_clocks()}, now=1001)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda data: data.update(path="/tmp/clocks.json"),
+        lambda data: data.update(session_epoch=True),
+        lambda data: data.update(session_epoch=data["session_epoch"] + 1),
+        lambda data: data.update(clocks="/tmp/clocks.json"),
+        lambda data: data["clocks"].append(data["clocks"][0].copy()),
+        lambda data: data["clocks"][0].append("extra"),
+        lambda data: data["clocks"][0].__setitem__(0, ""),
+        lambda data: data["clocks"][0].__setitem__(1, None),
+        lambda data: data["clocks"][0].__setitem__(2, True),
+        lambda data: data["clocks"][0].__setitem__(2, float("nan")),
+        lambda data: data["clocks"][0].__setitem__(2, -1),
+        lambda data: data["clocks"][0].__setitem__(2, 1e13),
+        lambda data: data["clocks"][0].__setitem__(2, 999),
+        lambda data: data["clocks"][0].__setitem__(3, float("inf")),
+        lambda data: data["clocks"][0].__setitem__(3, 1002),
+        lambda data: data["clocks"][0].__setitem__(3, 999),
+    ],
+)
+def test_local_clock_restore_rejects_malformed_future_or_backward_markers_atomically(change):
+    history = DiagnosticHistory(enabled=True)
+    record(history, observation())
+    original = history.export_clocks()
+    malformed = deepcopy(original)
+    change(malformed)
+    with pytest.raises(ValueError):
+        history.restore_clocks(malformed, now=1001)
+    assert history.export_clocks() == original
+    assert record(history, observation(1001, stamp=1000)) == 0
+
+
+def test_local_clock_restore_never_drops_resumed_watermarks_and_caps_merged_sources():
+    history = DiagnosticHistory(enabled=True, max_rows=2)
+    record(history, observation())
+    epoch = history.session_epoch
+    history.restore_clocks({"session_epoch": epoch, "clocks": []}, now=1001)
+    assert record(history, observation(1001, stamp=1000)) == 0
+    history.restore_clocks({"session_epoch": epoch, "clocks": [["beacon-b", "scanner-a", 1001, 1001]]}, now=1001)
+    original = history.export_clocks()
+    with pytest.raises(ValueError, match="row budget"):
+        history.restore_clocks({"session_epoch": epoch, "clocks": [["beacon-c", "scanner-a", 1001, 1001]]}, now=1001)
+    assert history.export_clocks() == original
+    with pytest.raises(ValueError, match="row budget"):
+        history.restore_clocks(
+            {"session_epoch": epoch, "clocks": [["a", "s", 1, 1], ["b", "s", 1, 1], ["c", "s", 1, 1]]}, now=1001
+        )

@@ -238,6 +238,24 @@ def receiver_value(values: Mapping, scanner_id: str, default: Any = None) -> Any
     return default
 
 
+def _legacy_power(value: Any) -> float:
+    return float(value) if finite_number(value) else float(DEFAULT_REF_POWER)
+
+
+def _legacy_attenuation(value: Any) -> float:
+    return float(value) if finite_number(value) and value > 0 else float(DEFAULT_ATTENUATION)
+
+
+def _legacy_offset(value: Any) -> float:
+    return float(value) if finite_number(value) else 0.0
+
+
+def _legacy_device_power(value: Any) -> float:
+    # Zero is Bermuda's unset per-device sentinel, so corrupt legacy values must
+    # follow the global/receiver model rather than create a transmitter override.
+    return float(value) if finite_number(value) else 0.0
+
+
 def effective_model(
     settings: Mapping,
     scanner_id: str,
@@ -263,13 +281,14 @@ def effective_model(
     # Existing settings have deliberately broader semantics than new profiles:
     # rssi_to_metres supports every finite power/offset and positive exponent.
     # Applying profile bounds to these baselines would break legacy tracking.
-    power = float(reference_power) if finite_number(reference_power) else float(DEFAULT_REF_POWER)
-    exponent = float(attenuation) if finite_number(attenuation) and attenuation > 0 else float(DEFAULT_ATTENUATION)
-    offset = float(rssi_offset) if finite_number(rssi_offset) else 0.0
+    power = _legacy_power(reference_power)
+    exponent = _legacy_attenuation(attenuation)
+    offset = _legacy_offset(rssi_offset)
     if "reference_power" in receiver:
         power = _number(receiver["reference_power"], -120.0, 0.0, "reference_power")
-    if device_reference_power is not None and device_reference_power != 0:
-        power = float(device_reference_power) if finite_number(device_reference_power) else float(DEFAULT_REF_POWER)
+    device_power = _legacy_device_power(device_reference_power)
+    if device_power != 0:
+        power = device_power
     if "reference_power" in beacon:
         power = _number(beacon["reference_power"], -120.0, 0.0, "reference_power")
     if "attenuation" in beacon:
@@ -297,19 +316,21 @@ def model_version(
 ) -> str:
     """Return a deterministic signature of only range-affecting configuration."""
     keys = {"reference_power", "attenuation", "rssi_offset", "reference_power_verified"}
+    profiles = {}
+    for namespace, kind in (("receiver_profiles", "receiver"), ("beacon_profiles", "beacon")):
+        profiles[namespace] = {}
+        for identifier, profile in settings.get(namespace, {}).items():
+            validated = normalize_profile(profile, kind=kind)
+            numeric = {key: value for key, value in validated.items() if key in keys}
+            if numeric:
+                profiles[namespace][identifier] = numeric
+    powers = {key: _legacy_device_power(value) for key, value in (device_reference_powers or {}).items()}
     model = {
-        "profiles": {
-            kind: {
-                identifier: {key: value for key, value in profile.items() if key in keys}
-                for identifier, profile in settings.get(kind, {}).items()
-                if keys.intersection(profile)
-            }
-            for kind in ("receiver_profiles", "beacon_profiles")
-        },
-        "offsets": dict(legacy_offsets or {}),
-        "reference_power": reference_power,
-        "attenuation": attenuation,
-        "device_reference_powers": dict(device_reference_powers or {}),
+        "profiles": profiles,
+        "offsets": {key: _legacy_offset(value) for key, value in (legacy_offsets or {}).items()},
+        "reference_power": _legacy_power(reference_power),
+        "attenuation": _legacy_attenuation(attenuation),
+        "device_reference_powers": {key: value for key, value in powers.items() if value != 0.0},
     }
     encoded = json.dumps(model, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]

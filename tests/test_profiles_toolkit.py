@@ -13,6 +13,9 @@ from custom_components.bermuda.profiles import (
     normalize_toolkit_settings,
     receiver_value,
 )
+from custom_components.bermuda.const import CONF_ATTENUATION, CONF_REF_POWER, CONF_RSSI_OFFSETS
+
+from .test_toolkit_runtime import SCANNER, runtime
 
 
 def test_defaults_preserve_legacy_behavior_and_off_optional_features():
@@ -242,3 +245,71 @@ def test_profile_verification_requires_an_explicit_reference_power():
         normalize_profile({"reference_power_verified": True})
     with pytest.raises(ValueError):
         normalize_profile({"antenna_gain_db": 1, "antenna_gain_dbi": 1})
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf"), True, None])
+def test_model_signature_normalizes_corrupt_legacy_values_to_effective_fallbacks(invalid):
+    settings = normalize_toolkit_settings(None)
+    actual = model_version(
+        settings, {"scanner": invalid}, invalid, invalid, device_reference_powers={"beacon": invalid}
+    )
+    fallback = model_version(settings, {"scanner": 0.0}, -55.0, 3.0, device_reference_powers={"beacon": 0.0})
+    assert actual == fallback
+    assert actual == model_version(settings, {"scanner": 0.0}, -55.0, 3.0)
+    model = effective_model(
+        settings,
+        "scanner",
+        "beacon",
+        reference_power=invalid,
+        attenuation=invalid,
+        rssi_offset=invalid,
+        device_reference_power=invalid,
+    )
+    assert model == {
+        "reference_power": -55.0,
+        "attenuation": 3.0,
+        "rssi_offset": 0.0,
+        "reference_power_verified": False,
+    }
+
+
+def test_invalid_legacy_device_power_is_unset_and_follows_receiver_profile():
+    settings = normalize_toolkit_settings({"receiver_profiles": {"scanner": {"reference_power": -62}}})
+    model = effective_model(
+        settings,
+        "scanner",
+        "beacon",
+        reference_power=-59,
+        attenuation=3,
+        rssi_offset=0,
+        device_reference_power=float("nan"),
+    )
+    assert model["reference_power"] == -62
+    assert model_version(settings, device_reference_powers={"beacon": float("nan")}) == model_version(settings)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("reference_power", float("nan")), ("attenuation", float("inf")), ("rssi_offset", 40.0)]
+)
+def test_signature_does_not_sanitize_invalid_explicit_profile_values(field, value):
+    with pytest.raises(ValueError):
+        model_version({"receiver_profiles": {"scanner": {field: value}}})
+
+
+async def test_actual_manager_diagnostics_work_with_corrupt_legacy_radio_options(runtime):
+    manager = runtime.manager
+    runtime.coordinator.options[CONF_REF_POWER] = float("nan")
+    runtime.coordinator.options[CONF_ATTENUATION] = float("inf")
+    runtime.coordinator.options[CONF_RSSI_OFFSETS][SCANNER] = float("nan")
+    runtime.device.ref_power = float("nan")
+    runtime.advert.ref_power = float("nan")
+    manager.invalidate_model()
+    version = manager.version()
+    state = await manager.async_dispatch("state", {})
+    assert state["diagnostics"]["model_version"] == version
+    assert manager.effective_advert_model(runtime.advert) == {
+        "reference_power": -55.0,
+        "attenuation": 3.0,
+        "rssi_offset": 0.0,
+        "reference_power_verified": False,
+    }

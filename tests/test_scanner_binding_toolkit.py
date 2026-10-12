@@ -7,9 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from bleak.backends.scanner import AdvertisementData
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import area_registry as ar
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.bermuda.bermuda_advert import BermudaAdvert
 from custom_components.bermuda.bermuda_device import BermudaDevice
 from custom_components.bermuda.config_flow import BermudaOptionsFlowHandler
 from custom_components.bermuda.const import (
@@ -116,6 +119,97 @@ def test_manual_binding_uses_registry_id_and_retains_resolved_identity(hass, dev
     assert scanner.entity_id_address == original_entity_address
     assert scanner.address == SOURCE
     assert scanner.scanner_binding["method"] == "manual"
+
+
+@pytest.mark.parametrize("manual_connections", ["mac", "bluetooth", "none"])
+def test_manual_registry_metadata_overrides_old_bluetooth_source_and_refreshes_adverts(
+    hass, device_registry, manual_connections
+):
+    old_area = ar.async_get(hass).async_create("Synthetic Old Area")
+    intended_area = ar.async_get(hass).async_create("Synthetic Intended Area")
+    old_bt_entry = _entry(hass, "bluetooth", "old-bt")
+    old_bt = device_registry.async_get_or_create(
+        config_entry_id=old_bt_entry.entry_id,
+        connections={("bluetooth", SOURCE.upper())},
+        name="Synthetic Old Receiver",
+    )
+    old_bt = device_registry.async_update_device(old_bt.id, name_by_user="Old User Name", area_id=old_area.id)
+    legacy_entry = _entry(hass, "esphome", "old-network", unique_id="aa:bb:cc:dd:ee:10")
+    device_registry.async_get_or_create(
+        config_entry_id=legacy_entry.entry_id,
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        name="Synthetic Legacy Network Receiver",
+    )
+    manual_entry = _entry(hass, "esphome", "new-network", unique_id=BASE)
+    connections = (
+        {(manual_connections, BASE.upper() if manual_connections == "bluetooth" else BASE)}
+        if manual_connections != "none"
+        else set()
+    )
+    manual = device_registry.async_get_or_create(
+        config_entry_id=manual_entry.entry_id,
+        connections=connections,
+        identifiers={("esphome", "synthetic-explicit-receiver")},
+        name="Synthetic Intended Receiver",
+    )
+    manual = device_registry.async_update_device(manual.id, name_by_user="Intended User Name", area_id=intended_area.id)
+    scanner, coordinator = _scanner(hass, device_registry)
+    scanner._is_scanner = scanner._is_remote_scanner = True
+    scanner.async_as_scanner_resolve_device_entries()
+    preserved_uid, preserved_entity_address = scanner.unique_id, scanner.entity_id_address
+    assert scanner.area_id == old_area.id
+    assert scanner.entry_id == old_bt.id
+    assert scanner.name == "Old User Name"
+    target_address = "aa:bb:cc:dd:ee:01"
+    target = BermudaDevice(target_address, coordinator)
+    scanner.stamps = {target_address.upper(): 100.0}
+    data = AdvertisementData(
+        local_name="Synthetic Beacon",
+        manufacturer_data={},
+        service_data={},
+        service_uuids=[],
+        tx_power=-59,
+        rssi=-68,
+        platform_data=(),
+    )
+    advert = BermudaAdvert(target, data, coordinator.options, scanner)
+    target.adverts[(target_address, SOURCE)] = advert
+    coordinator.devices = {SOURCE: scanner, target_address: target}
+    original_stamp, original_rssi = advert.stamp, advert.rssi
+    source_connections = set(old_bt.connections)
+    coordinator.options["measurement_toolkit"] = {"scanner_bindings": {SOURCE: {"device_registry_id": manual.id}}}
+    scanner.async_as_scanner_resolve_device_entries()
+    assert scanner.area_id == intended_area.id
+    assert scanner.area_name == intended_area.name
+    assert scanner.entry_id == manual.id
+    assert scanner.name_by_user == "Intended User Name"
+    assert scanner.name == "Intended User Name"
+    assert scanner.name_devreg == "Synthetic Intended Receiver"
+    assert scanner.scanner_binding["device_registry_id"] == manual.id
+    assert scanner.scanner_binding["method"] == "manual"
+    assert scanner.scanner_binding["status"] == "resolved"
+    assert scanner.address == scanner.address_ble_mac == SOURCE
+    assert scanner.unique_id == preserved_uid
+    assert scanner.entity_id_address == preserved_entity_address
+    assert device_registry.async_get(old_bt.id).connections == source_connections
+    assert advert.name == "Intended User Name"
+    assert advert.area_id == intended_area.id
+    assert advert.area_name == intended_area.name
+    assert advert.scanner_device is scanner
+    assert advert.scanner_address == SOURCE
+    assert advert.stamp == original_stamp and advert.rssi == original_rssi
+    with patch.object(advert, "apply_new_scanner", wraps=advert.apply_new_scanner) as refresh:
+        scanner.async_as_scanner_resolve_device_entries()
+        refresh.assert_not_called()
+    device_registry.async_update_device(manual.id, area_id=None, name_by_user=None)
+    scanner.async_as_scanner_resolve_device_entries()
+    assert scanner.area_id is None
+    assert scanner.name_by_user is None
+    assert scanner.name == "Synthetic Intended Receiver"
+    assert scanner.entry_id == manual.id
+    assert advert.area_id is None
+    assert advert.name == "Synthetic Intended Receiver"
+    assert scanner.unique_id == preserved_uid and scanner.entity_id_address == preserved_entity_address
 
 
 def test_identity_hook_restores_legacy_entity_keys_on_reload(hass, device_registry):

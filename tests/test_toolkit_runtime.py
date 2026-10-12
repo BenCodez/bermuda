@@ -730,3 +730,79 @@ async def test_optional_filter_interval_history_lists_latest_approach_readings_f
     assert advert.hist_distance_by_interval[:5] == list(reversed(distances[-5:]))
     assert advert.hist_distance_by_interval[0] < advert.hist_distance_by_interval[4] < 12.0
     assert advert.hist_distance_by_interval[-1] == pytest.approx(12.0)
+
+
+async def test_external_options_edit_wins_while_toolkit_settings_persistence_is_paused(runtime):
+    manager = runtime.manager
+    baseline = deepcopy(dict(runtime.entry.options))
+    entered, release = asyncio.Event(), asyncio.Event()
+    durable_payloads = []
+
+    async def save_while_paused(payload):
+        durable_payloads.append(deepcopy(payload))
+        if len(durable_payloads) == 1:
+            entered.set()
+            await release.wait()
+
+    manager.store.async_save.side_effect = save_while_paused
+    action = asyncio.create_task(manager.async_dispatch("settings", {"settings": {"receiver_limits": {SCANNER: 4.0}}}))
+    listener = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        external = {**baseline, CONF_RSSI_OFFSETS: {SCANNER: 7.0, OFFLINE: 7.0}}
+        runtime.hass.config_entries.async_update_entry(runtime.entry, options=external)
+        listener = asyncio.create_task(manager.async_options_changed(runtime.entry))
+        await asyncio.sleep(0)
+        assert listener.done() is False
+        assert runtime.coordinator.options[CONF_RSSI_OFFSETS][SCANNER] == 1.5
+        release.set()
+        with pytest.raises(RuntimeError, match="changed while saving"):
+            await asyncio.wait_for(action, timeout=1)
+        assert await asyncio.wait_for(listener, timeout=1) is True
+        assert dict(runtime.entry.options) == external
+        assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == external[CONF_RSSI_OFFSETS]
+        assert manager.settings["receiver_limits"] == {}
+        assert runtime.advert.conf_rssi_offset == 7.0
+        assert len(durable_payloads) == 2
+        assert durable_payloads[-1]["trial"] is None
+    finally:
+        release.set()
+        await asyncio.gather(action, *([listener] if listener is not None else []), return_exceptions=True)
+
+
+async def test_queued_options_listeners_adopt_latest_entry_options_after_acquiring_lock(runtime):
+    manager = runtime.manager
+    baseline = deepcopy(dict(runtime.entry.options))
+    intermediate = {**baseline, CONF_RSSI_OFFSETS: {SCANNER: 7.0, OFFLINE: 7.0}}
+    latest = {**baseline, CONF_RSSI_OFFSETS: {SCANNER: 9.0, OFFLINE: 7.0}}
+    observed = []
+    original_adopt = manager._adopt_settings
+
+    def adopt(settings, options):
+        observed.append(deepcopy(options))
+        original_adopt(settings, options)
+
+    first = second = None
+    await manager._lock.acquire()
+    lock_held = True
+    with patch.object(manager, "_adopt_settings", new=adopt):
+        try:
+            runtime.hass.config_entries.async_update_entry(runtime.entry, options=intermediate)
+            first = asyncio.create_task(manager.async_options_changed(runtime.entry))
+            await asyncio.sleep(0)
+            assert first.done() is False
+            runtime.hass.config_entries.async_update_entry(runtime.entry, options=latest)
+            second = asyncio.create_task(manager.async_options_changed(runtime.entry))
+            await asyncio.sleep(0)
+            assert second.done() is False
+            manager._lock.release()
+            lock_held = False
+            assert await asyncio.wait_for(asyncio.gather(first, second), timeout=1) == [True, True]
+            assert observed == [latest]
+            assert dict(runtime.entry.options) == latest
+            assert runtime.coordinator.options[CONF_RSSI_OFFSETS] == latest[CONF_RSSI_OFFSETS]
+            assert runtime.advert.conf_rssi_offset == 9.0
+        finally:
+            if lock_held:
+                manager._lock.release()
+            await asyncio.gather(*[task for task in (first, second) if task is not None], return_exceptions=True)

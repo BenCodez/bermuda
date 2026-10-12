@@ -602,6 +602,56 @@ class DiagnosticHistory:
             result["frames"] = [self._redact_frame(frame) for frame in self._frames]
         return result
 
+    def export_clocks(self) -> dict[str, Any]:
+        """Detach local-only watermarks, including sources whose frames were evicted."""
+        return {
+            "session_epoch": self.session_epoch,
+            "clocks": [
+                [device, scanner, stamp, observed]
+                for (device, scanner), (stamp, observed) in sorted(self._clocks.items())
+            ],
+        }
+
+    def restore_clocks(self, data: dict[str, Any], *, now: float) -> None:
+        """
+        Atomically merge trusted local clock watermarks after a same-host resume.
+
+        This local Store metadata is deliberately absent from public exports and
+        imports. Resumed frame watermarks are retained, and every supplied marker
+        must be at least as recent as existing evidence in the same session.
+        """
+        current = finite_number(now, "now", minimum=0)
+        if type(data) is not dict or set(data) != {"session_epoch", "clocks"}:
+            _fail("unsupported local history clock fields")
+        epoch = _integer(data["session_epoch"], "session_epoch", 1, MAX_CLOCK_EPOCH)
+        if epoch != self.session_epoch:
+            _fail("local clock watermarks must match the resumed history session")
+        rows = data["clocks"]
+        if type(rows) is not list or len(rows) > self.max_rows:
+            _fail("local clock watermarks exceed the row budget")
+        restored = self._clocks.copy()
+        seen = set()
+        for row in rows:
+            if type(row) is not list or len(row) != 4:
+                _fail("local clock watermarks require device, scanner, stamp and observed")
+            pair = opaque_id(row[0], "clock device_id"), opaque_id(row[1], "clock scanner_id")
+            if pair in seen:
+                _fail("local clock watermarks contain duplicate sources")
+            seen.add(pair)
+            stamp = finite_number(row[2], "clock stamp", minimum=0)
+            observed = finite_number(row[3], "clock observed", minimum=0)
+            if stamp > 1e12:
+                _fail("source stamp exceeds its permitted clock bound")
+            if observed > current:
+                _fail("local clock watermarks cannot contain future observations")
+            previous = restored.get(pair)
+            if previous and (stamp < previous[0] or observed < previous[1]):
+                _fail("local clock watermarks cannot move existing evidence backwards")
+            restored[pair] = stamp, observed
+        if len(restored) > self.max_rows:
+            _fail("combined local clock watermarks exceed the row budget")
+        self._clocks = restored
+
     def import_data(self, payload: dict[str, Any] | str, *, now: float, resume: bool = False) -> None:
         """
         Atomically replace memory with strictly validated bounded JSON history.

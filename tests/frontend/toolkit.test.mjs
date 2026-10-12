@@ -244,6 +244,7 @@ test("history, replay and shadow buttons dispatch complete actions with safe exp
   component._render();
   for (const label of ["Start recording", "Stop recording", "Clear history", "Export JSON", "Copy recording", "Run replay", "Start shadow", "Stop shadow", "Promote shadow candidate"]) await button(component, label).click();
   assert.deepEqual(calls.map(payload => payload.action), ["history_start", "history_stop", "history_clear", "history_export", "history_export", "replay", "shadow_start", "shadow_stop", "shadow_promote"]);
+  assert.deepEqual(calls[0].devices, []);
   assert.equal(calls[3].redact, true);
   assert.equal(calls[4].redact, true);
   assert.equal("candidate" in calls[5], false);
@@ -258,6 +259,83 @@ test("history, replay and shadow buttons dispatch complete actions with safe exp
   await button(component, "Import recording").click();
   assert.equal(calls.at(-1).action, "history_import");
   assert.deepEqual(calls.at(-1).data, { version: 1 });
+});
+
+test("recording one device then restarting for all explicitly clears the retained selection", async () => {
+  const calls = [];
+  let selectedDevices = new Set();
+  let running = false;
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") {
+      calls.push(payload);
+      if (payload.action === "history_start") {
+        // The history API retains its prior selection when devices is omitted.
+        if (payload.devices !== undefined) selectedDevices = new Set(payload.devices);
+        running = true;
+      } else if (payload.action === "history_stop") running = false;
+    }
+    return { ...state(), history: { running, selected_devices: [...selectedDevices] } };
+  });
+  component._activeTab = 2;
+  component._render();
+  field(component, "Record device (or all tracked devices)").value = "device1";
+  await button(component, "Start recording").click();
+  assert.deepEqual([...selectedDevices], ["device1"]);
+  assert.equal(running, true);
+  await button(component, "Stop recording").click();
+  assert.equal(running, false);
+  assert.deepEqual([...selectedDevices], ["device1"]);
+  field(component, "Record device (or all tracked devices)").value = "";
+  await button(component, "Start recording").click();
+  assert.deepEqual(calls.at(-1).devices, []);
+  assert.deepEqual([...selectedDevices], []);
+  assert.equal(running, true);
+  assert.deepEqual(component._state.history.selected_devices, []);
+});
+
+test("large recording downloads and clipboard JSON retain the import byte budget", async t => {
+  const frames = Array.from({ length: 1000 }, (_, index) => ({
+    sequence: index + 1, captured_at: 1750000000 + index, session_epoch: 1, model_version: "synthetic-model",
+    observations: Array.from({ length: 4 }, (_, scanner) => ({
+      device_id: "synthetic-device", scanner_id: `receiver-${scanner}`, observed: 1750000000 + index,
+      stamp: 1000 + index, rssi: -70, rssi_offset: 0, reference_power: -59, attenuation: 2,
+      raw_distance: 3.55, filtered_distance: 3.5, age: 0, status: "current",
+      quality: { fresh: true, reliability: .75, reasons: [] }, model_version: "synthetic-model",
+    })), truth: [],
+  }));
+  const recording = {
+    schema_version: 1, session_epoch: 1, selected_devices: [], redacted: true,
+    frames,
+  };
+  const maximumBytes = 2 * 1024 * 1024;
+  const compactBytes = new Blob([JSON.stringify(recording)]).size;
+  assert.ok(compactBytes < maximumBytes);
+  assert.ok(new Blob([JSON.stringify(recording, null, 2)]).size > maximumBytes, "fixture reproduces pretty JSON exceeding the import cap");
+  let downloaded;
+  t.mock.method(URL, "createObjectURL", blob => { downloaded = blob; return "blob:synthetic-recording"; });
+  t.mock.method(URL, "revokeObjectURL", () => {});
+  let copied;
+  const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { copied = text; } } });
+  t.after(() => { if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor); else delete navigator.clipboard; });
+  const diagnostics = { status: "synthetic", quality: { fresh: false, reasons: ["coverage"] } };
+  const component = panel(async (method, path, payload) => method === "POST" ? payload.action === "diagnostics" ? diagnostics : recording : state());
+  component._activeTab = 2;
+  component._render();
+  await button(component, "Export JSON").click();
+  assert.ok(downloaded instanceof Blob);
+  assert.equal(downloaded.size, compactBytes);
+  assert.ok(downloaded.size < maximumBytes);
+  assert.deepEqual(await readJSONFile(downloaded), recording);
+  await button(component, "Copy recording").click();
+  assert.equal(new Blob([copied]).size, compactBytes);
+  assert.deepEqual(JSON.parse(copied), recording);
+  assert.deepEqual(await readJSONFile(new Blob([copied])), recording);
+  component._activeTab = 4;
+  component._render();
+  await button(component, "Copy full diagnostics").click();
+  assert.equal(copied, JSON.stringify(diagnostics, null, 2), "diagnostics copies remain readable");
+  await new Promise(resolve => setTimeout(resolve, 0));
 });
 
 test("pending proposals disable apply; accepted previews, rollback and diagnostics dispatch", async () => {

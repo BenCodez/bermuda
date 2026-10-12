@@ -178,6 +178,8 @@ class ToolkitManager:
         if saved.get("history"):
             try:
                 self.history.import_data(saved["history"], now=time.time(), resume=True)
+                if saved.get("history_clocks") is not None:
+                    self.history.restore_clocks(saved["history_clocks"], now=time.time())
                 self.history.enabled = self.settings["history_enabled"]
             except ValueError:
                 self.last_result = {"reasons": ["saved_history_invalid"]}
@@ -218,6 +220,7 @@ class ToolkitManager:
             "clock": {"boot_id": self._boot_id, "stamp": monotonic_time_coarse(), "observed": time.time()},
             "identities": deepcopy(self._identities),
             "history": (history or self.history).export(redact=False),
+            "history_clocks": (history or self.history).export_clocks(),
             "fingerprints": (fingerprints or self.fingerprints).export_state(),
             "trial": deepcopy(trial if replace_trial else self.trial),
             "last_applied": self.last_applied,
@@ -247,8 +250,18 @@ class ToolkitManager:
         if key not in self._identities:
             from .api import scanner_identity_from_registry_entry  # noqa: PLC0415
 
-            historical = self.coordinator.dr.async_get_device(connections={(dr.CONNECTION_BLUETOOTH, source.upper())})
-            preserved = scanner_identity_from_registry_entry(historical, source) if historical else None
+            registry = self.coordinator.dr
+            connections = {(dr.CONNECTION_BLUETOOTH, source.upper())}
+            if hasattr(registry, "async_get_devices"):
+                entries = registry.async_get_devices(connections=connections)
+            else:
+                entries = registry.devices.get_entries(None, connections=connections)
+            evidenced = [
+                identity
+                for historical in entries
+                if (identity := scanner_identity_from_registry_entry(historical, source)) is not None
+            ]
+            preserved = evidenced[0] if evidenced and all(identity == evidenced[0] for identity in evidenced) else None
             identity = preserved or {"unique_id": proposed_uid, "entity_id_address": proposed_uid}
             if len(self._identities) < 128:
                 self._identities[key] = identity
@@ -463,6 +476,7 @@ class ToolkitManager:
         expected_version: str | None = None,
     ) -> None:
         """Save rollback evidence before publishing a synchronous HA options update."""
+        baseline_options = deepcopy(dict(self.entry.options))
         settings = _settings(options.get(OPTIONS_KEY))
         options[OPTIONS_KEY] = settings
         candidate_history = history or self.history
@@ -474,7 +488,9 @@ class ToolkitManager:
             payload["last_applied"] = trial["applied_at"]
             payload["last_data_id"] = trial["data_id"]
         await self.store.async_save(payload)
-        if expected_version is not None and self.version() != expected_version:
+        if dict(self.entry.options) != baseline_options or (
+            expected_version is not None and self.version() != expected_version
+        ):
             await self.store.async_save(self._store_payload())
             msg = "The radio model changed while saving; preview again"
             raise RuntimeError(msg)
@@ -522,13 +538,15 @@ class ToolkitManager:
 
     async def async_options_changed(self, entry: Any) -> bool:
         """Handle toolkit/offset-only edits live; reload all other legacy option changes."""
-        new = deepcopy(dict(entry.options))
-        excluded = {OPTIONS_KEY, CONF_RSSI_OFFSETS}
-        old_other = {key: value for key, value in self._saved_options.items() if key not in excluded}
-        new_other = {key: value for key, value in new.items() if key not in excluded}
-        if old_other != new_other:
-            return False
         async with self._lock:
+            if self._closed:
+                return True
+            new = deepcopy(dict(entry.options))
+            excluded = {OPTIONS_KEY, CONF_RSSI_OFFSETS}
+            old_other = {key: value for key, value in self._saved_options.items() if key not in excluded}
+            new_other = {key: value for key, value in new.items() if key not in excluded}
+            if old_other != new_other:
+                return False
             if new != self._saved_options:
                 self._adopt_settings(_settings(new.get(OPTIONS_KEY)), new)
                 self._saved_options = new
@@ -862,7 +880,7 @@ class ToolkitManager:
                     if type(clear) is not bool:
                         msg = "clear must be a boolean"
                         raise ValueError(msg)
-                    history.start(selected_devices=payload.get("devices"), clear=clear)
+                    history.start(selected_devices=payload.get("devices", []), clear=clear)
                 elif action == "history_stop":
                     history.stop()
                 elif action == "history_clear":

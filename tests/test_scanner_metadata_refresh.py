@@ -97,7 +97,7 @@ async def test_actual_manager_manual_binding_refreshes_existing_advert_and_next_
     assert runtime.scanner.entry_id == manual.id
     assert runtime.scanner.area_id == area_b.id
     assert runtime.scanner.scanner_binding["method"] == "manual"
-    assert runtime.advert.area_id == area_a.id  # same object still holds the previous cache before calculation
+    assert runtime.advert.area_id == area_b.id  # explicit rebinding refreshes existing observations immediately
     next_area_cycle(runtime)
     assert runtime.advert.scanner_device is runtime.scanner
     assert runtime.advert.area_id == area_b.id

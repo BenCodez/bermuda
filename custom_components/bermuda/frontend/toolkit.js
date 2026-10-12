@@ -196,7 +196,7 @@ export class BermudaToolkitPanel extends HTMLElement {
   }
 
   _download(data, filename) {
-    const url = URL.createObjectURL(new Blob([pretty(data)], { type: "application/json" }));
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: "application/json" }));
     const link = node("a", "", { href: url, download: filename });
     this.shadowRoot.append(link);
     link.click();
@@ -204,9 +204,9 @@ export class BermudaToolkitPanel extends HTMLElement {
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
-  async _copy(data) {
+  async _copy(data, { compact = false } = {}) {
     try {
-      await navigator.clipboard.writeText(pretty(data));
+      await navigator.clipboard.writeText(compact ? JSON.stringify(data) : pretty(data));
       this._message = "Copied JSON to clipboard.";
     } catch {
       this._message = "Clipboard is unavailable. Select and copy the displayed JSON.";
@@ -421,16 +421,16 @@ export class BermudaToolkitPanel extends HTMLElement {
   }
 
   _history(parent) {
-    const history = this._section(parent, "Bounded diagnostic recording", "Recording is off by default. Exports contain frozen observations, model versions and explicit label provenance. Imported recordings are validated on the server.");
+    const history = this._section(parent, "Bounded diagnostic recording", "Recording is off by default. Exports contain frozen observations, model versions and explicit label provenance. Recording downloads and copies use compact JSON to preserve the 2 MiB import budget. Imported recordings are validated on the server.");
     this._json(history, this._state.history);
     const devices = this._select(history, "Record device (or all tracked devices)", "history-device", [["", "All tracked devices"], ...this._devices()], "");
     const buttons = node("div", undefined, { class: "buttons" });
-    this._button(buttons, "Start recording", () => this._perform("history_start", devices.value ? { devices: [devices.value] } : {}));
+    this._button(buttons, "Start recording", () => this._perform("history_start", { devices: devices.value ? [devices.value] : [] }));
     this._button(buttons, "Stop recording", () => this._perform("history_stop"));
     this._button(buttons, "Clear history", () => this._perform("history_clear"));
     const redact = this._field(history, "Redact recording identifiers for sharing", "history-redact", true, { type: "checkbox" });
     this._button(buttons, "Export JSON", () => this._perform("history_export", { redact: redact.checked }, { download: true }));
-    this._button(buttons, "Copy recording", async () => { const data = await this._perform("history_export", { redact: redact.checked }); if (data) await this._copy(data); });
+    this._button(buttons, "Copy recording", async () => { const data = await this._perform("history_export", { redact: redact.checked }); if (data) await this._copy(data, { compact: true }); });
     history.append(buttons);
     const file = this._field(history, "Import recording JSON (maximum 2 MiB)", "history-file", "", { type: "file" });
     file.accept = ".json,application/json";
