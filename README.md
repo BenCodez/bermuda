@@ -27,7 +27,7 @@ Your Bermuda configuration, devices and settings stay as they are.
 |---|---|
 | Metadevices now copy their source's name, manufacturer and beacon fields (the copy loop was a no-op) | [#832](https://github.com/agittins/bermuda/pull/832) |
 | A duplicate entry in the prune list no longer raises `KeyError` and aborts the update cycle | [#833](https://github.com/agittins/bermuda/pull/833) |
-| One scanner that cannot be resolved no longer stops entity creation for every other scanner | [#835](https://github.com/agittins/bermuda/pull/835) |
+| One scanner that cannot be resolved no longer stops entity creation for every other scanner, and a scanner that comes up after startup gets its distance sensors without a reload | [#835](https://github.com/agittins/bermuda/pull/835) |
 | IRKs are no longer written in full to diagnostics or the debug log | [#840](https://github.com/agittins/bermuda/pull/840) |
 | `bermuda.dump_devices` requires an admin when the call carries a user | [#842](https://github.com/agittins/bermuda/pull/842) |
 | Changing a proxy's area takes effect without a reload (and the "no AREA" repair clears) | [#857](https://github.com/agittins/bermuda/pull/857) |
