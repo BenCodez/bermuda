@@ -1,5 +1,5 @@
 {
-  "name": "Bermuda BLE Trilateration",
+  "name": "Bermuda BLE Trilateration (patched)",
   "hacs": "1.6.0",
   "homeassistant": "2025.3",
   "render_readme": true,

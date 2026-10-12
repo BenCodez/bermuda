@@ -1,3 +1,53 @@
+# Bermuda BLE Trilateration, patched
+
+## TL;DR
+
+- **Bermuda with bug fixes that are waiting in upstream's queue.** Nothing else: same integration, same options, same stored data.
+- **Fixes the problems people keep reporting:** proxies shown with the wrong name or no area (the "Some Bluetooth Proxies don't have an AREA" repair), changing a proxy's area that does nothing until a reload, update cycles that abort, IRKs written to logs, and a lookup Home Assistant removes in 2027.9.
+- **Temporary by design.** Each fix below is an open pull request on [agittins/bermuda](https://github.com/agittins/bermuda). As each one is merged there, it is dropped here; when they all are, this repository is retired.
+
+**Why it exists:** pull requests to Bermuda take a long time to be merged, and some of these bugs make the integration hard to use in the meantime: proxies matched to the wrong device, repairs that never clear, crashes in the update loop. This build lets you run the fixes now, with an easy way back.
+
+## Switch from regular Bermuda
+
+Your Bermuda configuration, devices and settings stay as they are.
+
+1. **Remove the original:** in HACS, open *Bermuda BLE Trilateration* → ⋮ → **Remove**. Do *not* delete the integration under Settings → Devices & services; that is what keeps your configuration.
+2. **Add this repository:** HACS → ⋮ → **Custom repositories** → paste `https://github.com/davidcoulson/bermuda-patched`, choose type **Integration**, then **Add**. Or use this button, which opens it in your HACS:
+
+   [![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=davidcoulson&repository=bermuda-patched&category=Integration)
+3. **Install it:** search HACS for *Bermuda BLE Trilateration (patched)* → **Download**.
+4. **Restart Home Assistant.** Bermuda loads as before; HACS shows the version as `0.8.7-patched.N`.
+
+**To switch back,** do the same in reverse: remove the patched one in HACS, download the original *Bermuda BLE Trilateration*, and restart.
+
+## What's fixed
+
+| Fix | Upstream PR |
+|---|---|
+| Metadevices now copy their source's name, manufacturer and beacon fields (the copy loop was a no-op) | [#832](https://github.com/agittins/bermuda/pull/832) |
+| A duplicate entry in the prune list no longer raises `KeyError` and aborts the update cycle | [#833](https://github.com/agittins/bermuda/pull/833) |
+| One scanner that cannot be resolved no longer stops entity creation for every other scanner, and a scanner that comes up after startup gets its distance sensors without a reload | [#835](https://github.com/agittins/bermuda/pull/835) |
+| IRKs are no longer written in full to diagnostics or the debug log | [#840](https://github.com/agittins/bermuda/pull/840) |
+| `bermuda.dump_devices` requires an admin when the call carries a user | [#842](https://github.com/agittins/bermuda/pull/842) |
+| Changing a proxy's area takes effect without a reload (and the "no AREA" repair clears) | [#857](https://github.com/agittins/bermuda/pull/857) |
+| A proxy is matched to its own registry entry, not a neighbour's with an adjacent MAC (#859) | [#860](https://github.com/agittins/bermuda/pull/860) |
+| A proxy's own entry beats a router integration's entry for the same MAC (wrong name, "no AREA" repair, #722) | [#862](https://github.com/agittins/bermuda/pull/862) |
+| Random BLE addresses are classified correctly (a bitwise `&` where `==` was meant left random-static ones mislabelled) | [#863](https://github.com/agittins/bermuda/pull/863) |
+| Device pruning no longer raises `IndexError` when too few devices can be pruned, and prunes the right number | [#848](https://github.com/agittins/bermuda/pull/848) (by @barneyonline) |
+| Scanners are found with Home Assistant's supported registry lookup (the old one is removed in 2027.9) | [#847](https://github.com/agittins/bermuda/pull/847) (by @barneyonline) |
+| Scanner lists in the options and calibration screens are sorted by name | [#836](https://github.com/agittins/bermuda/pull/836) (by @BrawnyBravo) |
+| An attenuation of 0 (or NaN) in the options no longer aborts every update cycle; both distance settings are validated | [#864](https://github.com/agittins/bermuda/pull/864) |
+| A ref_power change shows the new distances at once (the cache-bypass check could never pass) | [#865](https://github.com/agittins/bermuda/pull/865) |
+| A truncated iBeacon advert no longer creates a bogus `None_None_None` beacon | [#866](https://github.com/agittins/bermuda/pull/866) |
+| iBeacons nobody tracks are pruned once they go stale, instead of piling up forever | [#867](https://github.com/agittins/bermuda/pull/867) |
+| Deleting a tracked device stops tracking it (iBeacon ids were split at an underscore, and the device list re-enabled it every cycle) | [#868](https://github.com/agittins/bermuda/pull/868) |
+| Fewer recorder rows: Distance is republished only when it moves by max(0.2 m, 10%), and Floor no longer carries the area attributes | [#869](https://github.com/agittins/bermuda/pull/869) |
+
+Problems with this build: [this repository's issues](https://github.com/davidcoulson/bermuda-patched/issues). Everything else, including all the documentation below, is the original's.
+
+---
+
 ![Bermuda Logo](img/logo@2x.png)
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)

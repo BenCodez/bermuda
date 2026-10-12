@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import binascii
 import re
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components.bluetooth import (
@@ -53,6 +53,13 @@ from .const import (
     METADEVICE_TYPE_IBEACON_SOURCE,
 )
 from .util import mac_math_offset, mac_norm
+from .util import mac_octet_offset as _mac_octet_offset
+
+# Integrations that provide Bluetooth scanners. When two registry entries
+# carry the same MAC - an ESPHome proxy and the router integration that also
+# tracks it as a network client - the scanner's own entry is the one from
+# one of these.
+SCANNER_DOMAINS: Final = frozenset({"bluetooth", "esphome", "shelly", "ruuvi_gateway"})
 
 if TYPE_CHECKING:
     from bleak.backends.scanner import AdvertisementData
@@ -60,7 +67,7 @@ if TYPE_CHECKING:
     from .coordinator import BermudaDataUpdateCoordinator
 
 
-class BermudaDevice(dict):
+class BermudaDevice:
     """
     This class is to represent a single bluetooth "device" tracked by Bermuda.
 
@@ -205,17 +212,23 @@ class BermudaDevice(dict):
                     self.address_type = BDADDR_TYPE_NOT_MAC48
             elif len(self.address) == 17:
                 top_bits = int(self.address[0:1], 16) >> 2
-                # The two MSBs of the first octet dictate the random type...
-                if top_bits & 0b00:  # First char will be in [0 1 2 3]
+                # The two MSBs of the first octet dictate the random type. These
+                # are EQUALITY tests: this used to use `&`, under which
+                # `top_bits & 0b00` is never true (non-resolvable addresses stayed
+                # UNKNOWN), `top_bits & 0b01` matched 0b11 as well (every random
+                # STATIC address was labelled resolvable and fed to the IRK
+                # resolver, which can never resolve it), and the 0b11 branch was
+                # unreachable, so BDADDR_TYPE_RANDOM_STATIC was never assigned.
+                if top_bits == 0b00:  # First char will be in [0 1 2 3]
                     self.address_type = BDADDR_TYPE_RANDOM_UNRESOLVABLE
-                elif top_bits & 0b01:  # Addresses where the first char will be 4,5,6 or 7
+                elif top_bits == 0b01:  # Addresses where the first char will be 4,5,6 or 7
                     _LOGGER.debug("Identified Resolvable Private (potential IRK source) Address on %s", self.address)
                     self.address_type = BDADDR_TYPE_RANDOM_RESOLVABLE
                     self._coordinator.irk_manager.check_mac(self.address)
-                elif top_bits & 0b10:
+                elif top_bits == 0b10:
                     self.address_type = "reserved"
                     _LOGGER.debug("Hey, got one of those reserved MACs, %s", self.address)
-                elif top_bits & 0b11:
+                else:  # 0b11, first char in [c d e f]
                     self.address_type = BDADDR_TYPE_RANDOM_STATIC
 
             else:
@@ -239,14 +252,18 @@ class BermudaDevice(dict):
         self._is_remote_scanner = False
         self._coordinator.scanner_list_del(self)
 
-    def async_as_scanner_init(self, ha_scanner: BaseHaScanner):
+    def async_as_scanner_init(self, ha_scanner: BaseHaScanner, *, force: bool = False):
         """
         Configure this device as a scanner device.
 
-        Use to set up a device as a scanner.
+        Use to set up a device as a scanner. With force, a scanner that is
+        already set up re-reads its device registry entries (area, name).
         """
         if self._hascanner is ha_scanner:
-            # Actual object has not changed, we're good.
+            # Actual object has not changed, but what the user has set on its
+            # device registry entries may have.
+            if force:
+                self.async_as_scanner_resolve_device_entries()
             return
 
         # If we don't already have a self._hascanner, then this must be our
@@ -261,10 +278,14 @@ class BermudaDevice(dict):
             self._is_remote_scanner = True
         else:
             self._is_remote_scanner = False
-        self._coordinator.scanner_list_add(self)
 
         # Find the relevant device entries in HA for this scanner and apply the names, addresses etc
+        # This must happen before scanner_list_add(), which tells the sensor platform the roster
+        # changed. The platform skips scanners whose wifi mac hasn't resolved yet, and a scanner
+        # that arrives after startup gets no other signal, so it would otherwise go without its
+        # per-scanner entities until the integration is reloaded.
         self.async_as_scanner_resolve_device_entries()
+        self._coordinator.scanner_list_add(self)
 
         # Call the per-update processor as well, but only
         # if this is our first ha_scanner.
@@ -272,6 +293,26 @@ class BermudaDevice(dict):
         # where the scanner_update might call us.
         if _first_init:
             self.async_as_scanner_update(ha_scanner)
+
+    def _from_scanner_integration(self, devreg_device) -> bool:
+        """
+        Whether a device-registry entry belongs to an integration that
+        provides Bluetooth scanners (SCANNER_DOMAINS).
+        """
+        hass = getattr(self._coordinator, "hass", None)
+        get_entry = getattr(getattr(hass, "config_entries", None), "async_get_entry", None)
+        if get_entry is None:
+            return False
+        # A device belongs to one config entry from Home Assistant 2026.10
+        # (``config_entry_id``); reading ``config_entries`` there is deprecated
+        # (removed in 2027.10), so it is only the fallback for older cores.
+        entry_id = getattr(devreg_device, "config_entry_id", None)
+        entry_ids = (entry_id,) if entry_id else getattr(devreg_device, "config_entries", None) or ()
+        for entry_id in entry_ids:
+            entry = get_entry(entry_id)
+            if getattr(entry, "domain", None) in SCANNER_DOMAINS:
+                return True
+        return False
 
     def async_as_scanner_resolve_device_entries(self):
         """From the known MAC address, resolve any relevant device entries and names etc."""
@@ -317,23 +358,62 @@ class BermudaDevice(dict):
                 connlist.add(("mac", altmac))
                 maclist.add(altmac)
 
-        # Requires 2025.3
-        devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
+        if hasattr(self._coordinator.dr, "async_get_devices"):
+            devreg_devices = self._coordinator.dr.async_get_devices(connections=connlist)
+        else:
+            # Compatibility with older HA versions (minimum 2025.3), before
+            # the public multi-device lookup replaced direct container access.
+            devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
         devreg_count = 0  # can't len() an iterable.
         devreg_stringlist = ""  # for debug logging
+        # Rank the matches rather than letting the LAST one iterated win.
+        # The +-3 octet window is wide enough to also catch a NEIGHBOUR's
+        # registry entry: an ESPHome proxy at BLE dc:..:4a (WiFi ..:48) and an
+        # unrelated ESPHome light at WiFi ..:4c both match, and whichever the
+        # registry happened to return last became this scanner's name,
+        # unique_id and wifi mac - measured in production as a bedroom proxy
+        # reported as a basement light, so it could never be placed as the
+        # bedroom receiver it is. Prefer, in order: a device whose bluetooth
+        # connection IS this address; then the espressif rule this window
+        # exists for (BLE = WiFi + 2); then Ethernet (BLE = Ether - 1); then
+        # anything else. Registry order only breaks exact ties.
+        # Equal ranks go to the entry from an integration that provides
+        # Bluetooth scanners: a router integration (TP-Link, UniFi, Fritz)
+        # can register the same hardware under the same WiFi MAC, with its
+        # own name ("linux") and no area (#722).
+        bt_candidates: list[tuple[int, int, Any, str]] = []
+        mac_candidates: list[tuple[int, int, int, Any, str]] = []
         for devreg_device in devreg_devices:
             devreg_count += 1
             # _LOGGER.debug("DevregScanner: %s", devreg_device)
             devreg_stringlist += f"** {devreg_device.name_by_user or devreg_device.name}\n"
+            has_exact_bt = any(
+                conn[0] == "bluetooth" and conn[1].lower() == self.address for conn in devreg_device.connections
+            )
             for conn in devreg_device.connections:
                 if conn[0] == "bluetooth":
                     # Bluetooth component's device!
-                    scanner_devreg_bt = devreg_device
-                    scanner_devreg_bt_address = conn[1].lower()
+                    addr = conn[1].lower()
+                    bt_candidates.append((0 if addr == self.address else 1, devreg_count, devreg_device, addr))
                 if conn[0] == "mac":
                     # ESPHome, Shelly
-                    scanner_devreg_mac = devreg_device
-                    scanner_devreg_mac_address = conn[1]
+                    offset = _mac_octet_offset(self.address, conn[1])
+                    if has_exact_bt:
+                        rank = 0
+                    elif offset == 2:
+                        rank = 1
+                    elif offset == -1:
+                        rank = 2
+                    else:
+                        rank = 3
+                    foreign = 0 if self._from_scanner_integration(devreg_device) else 1
+                    mac_candidates.append((rank, foreign, devreg_count, devreg_device, conn[1]))
+        if bt_candidates:
+            _rank, _order, scanner_devreg_bt, scanner_devreg_bt_address = min(bt_candidates, key=lambda c: c[:2])
+        if mac_candidates:
+            _rank, _foreign, _order, scanner_devreg_mac, scanner_devreg_mac_address = min(
+                mac_candidates, key=lambda c: c[:3]
+            )
 
         if devreg_count not in (1, 2, 3):
             # We expect just the bt, or bt and another like esphome/shelly, or
@@ -361,6 +441,10 @@ class BermudaDevice(dict):
         # First clear the existing to make prioritising the bt/mac matches
         # easier (feel free to refactor, bear in mind we prefer bt first)
         _area_id = None
+        # A re-resolve (a registry change) starts from nothing: the entry_id
+        # of an earlier, wrong winner - a router's entry for the same MAC -
+        # must not survive next to the new winner's name and area.
+        self.entry_id = None
 
         _bt_name = None
         _mac_name = None
@@ -378,6 +462,14 @@ class BermudaDevice(dict):
             self.entry_id = self.entry_id or scanner_devreg_mac.id
             _mac_name = scanner_devreg_mac.name
             _mac_name_by_user = scanner_devreg_mac.name_by_user
+            if _area_id is None:
+                # Still no area: another entry for the same hardware (the
+                # same MAC) may have one - the user put the device in a room
+                # once, on whichever integration's page they found it.
+                for cand in sorted(mac_candidates, key=lambda c: c[:3]):
+                    if cand[4].lower() == str(scanner_devreg_mac_address).lower() and cand[3].area_id:
+                        _area_id = cand[3].area_id
+                        break
 
         # As of ESPHome 2025.3.0 (via aioesphomeapi 29.3.1) ESPHome proxies now
         # report their BLE MAC address instead of their WIFI MAC in the hascanner
@@ -795,6 +887,11 @@ class BermudaDevice(dict):
                         # UniversallyUniqueIDentifier is not even unique
                         # locally, so we need to make one :-)
 
+                        if len(man_data) < 22:
+                            # Too short to hold the uuid, major and minor: there is no
+                            # id to make, and registering it would create a bogus
+                            # "None_None_None" beacon metadevice.
+                            continue
                         self.beacon_unique_id = f"{self.beacon_uuid}_{self.beacon_major}_{self.beacon_minor}"
                         # Note: it's possible that a device sends multiple
                         # beacons. We are only going to process the latest
@@ -829,6 +926,12 @@ class BermudaDevice(dict):
                 for advert in self.adverts.values():
                     advertout[f"{advert.device_address}__{advert.scanner_address}"] = advert.to_dict()
                 out[var] = advertout
+                continue
+            if val is self.area_advert:
+                # A BermudaAdvert, which is not JSON-serialisable. It is already
+                # dumped in full under `adverts` above, so emit just its
+                # identifying repr here to show which one won the area.
+                out[var] = val.__repr__()
                 continue
             out[var] = val
         return out

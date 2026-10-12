@@ -1,5 +1,7 @@
 -r requirements.txt
 pytest-homeassistant-custom-component
 #==0.13.50
+# Home Assistant's usb component imports serialx since 2026.9; the test harness loads it.
+serialx
 pre-commit
 # AJG 2024-04-07: github not completing tests due to this.

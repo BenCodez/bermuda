@@ -2,9 +2,12 @@
 Tests for BermudaDevice class in bermuda_device.py.
 """
 
+import json
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from homeassistant.components.bluetooth import BaseHaScanner, BaseHaRemoteScanner
+from homeassistant.helpers.json import JSONEncoder
 from custom_components.bermuda.bermuda_device import BermudaDevice
 from custom_components.bermuda.const import ICON_DEFAULT_AREA, ICON_DEFAULT_FLOOR
 
@@ -65,6 +68,53 @@ def test_async_as_scanner_init(bermuda_scanner, mock_scanner):
     assert bermuda_scanner.is_remote_scanner is False
 
 
+def test_async_as_scanner_init_force_rereads_registry_entries(bermuda_scanner, mock_coordinator, mock_scanner):
+    """A forced init on a known scanner re-reads its registry entries.
+
+    Changing a proxy's area in Home Assistant does not replace its scanner
+    object, so an init that only reacts to a new object never saw the change
+    (agittins/bermuda#856).
+    """
+    with patch.object(bermuda_scanner, "async_as_scanner_resolve_device_entries") as resolve:
+        bermuda_scanner.async_as_scanner_init(mock_scanner)
+        assert resolve.call_count == 1  # first set-up
+
+        bermuda_scanner.async_as_scanner_init(mock_scanner)
+        assert resolve.call_count == 1  # same object, not forced: nothing to do
+
+        bermuda_scanner.async_as_scanner_init(mock_scanner, force=True)
+        assert resolve.call_count == 2  # forced: read the registry again
+
+    # Re-reading must not announce the scanner as new again.
+    assert mock_coordinator.scanner_list_add.call_count == 1
+
+
+def test_scanner_resolves_wifi_mac_before_announcing(bermuda_scanner, mock_coordinator, mock_remote_scanner):
+    """The roster-changed signal must see the scanner's resolved wifi mac.
+
+    scanner_list_add() dispatches SIGNAL_SCANNERS_CHANGED, and the sensor platform
+    skips scanners whose wifi mac is still None. A scanner that registers after
+    startup gets no other signal, so announcing it before resolving left it
+    without per-scanner entities until a reload.
+    """
+    wifi_mac = "11:22:33:44:55:64"
+    mock_coordinator.dr.async_get_devices.return_value = [
+        SimpleNamespace(
+            id="shelly_device",
+            name="Shelly",
+            name_by_user=None,
+            area_id=None,
+            connections={("mac", wifi_mac)},
+        )
+    ]
+    seen_at_announce = []
+    mock_coordinator.scanner_list_add.side_effect = lambda scanner: seen_at_announce.append(scanner.address_wifi_mac)
+
+    bermuda_scanner.async_as_scanner_init(mock_remote_scanner)
+
+    assert seen_at_announce == [wifi_mac]
+
+
 def test_async_as_scanner_update(bermuda_scanner, mock_scanner):
     """Test async_as_scanner_update method."""
     bermuda_scanner.async_as_scanner_update(mock_scanner)
@@ -119,7 +169,394 @@ def test_to_dict(bermuda_device):
     assert device_dict["address"] == "aa:bb:cc:dd:ee:ff"
 
 
+def test_to_dict_is_json_serialisable_with_area_advert(bermuda_device, bermuda_scanner):
+    """to_dict() output must be JSON-serialisable, including area_advert.
+
+    Regression test: to_dict() passed the area_advert BermudaAdvert object
+    through unconverted. That happened to survive JSON encoding only because
+    BermudaAdvert subclassed dict (it serialised as a useless empty {}).
+    Once that unused dict base was removed, the dump_devices service call and
+    the config-entry diagnostics download - which both serialise this output -
+    failed outright with "Unable to serialize to JSON. Bad data found at
+    $.service_response.<device>.area_advert".
+    """
+    advertisement_data = MagicMock()
+    bermuda_device.process_advertisement(bermuda_scanner, advertisement_data)
+    advert = next(iter(bermuda_device.adverts.values()))
+    bermuda_device.area_advert = advert
+
+    device_dict = bermuda_device.to_dict()
+
+    # The advert must be reduced to an identifying string, not passed through
+    # as a BermudaAdvert object (which the JSON encoder cannot handle, and
+    # which the old dict-subclass behaviour silently rendered as an empty {}).
+    assert isinstance(device_dict["area_advert"], str)
+    assert device_dict["area_advert"] == repr(advert)
+
+    # That field must survive the encoder HA serialises service responses with.
+    json.dumps(device_dict["area_advert"], cls=JSONEncoder)
+
+
 def test_repr(bermuda_device):
     """Test __repr__ method."""
     repr_str = repr(bermuda_device)
     assert repr_str == f"{bermuda_device.name} [{bermuda_device.address}]"
+
+
+def test_scanner_registry_match_prefers_own_device_over_a_mac_neighbour(mock_coordinator, mock_remote_scanner):
+    """Regression: the +-3 octet registry search also matches a NEIGHBOUR.
+
+    An ESPHome proxy at BLE ..:4a (WiFi ..:48) and an unrelated ESPHome light
+    at WiFi ..:4c both fall inside the window, and the last entry the
+    registry returned used to win - so the proxy took the light's name,
+    unique_id and wifi mac (and could never be placed as the receiver it is).
+    The entry whose bluetooth connection IS the scanner address must win,
+    whatever order the registry returns them in.
+    """
+    from types import SimpleNamespace
+
+    proxy = SimpleNamespace(
+        id="dev-proxy",
+        name="Eilee Bedroom RRN00 4e8948",
+        name_by_user=None,
+        area_id="eilee_bedroom",
+        connections={("mac", "dc:06:75:4e:89:48"), ("bluetooth", "dc:06:75:4e:89:4a")},
+    )
+    light = SimpleNamespace(
+        id="dev-light",
+        name="Basement Lumary 4e894c",
+        name_by_user=None,
+        area_id="basement",
+        connections={("mac", "dc:06:75:4e:89:4c")},
+    )
+    for order in ([proxy, light], [light, proxy]):
+        mock_coordinator.dr.async_get_devices = MagicMock(return_value=list(order))
+        scanner = BermudaDevice(address="DC:06:75:4E:89:4A", coordinator=mock_coordinator)
+        scanner._hascanner = mock_remote_scanner
+        scanner.async_as_scanner_resolve_device_entries()
+        assert scanner.unique_id == "dc:06:75:4e:89:48", order
+        assert scanner.address_wifi_mac == "dc:06:75:4e:89:48"
+        assert scanner.address_ble_mac == "dc:06:75:4e:89:4a"
+        assert scanner.entry_id == "dev-proxy"
+        assert scanner.name_devreg == "Eilee Bedroom RRN00 4e8948"
+
+
+def test_scanner_registry_match_falls_back_to_the_wifi_plus_two_rule(mock_coordinator, mock_remote_scanner):
+    """With no bluetooth entry at all (older cores), the espressif BLE = WiFi + 2
+    neighbour beats any other offset."""
+    from types import SimpleNamespace
+
+    proxy = SimpleNamespace(
+        id="p", name="Proxy", name_by_user=None, area_id=None, connections={("mac", "dc:06:75:4e:89:48")}
+    )
+    light = SimpleNamespace(
+        id="l", name="Light", name_by_user=None, area_id=None, connections={("mac", "dc:06:75:4e:89:4c")}
+    )
+    mock_coordinator.dr.async_get_devices = MagicMock(return_value=[light, proxy])
+    scanner = BermudaDevice(address="dc:06:75:4e:89:4a", coordinator=mock_coordinator)
+    scanner._hascanner = mock_remote_scanner
+    scanner.async_as_scanner_resolve_device_entries()
+    assert scanner.unique_id == "dc:06:75:4e:89:48"
+    assert scanner.name_devreg == "Proxy"
+
+
+def test_scanner_registry_match_ignores_a_neighbour_two_above(mock_coordinator, mock_remote_scanner):
+    """Issue #859: two ESP32-S3 proxies with adjacent MACs. Proxy A's BLE MAC
+    (..:6e) is its own WiFi MAC (..:6c) + 2 and also proxy B's WiFi MAC
+    (..:70) - 2, so both ESPHome entries fall in the +-3 window. A must keep
+    its own name and WiFi MAC whatever order the registry returns them in."""
+    from types import SimpleNamespace
+
+    bluetooth_a = SimpleNamespace(
+        id="bt-a",
+        name="Bluetooth Proxy 44696c",
+        name_by_user=None,
+        area_id="bedroom",
+        connections={("bluetooth", "1C:69:7A:44:69:6E")},
+    )
+    esphome_a = SimpleNamespace(
+        id="esp-a",
+        name="ESP32-S3 Bluetooth Proxy 44696c",
+        name_by_user=None,
+        area_id="bedroom",
+        connections={("mac", "1c:69:7a:44:69:6c")},
+    )
+    esphome_b = SimpleNamespace(
+        id="esp-b",
+        name="ESP32-S3 Bluetooth Proxy 446970",
+        name_by_user=None,
+        area_id="bathroom",
+        connections={("mac", "1c:69:7a:44:69:70")},
+    )
+    for order in (
+        [bluetooth_a, esphome_a, esphome_b],
+        [esphome_b, esphome_a, bluetooth_a],
+        [bluetooth_a, esphome_b, esphome_a],
+    ):
+        mock_coordinator.dr.async_get_devices = MagicMock(return_value=list(order))
+        scanner = BermudaDevice(address="1C:69:7A:44:69:6E", coordinator=mock_coordinator)
+        scanner._hascanner = mock_remote_scanner
+        scanner.async_as_scanner_resolve_device_entries()
+        assert scanner.address_wifi_mac == "1c:69:7a:44:69:6c", order
+        assert scanner.address_ble_mac == "1c:69:7a:44:69:6e"
+        assert scanner.unique_id == "1c:69:7a:44:69:6c"
+        assert scanner.name_devreg == "ESP32-S3 Bluetooth Proxy 44696c"
+
+
+def _with_domains(mock_coordinator, domains):
+    """Give the mock coordinator a config-entry lookup: entry id -> domain."""
+    from types import SimpleNamespace
+
+    mock_coordinator.hass.config_entries.async_get_entry = MagicMock(
+        side_effect=lambda entry_id: SimpleNamespace(domain=domains[entry_id]) if entry_id in domains else None
+    )
+
+
+def test_scanner_registry_match_prefers_the_scanner_integration_over_a_router_with_the_same_mac(
+    mock_coordinator, mock_remote_scanner
+):
+    """Issue #722: a router integration (TP-Link here) registers the same proxy
+    under the same WiFi MAC, named "linux" and with no area. Both entries are
+    the same distance from the BLE address, so registry order used to decide:
+    router first meant no area (the repair) and the router's name. The
+    ESPHome entry must win whatever the order, and with the core Bluetooth
+    entry present the name must still be ESPHome's, not the router's."""
+    from types import SimpleNamespace
+
+    _with_domains(mock_coordinator, {"e-esp": "esphome", "e-tp": "tplink", "e-bt": "bluetooth"})
+    esphome = SimpleNamespace(
+        id="esp",
+        name="TECHO5 proxy",
+        name_by_user=None,
+        area_id="office",
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-esp"},
+    )
+    router = SimpleNamespace(
+        id="tplink",
+        name="linux",
+        name_by_user=None,
+        area_id=None,
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-tp"},
+    )
+    bluetooth = SimpleNamespace(
+        id="bt",
+        name="Bluetooth proxy",
+        name_by_user=None,
+        area_id="office",
+        connections={("bluetooth", "AA:BB:CC:DD:EE:12")},
+        config_entries={"e-bt"},
+    )
+    for order, entry in (
+        ([esphome, router], "esp"),
+        ([router, esphome], "esp"),
+        ([bluetooth, router, esphome], "bt"),
+        ([router, esphome, bluetooth], "bt"),
+    ):
+        mock_coordinator.dr.async_get_devices = MagicMock(return_value=list(order))
+        scanner = BermudaDevice(address="AA:BB:CC:DD:EE:12", coordinator=mock_coordinator)
+        scanner._hascanner = mock_remote_scanner
+        scanner.async_as_scanner_resolve_device_entries()
+        ids = [d.id for d in order]
+        assert scanner.entry_id == entry, ids
+        assert scanner.area_id == "office", ids
+        assert scanner.name_devreg == "TECHO5 proxy", ids
+        assert scanner.address_wifi_mac == "aa:bb:cc:dd:ee:10", ids
+
+
+def test_scanner_area_comes_from_another_entry_for_the_same_hardware(mock_coordinator, mock_remote_scanner):
+    """The workaround people use for #722 - giving the router's entry an area -
+    keeps working: the scanner's own entry has none, the same MAC's other
+    entry has one, and that area is the scanner's."""
+    from types import SimpleNamespace
+
+    _with_domains(mock_coordinator, {"e-esp": "esphome", "e-tp": "tplink"})
+    esphome = SimpleNamespace(
+        id="esp",
+        name="TECHO5 proxy",
+        name_by_user=None,
+        area_id=None,
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-esp"},
+    )
+    router = SimpleNamespace(
+        id="tplink",
+        name="linux",
+        name_by_user=None,
+        area_id="office",
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-tp"},
+    )
+    neighbour = SimpleNamespace(
+        id="light",
+        name="Hall light",
+        name_by_user=None,
+        area_id="hall",
+        connections={("mac", "aa:bb:cc:dd:ee:14")},
+        config_entries={"e-esp"},
+    )
+    for order in ([esphome, router, neighbour], [neighbour, router, esphome]):
+        mock_coordinator.dr.async_get_devices = MagicMock(return_value=list(order))
+        scanner = BermudaDevice(address="AA:BB:CC:DD:EE:12", coordinator=mock_coordinator)
+        scanner._hascanner = mock_remote_scanner
+        scanner.async_as_scanner_resolve_device_entries()
+        assert scanner.entry_id == "esp" and scanner.name_devreg == "TECHO5 proxy"
+        # The router's area (same MAC), never the neighbour light's (different MAC).
+        assert scanner.area_id == "office", [d.id for d in order]
+
+
+def test_a_re_resolve_replaces_an_earlier_winners_entry_id(mock_coordinator, mock_remote_scanner):
+    """A scanner first resolved to the router's entry (the scanner
+    integration's entry not registered yet), then re-resolved once it is,
+    must carry the new winner's entry_id, not keep the router's."""
+    from types import SimpleNamespace
+
+    _with_domains(mock_coordinator, {"e-esp": "esphome", "e-tp": "tplink"})
+    esphome = SimpleNamespace(
+        id="esp",
+        name="TECHO5 proxy",
+        name_by_user=None,
+        area_id="office",
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-esp"},
+    )
+    router = SimpleNamespace(
+        id="tplink",
+        name="linux",
+        name_by_user=None,
+        area_id=None,
+        connections={("mac", "aa:bb:cc:dd:ee:10")},
+        config_entries={"e-tp"},
+    )
+    scanner = BermudaDevice(address="AA:BB:CC:DD:EE:12", coordinator=mock_coordinator)
+    scanner._hascanner = mock_remote_scanner
+    mock_coordinator.dr.async_get_devices = MagicMock(return_value=[router])
+    scanner.async_as_scanner_resolve_device_entries()
+    assert scanner.entry_id == "tplink"
+    mock_coordinator.dr.async_get_devices = MagicMock(return_value=[router, esphome])
+    scanner.async_as_scanner_resolve_device_entries()
+    assert scanner.entry_id == "esp" and scanner.name_devreg == "TECHO5 proxy" and scanner.area_id == "office"
+
+
+@pytest.mark.parametrize(
+    ("first_char", "expected"),
+    [(c, "bd_addr_random_unresolvable") for c in "0123"]
+    + [(c, "bd_addr_random_resolvable") for c in "4567"]
+    + [(c, "reserved") for c in "89ab"]
+    + [(c, "bd_addr_random_static") for c in "cdef"],
+)
+def test_address_type_classifier_uses_the_top_two_bits(mock_coordinator, first_char, expected):
+    """Regression: the classifier tested the top two bits with `&` where it
+    meant `==`, so 0b00 addresses stayed unknown, every random-static (0b11)
+    address was labelled resolvable and handed to the IRK resolver, and
+    BDADDR_TYPE_RANDOM_STATIC was never assigned at all."""
+    device = BermudaDevice(address=f"{first_char}a:bb:cc:dd:ee:ff", coordinator=mock_coordinator)
+    assert device.address_type == expected
+    if expected == "bd_addr_random_resolvable":
+        mock_coordinator.irk_manager.check_mac.assert_called_once_with(f"{first_char}a:bb:cc:dd:ee:ff")
+    else:
+        mock_coordinator.irk_manager.check_mac.assert_not_called()
+
+
+@pytest.mark.parametrize("modern_registry", [True, False])
+@pytest.mark.parametrize("device_types", [("bluetooth",), ("mac",), ("bluetooth", "mac"), ()])
+def test_scanner_resolves_all_device_entries(
+    bermuda_scanner, mock_coordinator, mock_scanner, modern_registry, device_types
+):
+    """Preserve scanner identity and metadata with both registry lookup APIs."""
+    entries = {
+        "bluetooth": SimpleNamespace(
+            id="bluetooth_device",
+            connections={("bluetooth", "11:22:33:44:55:66")},
+            name="Bluetooth scanner",
+            name_by_user="Bluetooth user name",
+            area_id="bluetooth_area",
+        ),
+        "mac": SimpleNamespace(
+            id="network_device",
+            connections={("mac", "11:22:33:44:55:64")},
+            name="ESPHome scanner",
+            name_by_user="ESPHome user name",
+            area_id="network_area",
+        ),
+    }
+    lookup = MagicMock(return_value=[entries[key] for key in device_types])
+    if modern_registry:
+        # No devices attribute: any deprecated container access must fail.
+        registry = SimpleNamespace(async_get_devices=lookup)
+    else:
+        registry = SimpleNamespace(devices=SimpleNamespace(get_entries=lookup))
+    mock_coordinator.dr = registry
+    bermuda_scanner._hascanner = mock_scanner
+
+    with patch.object(bermuda_scanner, "_update_area_and_floor") as update_area:
+        bermuda_scanner.async_as_scanner_resolve_device_entries()
+
+    expected_connections = {
+        (kind, f"11:22:33:44:55:{suffix:02x}") for kind in ("bluetooth", "mac") for suffix in range(0x63, 0x69)
+    }
+    if modern_registry:
+        lookup.assert_called_once_with(connections=expected_connections)
+    else:
+        lookup.assert_called_once_with(None, connections=expected_connections)
+    if not device_types:
+        update_area.assert_not_called()
+        return
+
+    preferred = entries["bluetooth" if "bluetooth" in device_types else "mac"]
+    update_area.assert_called_once_with(preferred.area_id)
+    assert bermuda_scanner.entry_id == preferred.id
+    assert bermuda_scanner.name_by_user == preferred.name_by_user
+    assert bermuda_scanner.name_devreg == entries["mac" if "mac" in device_types else "bluetooth"].name
+    assert bermuda_scanner.unique_id == ("11:22:33:44:55:64" if "mac" in device_types else "11:22:33:44:55:66")
+    assert bermuda_scanner.address_ble_mac == (
+        "11:22:33:44:55:66" if "bluetooth" in device_types else "11:22:33:44:55:64"
+    )
+    assert bermuda_scanner.address_wifi_mac == ("11:22:33:44:55:64" if "mac" in device_types else None)
+
+
+async def test_scanner_resolves_real_registry(
+    hass, device_registry, bermuda_scanner, mock_coordinator, mock_scanner, caplog
+):
+    """Resolve separate Bluetooth and ESPHome devices through HA's registry."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    for domain, address in (("bluetooth", "11:22:33:44:55:66"), ("esphome", "11:22:33:44:55:64")):
+        entry = MockConfigEntry(domain=domain)
+        entry.add_to_hass(hass)
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            connections={("bluetooth" if domain == "bluetooth" else "mac", address)},
+            name=domain,
+        )
+
+    mock_coordinator.dr = device_registry
+    bermuda_scanner._hascanner = mock_scanner
+    bermuda_scanner.async_as_scanner_resolve_device_entries()
+
+    assert bermuda_scanner.unique_id == "11:22:33:44:55:64"
+    assert bermuda_scanner.address_ble_mac == "11:22:33:44:55:66"
+    assert bermuda_scanner.name_devreg == "esphome"
+    assert "uses `device_registry.devices`" not in caplog.text
+
+
+def test_scanner_integration_is_read_from_config_entry_id_on_current_cores(mock_coordinator):
+    """From Home Assistant 2026.10 a device has one ``config_entry_id`` and
+    reading ``config_entries`` is deprecated: use the new attribute, and do
+    not touch the old one when the new one is there."""
+    from types import SimpleNamespace
+
+    class NewCoreDevice:
+        config_entry_id = "e-esp"
+
+        @property
+        def config_entries(self):
+            raise AssertionError("config_entries read on a core that has config_entry_id")
+
+    _with_domains(mock_coordinator, {"e-esp": "esphome", "e-tp": "tplink"})
+    scanner = BermudaDevice(address="AA:BB:CC:DD:EE:12", coordinator=mock_coordinator)
+    assert scanner._from_scanner_integration(NewCoreDevice()) is True
+    # An older core: no config_entry_id, the set of entries is read instead.
+    assert scanner._from_scanner_integration(SimpleNamespace(config_entries={"e-tp"})) is False
+    assert scanner._from_scanner_integration(SimpleNamespace(config_entries={"e-tp", "e-esp"})) is True
