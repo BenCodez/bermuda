@@ -138,15 +138,50 @@ def test_unknown_targets_do_not_validate_absolute_offsets():
         ("quality", {"source_trusted": False}, "untrusted_source"),
         ("quality", {"clock_reset": True}, "untrusted_source"),
         ("quality", {"reliability": True}, "unreliable_signal"),
+        ("quality", {"signal_reliability": 1.0, "reliable": False}, "untrusted_source"),
+        ("quality", {"signal_reliability": 1.0, "source_trusted": False}, "untrusted_source"),
+        ("quality", {"signal_reliability": 1.0, "clock_reset": True}, "untrusted_source"),
         ("accuracy_m", 100.0, "uncertain_truth"),
         ("stamp", True, "untrusted_source_clock"),
     ],
 )
 def test_bad_freshness_model_truth_and_weak_inputs_are_excluded(field, value, reason):
     rows = observations()
+    for row in rows:
+        row["quality"]["signal_reliability"] = 1.0
     rows[0][field] = value
     result = preview(rows)
     assert result["rejected"][reason] == 1
+
+
+@pytest.mark.parametrize(
+    "quality,accepted",
+    [
+        ({"signal_reliability": 1.0, "reliability": 0.01}, True),
+        ({"signal_reliability": 0.1, "reliability": 1.0}, False),
+        ({"signal_reliability": None, "reliability": 1.0}, False),
+        ({"signal_reliability": True, "reliability": 1.0}, False),
+        ({"signal_reliability": float("nan"), "reliability": 1.0}, False),
+        ({"signal_reliability": float("inf"), "reliability": 1.0}, False),
+        ({"signal_reliability": "1.0", "reliability": 1.0}, False),
+        ({"signal_reliability": -0.1, "reliability": 1.0}, False),
+        ({"signal_reliability": 1.1, "reliability": 1.0}, False),
+        ({"reliability": 1.0}, True),
+        ({"reliability": 0.1}, False),
+        ({"reliability": True}, False),
+        ({"reliability": None}, True),
+        ({}, True),
+    ],
+)
+def test_signal_reliability_is_authoritative_with_legacy_compatibility(quality, accepted):
+    rows = observations()
+    for row in rows:
+        row["quality"] = deepcopy(quality)
+    result = preview(rows)
+    assert result["eligible"] is accepted
+    assert result["coverage"]["samples"] == (len(rows) if accepted else 0)
+    if not accepted:
+        assert result["rejected"]["unreliable_signal"] == len(rows)
 
 
 def test_duplicate_packets_cannot_invent_training_evidence():

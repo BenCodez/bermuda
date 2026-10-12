@@ -264,12 +264,12 @@ class FilterState:
         values = [row[1] for row in self._raw]
         variance = statistics.pvariance(values) if len(values) >= 3 else None
         noise = math.sqrt(variance) if variance is not None else None
-        reliability = 0.0
+        signal_reliability = 0.0
         if valid:
             support = min(1.0, len(values) / 5.0)
             noise_factor = 1.0 / (1.0 + ((noise if noise is not None else 4.0) / 6.0) ** 2)
             acceptance = sum(self._accepted) / len(self._accepted) if self._accepted else 0.0
-            reliability = support * noise_factor * acceptance * math.exp(-age / self.timeout_s)
+            signal_reliability = support * noise_factor * acceptance * math.exp(-age / self.timeout_s)
         physical = receiver_quality(
             noise_db=noise,
             distance=raw_distance,
@@ -277,6 +277,9 @@ class FilterState:
             expected_distance=expected_distance,
             expected_accuracy_m=expected_accuracy_m,
         )
+        # Calibration must judge signal evidence independently of the range model
+        # it is correcting. Live election still includes measured range accuracy.
+        reliability = signal_reliability
         if physical["accuracy_reliability"] is not None:
             reliability *= physical["accuracy_reliability"]
         reasons: list[dict[str, Any]] = []
@@ -305,6 +308,7 @@ class FilterState:
             "variance_db2": variance,
             "cadence_s": self.cadence_s,
             "timeout_s": self.timeout_s,
+            "signal_reliability": signal_reliability,
             "reliability": reliability,
             "reasons": reasons,
             **physical,

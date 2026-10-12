@@ -61,6 +61,7 @@ def test_stationary_cached_packet_departure_does_not_extend_freshness_or_confirm
         assert "duplicate_stamp" in reason_codes(result)
     assert result["filtered_rssi"] is None
     assert result["status"] == "stale"
+    assert result["signal_reliability"] == 0
     assert result["reliability"] == 0
     assert "accepted_data_timeout" in reason_codes(result)
 
@@ -145,6 +146,7 @@ def test_out_of_order_source_and_clock_regression_cannot_rewrite_state():
     result = state.process(-90, 12, 12)
     assert "current_clock_regression" in reason_codes(result)
     assert result["filtered_rssi"] is None
+    assert result["signal_reliability"] == 0
     assert result["reliability"] == 0
     assert state.snapshot(21)["filtered_rssi"] == -60
 
@@ -225,13 +227,37 @@ def test_invalid_physical_inputs_do_not_claim_covariance(distance, attenuation):
     assert quality["distance_variance_m2"] is None
 
 
-def test_filter_reports_accuracy_effect_separately_and_keeps_raw_value():
-    state = FilterState("pet")
+@pytest.mark.parametrize("mode", ["legacy", "pet", "stationary"])
+def test_filter_reports_accuracy_effect_separately_and_keeps_raw_value(mode):
+    state = FilterState(mode)
     for stamp in range(5):
         result = state.process(-60, stamp, stamp, raw_distance=10, expected_distance=5, expected_accuracy_m=1)
     assert result["raw_rssi"] == -60
     assert result["range_error_m"] == 5
+    assert result["signal_reliability"] == pytest.approx(1)
     assert result["reliability"] < 0.1
+    assert result["reliability"] == pytest.approx(result["signal_reliability"] * result["accuracy_reliability"])
+    without_truth = state.snapshot(4, raw_distance=10)
+    assert without_truth["signal_reliability"] == result["signal_reliability"]
+    assert without_truth["reliability"] == without_truth["signal_reliability"]
+
+
+@pytest.mark.parametrize("condition", ["insufficient", "noisy", "rejected", "stale"])
+def test_model_independent_reliability_keeps_signal_evidence_guards(condition):
+    state = FilterState("pet" if condition == "rejected" else "legacy")
+    for stamp in range(32 if condition != "insufficient" else 1):
+        rssi = -60
+        if condition == "noisy" or (condition == "rejected" and stamp >= 5):
+            rssi += 20 if stamp % 2 else -20
+        result = state.process(rssi, stamp, stamp)
+    if condition == "stale":
+        result = state.snapshot(62)
+    assert result["signal_reliability"] < 0.2
+    assert result["reliability"] == result["signal_reliability"]
+    if condition == "rejected":
+        assert not result["accepted"]
+        assert result["last_valid_stamp"] == 4
+        assert "unconfirmed_jump" in reason_codes(result)
 
 
 @pytest.mark.parametrize("mode,window", [("moving", 32), ({}, 32), ("pet", True), ("pet", 1), ("pet", 1000)])

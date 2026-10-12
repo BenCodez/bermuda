@@ -285,8 +285,11 @@ class CalibrationEngine:
             return "untrusted_source"
         if any(quality.get(key) is True for key in ("clock_reset", "clock_jump", "stale", "missing")):
             return "untrusted_source"
-        reliability = quality.get("reliability")
-        if reliability is not None and (
+        # New snapshots separate signal quality from current-model accuracy.
+        # Older recordings retain their original reliability gate; never infer a
+        # trustworthy signal by undoing a recorded physical-accuracy penalty.
+        reliability = quality.get("signal_reliability", quality.get("reliability"))
+        if ("signal_reliability" in quality or reliability is not None) and (
             not finite_number(reliability) or not self.policy.minimum_reliability <= reliability <= 1
         ):
             return "unreliable_signal"
