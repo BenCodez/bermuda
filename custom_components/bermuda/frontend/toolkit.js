@@ -252,7 +252,10 @@ export class BermudaToolkitPanel extends HTMLElement {
     }
   }
 
-  _draftValue(input) { return input.type === "checkbox" ? input.checked : input.value; }
+  _draftValue(input) {
+    if (input.dataset.unavailableValue !== undefined && input.value === input.dataset.unavailableValue) return input.dataset.unavailableId;
+    return input.type === "checkbox" ? input.checked : input.value;
+  }
 
   _markDraft(input) {
     const name = input.dataset.draft;
@@ -270,27 +273,57 @@ export class BermudaToolkitPanel extends HTMLElement {
     input.addEventListener("change", remember);
   }
 
-  _bindTargetDrafts(name, kind, id, fields) {
+  _bindTargetDrafts(name, kind, id, fields, keepUnavailable = false) {
     const previous = this._draftTargets.get(name);
     if (previous && (previous.kind !== kind || previous.id !== id)) {
-      for (const field of fields) {
+      for (const field of new Set([...previous.fields, ...fields])) {
         this._drafts.delete(field);
         this._draftVersions.delete(field);
       }
     }
-    this._draftTargets.set(name, { kind, id, fields });
+    this._draftTargets.set(name, { kind, id, fields, keepUnavailable });
   }
 
   _discardUnavailableTargetDrafts() {
-    const rosters = { receiver: this._scanners(), beacon: this._devices() };
     for (const [name, target] of this._draftTargets) {
-      if (rosters[target.kind].some(([id]) => id === target.id)) continue;
+      if (this._targetChoices(target.kind).some(([id]) => id === target.id)) continue;
+      if (target.keepUnavailable) { target.unavailable = true; continue; }
       for (const field of [name, ...target.fields]) {
         this._drafts.delete(field);
         this._draftVersions.delete(field);
       }
       this._draftTargets.delete(name);
     }
+  }
+
+  _targetChoices(kind) {
+    if (kind === "receiver") return this._scanners();
+    if (kind === "area") return rows(this._state?.areas).map(area => [area.area_id || area.id, area.name || area.area_id || area.id]);
+    if (kind === "recording") return [["", "All tracked devices"], ...this._devices()];
+    return this._devices();
+  }
+
+  _targetAvailable(select) {
+    const target = this._draftTargets.get(select.dataset.draft);
+    return Boolean(target && !target.unavailable && target.id === select.value
+      && this._targetChoices(target.kind).some(([id]) => id === select.value)
+      && [...this._content.querySelectorAll("[data-draft]")].includes(select));
+  }
+
+  _targetSelect(parent, label, name, kind, fields = [], value) {
+    const choices = this._targetChoices(kind);
+    const select = this._select(parent, label, name, choices, value);
+    if (!this._draftTargets.get(name)?.unavailable && choices.some(([id]) => id === select.value)) {
+      this._bindTargetDrafts(name, kind, select.value, fields, true);
+    }
+    const content = this._content;
+    select.addEventListener("change", () => {
+      if (content !== this._content || !choices.some(([id]) => id === select.value)) return;
+      this._bindTargetDrafts(name, kind, select.value, fields, true);
+      this._markDraft(select);
+      this._render();
+    });
+    return select;
   }
 
   _resetField(input, value) {
@@ -338,7 +371,14 @@ export class BermudaToolkitPanel extends HTMLElement {
     select.dataset.draft = name;
     for (const [id, text] of choices) select.append(node("option", text, { value: id }));
     const saved = this._drafts.has(name) ? this._drafts.get(name) : this._draftTargets.get(name)?.id ?? value;
-    if (choices.some(([id]) => id === saved)) select.value = saved;
+    if (this._draftTargets.get(name)?.unavailable) {
+      let unavailable = "";
+      while (choices.some(([id]) => id === unavailable)) unavailable += "#";
+      select.dataset.unavailableValue = unavailable;
+      select.dataset.unavailableId = saved;
+      select.append(node("option", `Choose again: ${saved} (selection became unavailable)`, { value: unavailable, disabled: "" }));
+      select.value = unavailable;
+    } else if (choices.some(([id]) => id === saved)) select.value = saved;
     this._trackDraft(select);
     wrapper.append(select);
     parent.append(wrapper);
@@ -350,6 +390,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     button.disabled = (!allowBusy && (this._busy || this._fileBusy)) || disabled;
     button.addEventListener("click", async () => {
       if ((!allowBusy && (this._busy || this._fileBusy)) || button.disabled) return;
+      if (![...this.shadowRoot.querySelectorAll("button")].includes(button)) return;
       try { await callback(); } catch (error) { this._message = this._errorText(error); this._render(); }
     });
     parent.append(button);
@@ -450,7 +491,10 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
       this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0));
     });
-    this._button(receiver, "Save receiver limit", () => this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true }), { disabled: !this._scanners().length });
+    this._button(receiver, "Save receiver limit", () => {
+      if (!this._targetAvailable(scanner)) throw new Error("Choose an available receiver.");
+      return this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true });
+    }, { disabled: !this._targetAvailable(scanner) });
     const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
     const device = this._select(filters, "Device", "filter-device", this._devices());
     this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
@@ -460,7 +504,10 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
       this._resetField(mode, this._options().filters?.[device.value] || "legacy");
     });
-    this._button(filters, "Save filter mode", () => this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true }), { disabled: !this._devices().length });
+    this._button(filters, "Save filter mode", () => {
+      if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
+      return this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true });
+    }, { disabled: !this._targetAvailable(device) });
     const profiles = this._section(parent, "Hardware and radio profile", "Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance. Leave a numeric field empty to inherit the existing model.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
@@ -494,7 +541,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       loadProfile();
     });
     this._button(profiles, "Save profile", () => {
-      if (!target.value) throw new Error("Choose a profile target.");
+      if (!this._targetAvailable(target)) throw new Error("Choose an available profile target.");
       const profile = {};
       const remove = [];
       const edited = [];
@@ -507,7 +554,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (!verified.disabled && this._drafts.has(verified.dataset.draft)) { profile.reference_power_verified = verified.checked; edited.push(verified); }
       if (!edited.length) { this._message = "No unsaved profile changes."; this._render(); return; }
       return this._perform("profile", { kind: kind.value, id: target.value, profile, remove }, { draftNames: edited.map(input => input.dataset.draft) });
-    });
+    }, { disabled: !this._targetAvailable(target) });
     const fixed = this._section(parent, "Fixed reference labels", "Only permanently fixed beacons belong here. Saving explicitly labels future samples. Use measured slant ranges and an independent location label. Use {} to remove fixed references.");
     const referenceJSON = this._field(fixed, "Fixed reference map (JSON)", "fixed-references", pretty(options.fixed_references || {}), { multiline: true });
     this._button(fixed, "Save fixed references", () => this._saveSettings(this._drafts.has(referenceJSON.dataset.draft) ? { fixed_references: JSON.parse(referenceJSON.value) } : {}, [referenceJSON]));
@@ -518,11 +565,13 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _calibration(parent) {
     const capture = this._section(parent, "1. Capture independent measured truth", "Place the same device at several separately labelled locations. Measure receiver-to-beacon slant distance, including height. Leave receivers without a measured range blank. Repeated clicks at one position do not create independent coverage.");
-    const device = this._select(capture, "Device", "capture-device", this._devices());
+    const truthDrafts = ["capture-location", "capture-accuracy", ...new Set([...this._scanners().map(([id]) => `range-${id}`), ...[...this._drafts.keys()].filter(name => name.startsWith("range-"))])];
+    const device = this._targetSelect(capture, "Device", "capture-device", "beacon", truthDrafts);
     const location = this._field(capture, "Independent location label", "capture-location", "", { required: true, placeholder: "Reference spot A" });
     const accuracy = this._field(capture, "Measurement tolerance (m)", "capture-accuracy", .1, { type: "number", min: 0, max: 100, step: .01 });
     const ranges = this._scanners().map(([id, name]) => [id, this._field(capture, `Measured slant range to ${name} (m)`, `range-${id}`, "", { type: "number", min: .05, max: 1000, step: .01 })]);
     this._button(capture, "Capture labelled readings", () => {
+      if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
       if (!location.value.trim()) throw new Error("Enter an independent location label.");
       const measured = {};
       for (const [id, input] of ranges) {
@@ -531,7 +580,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       }
       if (!Object.keys(measured).length) throw new Error("Enter at least one measured slant range.");
       return this._perform("capture", { device_id: device.value, location_id: location.value.trim(), ranges: measured, accuracy_m: finiteInput(accuracy, { min: 0, max: 100 }) });
-    }, { disabled: !this._devices().length || !ranges.length });
+    }, { disabled: !this._targetAvailable(device) || !ranges.length });
     if (this._results.capture) this._json(capture, this._results.capture);
     const calibration = this._section(parent, "2. Preview, apply, or rollback", "Preview is a trial. Inspect coverage, holdout errors, confidence and rejection reasons before applying. Range error does not prove position accuracy.");
     this._button(calibration, "Preview calibration", () => this._perform("calibration_preview"));
@@ -548,9 +597,12 @@ export class BermudaToolkitPanel extends HTMLElement {
   _history(parent) {
     const history = this._section(parent, "Bounded diagnostic recording", "Recording is off by default. Exports contain frozen observations, model versions and explicit label provenance. Recording downloads and copies use compact JSON to preserve the 2 MiB import budget. Imported recordings are validated on the server.");
     this._json(history, this._state.history);
-    const devices = this._select(history, "Record device (or all tracked devices)", "history-device", [["", "All tracked devices"], ...this._devices()], "");
+    const devices = this._targetSelect(history, "Record device (or all tracked devices)", "history-device", "recording", [], "");
     const buttons = node("div", undefined, { class: "buttons" });
-    this._button(buttons, "Start recording", () => this._perform("history_start", { devices: devices.value ? [devices.value] : [] }));
+    this._button(buttons, "Start recording", () => {
+      if (!this._targetAvailable(devices)) throw new Error("Choose an available device or all tracked devices.");
+      return this._perform("history_start", { devices: devices.value ? [devices.value] : [] });
+    }, { disabled: !this._targetAvailable(devices) });
     this._button(buttons, "Stop recording", () => this._perform("history_stop"));
     this._button(buttons, "Clear history", () => this._perform("history_clear"));
     const redact = this._field(history, "Redact recording identifiers for sharing", "history-redact", true, { type: "checkbox" });
@@ -577,15 +629,17 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _fingerprints(parent) {
     const section = this._section(parent, "Supervised RSSI fingerprints", "Train the selected device at an independently known Home Assistant area. Capture multiple positions and times. Suggestions report unknown, ambiguous and missing coverage; they do not automatically label later samples.");
-    const device = this._select(section, "Device", "fingerprint-device", this._devices());
-    const areas = rows(this._state.areas).map(area => [area.area_id || area.id, area.name || area.area_id || area.id]);
-    const location = this._select(section, "Independently known Home Assistant area", "fingerprint-location", areas);
+    const device = this._targetSelect(section, "Device", "fingerprint-device", "beacon");
+    const location = this._targetSelect(section, "Independently known Home Assistant area", "fingerprint-location", "area");
     const controls = node("div", undefined, { class: "buttons" });
     this._button(controls, "Train labelled sample", () => {
-      if (!location.value) throw new Error("Choose an independently known Home Assistant area.");
+      if (!this._targetAvailable(device) || !this._targetAvailable(location)) throw new Error("Choose an available device and independently known Home Assistant area.");
       return this._perform("fingerprint_train", { device_id: device.value, location_id: location.value.trim() });
-    }, { disabled: !this._devices().length || !areas.length });
-    this._button(controls, "Clear device fingerprints", () => this._perform("fingerprint_clear", { device_id: device.value }), { disabled: !this._devices().length });
+    }, { disabled: !this._targetAvailable(device) || !this._targetAvailable(location) });
+    this._button(controls, "Clear device fingerprints", () => {
+      if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
+      return this._perform("fingerprint_clear", { device_id: device.value });
+    }, { disabled: !this._targetAvailable(device) });
     section.append(controls);
     this._json(section, this._results.fingerprint_train || this._state.fingerprints || this._state.fingerprint);
     const results = this._section(parent, "Current fingerprint matches", "Confidence, coverage, ambiguity, suggested area and rejection reasons for supervised matches. A suggestion requires fresh observations; unknown results are not assigned to an area.");

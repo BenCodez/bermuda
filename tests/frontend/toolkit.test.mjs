@@ -269,7 +269,7 @@ test("history, replay and shadow buttons dispatch complete actions with safe exp
   assert.equal(calls[3].redact, true);
   assert.equal(calls[4].redact, true);
   assert.equal("candidate" in calls[5], false);
-  field(component, "Record device (or all tracked devices)").value = "device1";
+  await edit(component, "Record device (or all tracked devices)", "device1", "change");
   await button(component, "Start recording").click();
   assert.deepEqual(calls.at(-1).devices, ["device1"]);
   field(component, "Candidate receiver offsets (JSON; empty object uses the current proposal)").value = '{"receiver1":1.5}';
@@ -299,14 +299,14 @@ test("recording one device then restarting for all explicitly clears the retaine
   });
   component._activeTab = 2;
   component._render();
-  field(component, "Record device (or all tracked devices)").value = "device1";
+  await edit(component, "Record device (or all tracked devices)", "device1", "change");
   await button(component, "Start recording").click();
   assert.deepEqual([...selectedDevices], ["device1"]);
   assert.equal(running, true);
   await button(component, "Stop recording").click();
   assert.equal(running, false);
   assert.deepEqual([...selectedDevices], ["device1"]);
-  field(component, "Record device (or all tracked devices)").value = "";
+  await edit(component, "Record device (or all tracked devices)", "", "change");
   await button(component, "Start recording").click();
   assert.deepEqual(calls.at(-1).devices, []);
   assert.deepEqual([...selectedDevices], []);
@@ -916,6 +916,153 @@ test("detached target controls cannot overwrite or discard a replacement target'
   assert.equal(field(component, "Filter").value, "stationary");
   assert.equal(field(component, "Profile target").value, receiverB);
   assert.equal(field(component, "model").value, "newer receiver B");
+});
+
+test("calibration requires reselection after device loss and clears truth for a different device", async () => {
+  const { server, receiverA, deviceA, deviceB } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") calls.push(payload);
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._activeTab = 1; component._render();
+  const rangeLabel = `Measured slant range to Synthetic receiver (${receiverA}) (m)`;
+  await edit(component, "Independent location label", "Measured device A");
+  await edit(component, "Measurement tolerance (m)", ".25");
+  await edit(component, rangeLabel, "2.25");
+  const removed = server.snapshot.devices[deviceA]; delete server.snapshot.devices[deviceA];
+  await component.refresh();
+  assert.match(field(component, "Device").textContent, /selection became unavailable/);
+  assert.notEqual(field(component, "Device").value, deviceB);
+  assert.equal(button(component, "Capture labelled readings").disabled, true);
+  button(component, "Capture labelled readings").disabled = false;
+  await button(component, "Capture labelled readings").click();
+  assert.equal(calls.length, 0, "source guard rejects unavailable selections even if the button is enabled");
+  server.snapshot.devices = { [deviceA]: removed, ...server.snapshot.devices };
+  await component.refresh();
+  assert.equal(button(component, "Capture labelled readings").disabled, true);
+  await edit(component, "Device", deviceA, "change");
+  assert.equal(field(component, "Independent location label").value, "Measured device A");
+  await button(component, "Capture labelled readings").click();
+  assert.equal(calls[0].device_id, deviceA);
+  await edit(component, "Device", deviceB, "change");
+  assert.equal(field(component, "Independent location label").value, "");
+  assert.equal(field(component, "Measurement tolerance (m)").value, "0.1");
+  assert.equal(field(component, rangeLabel).value, "");
+  await button(component, "Capture labelled readings").click();
+  assert.equal(calls.length, 1);
+  await edit(component, "Independent location label", "Measured device B");
+  await edit(component, rangeLabel, "4");
+  await button(component, "Capture labelled readings").click();
+  assert.equal(calls[1].device_id, deviceB);
+  assert.equal(calls[1].location_id, "Measured device B");
+  assert.deepEqual(calls[1].ranges, { [receiverA]: 4 });
+});
+
+for (const missing of ["device", "area"]) {
+  test(`fingerprint ${missing} loss retains identity and requires explicit reselection before training`, async () => {
+    const { server, deviceA, deviceB } = twoTargetState();
+    server.areas = [{ area_id: "roomA", name: "Room A" }, { area_id: "roomB", name: "Room B" }];
+    const calls = [];
+    const component = panel(async (method, path, payload) => {
+      if (method === "POST") calls.push(payload);
+      return structuredClone(server);
+    });
+    component._state = structuredClone(server); component._activeTab = 3; component._render();
+    const label = missing === "device" ? "Device" : "Independently known Home Assistant area";
+    const original = missing === "device" ? deviceA : "roomA";
+    const replacement = missing === "device" ? deviceB : "roomB";
+    const devices = server.snapshot.devices, areas = server.areas;
+    component._activeTab = 4; component._render();
+    if (missing === "device") server.snapshot.devices = { [deviceB]: devices[deviceB] };
+    else server.areas = [areas[1]];
+    await component.refresh();
+    component._activeTab = 3; component._render();
+    assert.match(field(component, label).textContent, /selection became unavailable/);
+    assert.notEqual(field(component, label).value, replacement);
+    assert.equal(button(component, "Train labelled sample").disabled, true);
+    assert.equal(button(component, "Clear device fingerprints").disabled, missing === "device");
+    button(component, "Train labelled sample").disabled = false;
+    await button(component, "Train labelled sample").click();
+    assert.equal(calls.length, 0);
+    server.snapshot.devices = devices; server.areas = areas;
+    await component.refresh();
+    assert.equal(button(component, "Train labelled sample").disabled, true, "reappearance does not confirm independent truth");
+    await edit(component, label, original, "change");
+    await button(component, "Train labelled sample").click();
+    assert.equal(calls[0].device_id, deviceA);
+    assert.equal(calls[0].location_id, "roomA");
+    await edit(component, label, replacement, "change");
+    await button(component, "Train labelled sample").click();
+    assert.equal(calls[1].device_id, missing === "device" ? deviceB : deviceA);
+    assert.equal(calls[1].location_id, missing === "area" ? "roomB" : "roomA");
+  });
+}
+
+test("a missing history device cannot silently widen recording to all devices", async () => {
+  const { server, deviceA, deviceB } = twoTargetState();
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") calls.push(payload);
+    return structuredClone(server);
+  });
+  component._state = structuredClone(server); component._activeTab = 2; component._render();
+  await edit(component, "Record device (or all tracked devices)", deviceA, "change");
+  const devices = server.snapshot.devices; server.snapshot.devices = {};
+  component._activeTab = 4; component._render(); await component.refresh();
+  component._activeTab = 2; component._render();
+  assert.match(field(component, "Record device (or all tracked devices)").textContent, /selection became unavailable/);
+  assert.notEqual(field(component, "Record device (or all tracked devices)").value, "");
+  assert.equal(button(component, "Start recording").disabled, true);
+  button(component, "Start recording").disabled = false; await button(component, "Start recording").click();
+  assert.equal(calls.length, 0);
+  server.snapshot.devices = devices; await component.refresh();
+  assert.equal(button(component, "Start recording").disabled, true);
+  await edit(component, "Record device (or all tracked devices)", deviceB, "change");
+  await button(component, "Start recording").click();
+  assert.deepEqual(calls[0].devices, [deviceB]);
+  await edit(component, "Record device (or all tracked devices)", "", "change");
+  await button(component, "Start recording").click();
+  assert.deepEqual(calls[1].devices, []);
+});
+
+for (const tab of [1, 2, 3]) {
+  test(`tab ${tab} keeps present targets on reorder and ignores detached mutation controls`, async () => {
+    const { server, deviceA, deviceB } = twoTargetState();
+    server.areas = [{ area_id: "roomA", name: "Room A" }, { area_id: "roomB", name: "Room B" }];
+    const calls = [];
+    const component = panel(async (method, path, payload) => {
+      if (method === "POST") calls.push(payload);
+      return structuredClone(server);
+    });
+    component._state = structuredClone(server); component._activeTab = tab; component._render();
+    const selector = tab === 2 ? "Record device (or all tracked devices)" : "Device";
+    if (tab === 2) await edit(component, selector, deviceA, "change");
+    const action = tab === 1 ? "Capture labelled readings" : tab === 2 ? "Start recording" : "Train labelled sample";
+    const detached = button(component, action);
+    server.snapshot.devices = { [deviceB]: server.snapshot.devices[deviceB], [deviceA]: server.snapshot.devices[deviceA] };
+    server.areas.reverse(); await component.refresh();
+    assert.equal(field(component, selector).value, deviceA);
+    if (tab === 3) assert.equal(field(component, "Independently known Home Assistant area").value, "roomA");
+    await edit(component, selector, deviceB, "change");
+    await detached.click();
+    assert.equal(calls.length, 0, "detached buttons do not mutate a prior target");
+  });
+}
+
+test("changing calibration devices clears truth for receivers missing from the current roster", async () => {
+  const { server, receiverA, deviceB } = twoTargetState();
+  const component = panel(async () => structuredClone(server));
+  component._state = structuredClone(server); component._activeTab = 1; component._render();
+  const rangeLabel = `Measured slant range to Synthetic receiver (${receiverA}) (m)`;
+  await edit(component, "Independent location label", "Measured prior device");
+  await edit(component, rangeLabel, "2.25");
+  const receiver = server.snapshot.scanners[receiverA]; delete server.snapshot.scanners[receiverA];
+  await component.refresh();
+  await edit(component, "Device", deviceB, "change");
+  server.snapshot.scanners[receiverA] = receiver; await component.refresh();
+  assert.equal(field(component, "Independent location label").value, "");
+  assert.equal(field(component, rangeLabel).value, "");
 });
 
 test("single-target map patches preserve concurrent edits to other receivers and public devices", async () => {
