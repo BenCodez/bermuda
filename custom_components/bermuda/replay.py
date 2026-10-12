@@ -28,7 +28,7 @@ def _fail(message: str) -> NoReturn:
 
 
 def _source_identity(identifier: str) -> str:
-    """Share replay clock state between MAC aliases while keeping opaque IDs exact."""
+    """Share internal source identity between MAC aliases while keeping opaque IDs exact."""
     canonical = identifier.lower()
     return receiver_value({canonical: canonical}, identifier, identifier)
 
@@ -468,20 +468,65 @@ class ShadowSession:
         if json_size(self._baseline) > MAX_IMPORT_BYTES:
             _fail("shadow baseline exceeds its byte budget")
         self._new: list[dict[str, Any]] = []
-        self._initial_sources = {
-            (row["device_id"], row["scanner_id"], row["stamp"]) for frame in frames for row in frame["observations"]
-        }
+        self._initial_sources = {self._source_key(row) for frame in frames for row in frame["observations"]}
+        self._initial_physical_sources = {self._physical_key(row) for frame in frames for row in frame["observations"]}
         self._new_keys: set[tuple[Any, ...]] = set()
+        self._physical_truths: dict[tuple[Any, ...], tuple[Any, ...]] = {}
         self._shadow_bytes = json_size(self._baseline)
         self._shadow_rows = sum(len(frame["observations"]) for frame in self._baseline)
 
     @staticmethod
-    def _source_keys(frames: list[dict[str, Any]]) -> set[tuple[Any, ...]]:
+    def _source_key(row: dict[str, Any], epoch: int | None = None) -> tuple[Any, ...]:
+        source = _source_identity(row["device_id"]), _source_identity(row["scanner_id"]), row["stamp"]
+        return (epoch, *source) if epoch is not None else source
+
+    @staticmethod
+    def _physical_key(row: dict[str, Any], epoch: int | None = None) -> tuple[Any, ...]:
+        source = (
+            _source_identity(row.get("source_id", row["device_id"])),
+            _source_identity(row["scanner_id"]),
+            row["stamp"],
+        )
+        return (epoch, *source) if epoch is not None else source
+
+    @classmethod
+    def _independent_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        physical = {}
+        for row in rows:
+            physical.setdefault(cls._physical_key(row, row["session_epoch"]), row)
+        return list(physical.values())
+
+    @classmethod
+    def _source_keys(cls, frames: list[dict[str, Any]]) -> set[tuple[Any, ...]]:
+        return {cls._source_key(row, frame["session_epoch"]) for frame in frames for row in frame["observations"]}
+
+    @staticmethod
+    def _source_truth(frame: dict[str, Any], row: dict[str, Any]) -> dict[str, Any] | None:
+        label = receiver_value({truth["device_id"]: truth for truth in frame["truth"]}, row["device_id"])
+        if label is None or receiver_value(label["ranges"], row["scanner_id"]) is None:
+            return None
         return {
-            (frame["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"])
-            for frame in frames
-            for row in frame["observations"]
+            **label,
+            "device_id": _source_identity(label["device_id"]),
+            "ranges": frozenset((_source_identity(scanner), distance) for scanner, distance in label["ranges"].items()),
         }
+
+    @classmethod
+    def _physical_truth(cls, frame: dict[str, Any], row: dict[str, Any]) -> tuple[Any, ...] | None:
+        """Compare a packet's range truth independently of its logical alias and capture time."""
+        label = cls._source_truth(frame, row)
+        if label is None:
+            return None
+        ranges = {distance for scanner, distance in label["ranges"] if scanner == _source_identity(row["scanner_id"])}
+        if len(ranges) != 1:
+            _fail("physical source observation already has different independent truth")
+        return (
+            label["location_id"],
+            ranges.pop(),
+            label["accuracy_m"],
+            label["source"],
+            label["independent"],
+        )
 
     @property
     def proposed_offsets(self) -> dict[str, float]:
@@ -518,29 +563,24 @@ class ShadowSession:
             frozen = validate_frame(frame, now=finite_number(frame.get("captured_at"), "captured_at", minimum=0))
             if frozen["model_version"] != self.model_version:
                 _fail("live model version changed during shadow collection")
-            labelled_pairs = {(truth["device_id"], scanner) for truth in frozen["truth"] for scanner in truth["ranges"]}
+            labelled_pairs = {
+                (_source_identity(truth["device_id"]), _source_identity(scanner))
+                for truth in frozen["truth"]
+                for scanner in truth["ranges"]
+            }
             relabelled_keys = {
-                (frozen["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"])
+                self._source_key(row, frozen["session_epoch"])
                 for row in frozen["observations"]
-                if (row["device_id"], row["scanner_id"]) in labelled_pairs
-                and (frozen["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]) in self._new_keys
+                if self._source_key(row)[:2] in labelled_pairs
+                and self._source_key(row, frozen["session_epoch"]) in self._new_keys
             }
             for old in self._new if relabelled_keys else ():
                 for row in old["observations"]:
-                    key = old["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]
+                    key = self._source_key(row, old["session_epoch"])
                     if key not in relabelled_keys:
                         continue
-                    previous_truth = next(
-                        (
-                            label
-                            for label in old["truth"]
-                            if label["device_id"] == row["device_id"] and row["scanner_id"] in label["ranges"]
-                        ),
-                        None,
-                    )
-                    incoming_truth = next(
-                        (label for label in frozen["truth"] if label["device_id"] == row["device_id"]), None
-                    )
+                    previous_truth = self._source_truth(old, row)
+                    incoming_truth = self._source_truth(frozen, row)
                     if previous_truth is not None:
                         if previous_truth != incoming_truth:
                             _fail("shadow source observation already has different independent truth")
@@ -548,32 +588,43 @@ class ShadowSession:
             rows = [
                 row
                 for row in frozen["observations"]
-                if (row["device_id"], row["scanner_id"], row["stamp"]) not in self._initial_sources
+                if self._source_key(row) not in self._initial_sources
+                and self._physical_key(row) not in self._initial_physical_sources
                 and (
-                    (frozen["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]) not in self._new_keys
-                    or (frozen["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]) in relabelled_keys
+                    self._source_key(row, frozen["session_epoch"]) not in self._new_keys
+                    or self._source_key(row, frozen["session_epoch"]) in relabelled_keys
                 )
             ]
             if not rows:
                 return 0
             frozen["observations"] = rows
-            pairs = {(row["device_id"], row["scanner_id"]) for row in rows}
+            pairs = {self._source_key(row)[:2] for row in rows}
             frozen["truth"] = [
                 truth
                 for truth in frozen["truth"]
-                if any((truth["device_id"], scanner) in pairs for scanner in truth["ranges"])
+                if any(
+                    (_source_identity(truth["device_id"]), _source_identity(scanner)) in pairs
+                    for scanner in truth["ranges"]
+                )
             ]
+            physical_truths = self._physical_truths.copy()
+            for row in rows:
+                label = self._physical_truth(frozen, row)
+                if label is None:
+                    continue
+                key = self._physical_key(row, frozen["session_epoch"])
+                previous_truth = physical_truths.get(key)
+                if previous_truth is not None and previous_truth != label:
+                    _fail("physical source observation already has different independent truth")
+                physical_truths[key] = label
             retained = self._new
             if relabelled_keys:
                 retained = []
                 for old in self._new:
                     remaining = []
                     for row in old["observations"]:
-                        if (old["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]) in relabelled_keys:
-                            if any(
-                                label["device_id"] == row["device_id"] and row["scanner_id"] in label["ranges"]
-                                for label in old["truth"]
-                            ):
+                        if self._source_key(row, old["session_epoch"]) in relabelled_keys:
+                            if self._source_truth(old, row) is not None:
                                 _fail("shadow source observation already has independent truth")
                         else:
                             remaining.append(row)
@@ -593,6 +644,7 @@ class ShadowSession:
             self._new = retained
             self._new.append(frozen)
             self._new_keys.update(self._source_keys([frozen]))
+            self._physical_truths = physical_truths
             self._shadow_rows = previous_rows + len(rows)
             self._shadow_bytes = previous_bytes + new_size
         except (ValueError, TypeError, KeyError, OverflowError) as err:
@@ -633,12 +685,12 @@ class ShadowSession:
         rows = [
             row
             for row in evaluated["report"]["observations"]
-            if (row["session_epoch"], row["device_id"], row["scanner_id"], row["stamp"]) in keys
-            and row["expected_distance"] is not None
+            if self._source_key(row, row["session_epoch"]) in keys and row["expected_distance"] is not None
         ]
-        if len(rows) < self.min_labelled_rows:
+        independent = self._independent_rows(rows)
+        if len(independent) < self.min_labelled_rows:
             reasons.append("insufficient new independently labelled observations")
-        locations = {row["location_id"] for row in rows}
+        locations = {row["location_id"] for row in independent}
         if len(locations) < self.min_locations:
             reasons.append("insufficient new independent location coverage")
         if any(row["candidate"] is None for row in rows):
@@ -656,6 +708,7 @@ class ShadowSession:
             if not receiver_value(scanners, scanner, False):
                 continue
             scanner_rows = [row for row in rows if receiver_value({scanner: True}, row["scanner_id"], False)]
+            scanner_rows = self._independent_rows(scanner_rows)
             if (
                 len(scanner_rows) < self.min_labelled_rows
                 or len({row["location_id"] for row in scanner_rows}) < self.min_locations
@@ -675,10 +728,8 @@ class ShadowSession:
         for device, groups in _device_locations(rows).items():
             if len(groups) < self.min_locations:
                 reasons.append(f"device {device} lacks independent location coverage")
-            if (
-                sum(metrics["current"]["count"] if metrics["current"] is not None else 0 for metrics in groups.values())
-                < self.min_labelled_rows
-            ):
+            device_rows = [row for row in rows if row["device_id"] == device]
+            if len(self._independent_rows(device_rows)) < self.min_labelled_rows:
                 reasons.append(f"device {device} lacks sufficient new labelled observations")
             for location, metrics in groups.items():
                 baseline, proposed = metrics["current"], metrics["candidate"]
@@ -725,7 +776,7 @@ class ShadowSession:
             "filter_modes": self.filter_modes,
             "new_data_range_metrics": comparison,
             "new_data_movement": new_movement,
-            "new_labelled_rows": len(rows),
+            "new_labelled_rows": len(independent),
             "new_locations": sorted(locations),
             "evaluation": evaluated,
         }

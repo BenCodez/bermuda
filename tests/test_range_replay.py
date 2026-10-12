@@ -353,6 +353,209 @@ def test_shadow_baseline_source_is_not_new_evidence_in_an_independent_recording_
     assert not shadow.promotion_check(current_model_version="model-1")["eligible"]
 
 
+@pytest.mark.parametrize("field", ["device_id", "scanner_id"])
+@pytest.mark.parametrize("identifier", ["aa:bb:cc:dd:ee:12", "Opaque:Source"])
+def test_shadow_baseline_alias_exclusion_preserves_opaque_case_and_accepts_fresh_stamps(field, identifier):
+    initial = frames(count=1)
+    initial[0]["session_epoch"] = 2
+    row = initial[0]["observations"][0]
+    row[field] = identifier.upper()
+    initial[0]["truth"][0].update(device_id=row["device_id"], ranges={row["scanner_id"]: 2})
+    original = deepcopy(initial)
+    shadow = ShadowSession(initial, model_version="model-1", proposed_offsets={row["scanner_id"]: 6})
+    cached = deepcopy(initial[0])
+    cached["session_epoch"] = 1
+    cached["observations"][0][field] = identifier
+    cached_row = cached["observations"][0]
+    cached["truth"][0].update(device_id=cached_row["device_id"], ranges={cached_row["scanner_id"]: 2})
+    is_mac = identifier.startswith("aa:")
+    assert shadow.add_frame(cached) == (0 if is_mac else 1)
+    assert shadow.summary()["new_frames"] == (0 if is_mac else 1)
+    fresh = deepcopy(cached)
+    fresh["sequence"] += 1
+    fresh["captured_at"] += 1
+    fresh["observations"][0]["stamp"] += 1
+    fresh["observations"][0]["observed"] += 1
+    fresh["truth"][0]["observed"] += 1
+    assert shadow.add_frame(fresh) == 1
+    assert shadow.promotion_check(current_model_version="model-1")["new_labelled_rows"] == (1 if is_mac else 2)
+    assert initial == original
+
+
+@pytest.mark.parametrize("alias_field", ["device_id", "scanner_id"])
+def test_shadow_mac_alias_can_receive_truth_once_and_cannot_evade_conflicting_relabel_guard(alias_field):
+    captured = frames(count=1, labelled=False)[0]
+    row = captured["observations"][0]
+    row.update(device_id="aa:bb:cc:dd:ee:01", scanner_id="aa:bb:cc:dd:ee:12")
+    row[alias_field] = row[alias_field].upper()
+    original = deepcopy(captured)
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={row["scanner_id"]: 6})
+    assert shadow.add_frame(captured) == 1
+    labelled = deepcopy(captured)
+    labelled_row = labelled["observations"][0]
+    labelled_row[alias_field] = labelled_row[alias_field].lower()
+    labelled["truth"] = [{**truth(1000, device=labelled_row["device_id"]), "ranges": {labelled_row["scanner_id"]: 2}}]
+    assert shadow.add_frame(labelled) == 1
+    assert shadow.summary()["new_frames"] == 1
+    report = shadow.evaluate()["report"]
+    assert report["counts"]["observations"] == report["counts"]["labelled"] == 1
+    assert report["observations"][0][alias_field] == labelled_row[alias_field]
+    repeat = deepcopy(labelled)
+    repeat["observations"][0][alias_field] = row[alias_field]
+    repeat["truth"][0].update(device_id=row["device_id"], ranges={row["scanner_id"]: 2})
+    assert shadow.add_frame(repeat) == 0
+    assert shadow.state == "active"
+    repeat["truth"][0]["location_id"] = "different-site"
+    assert shadow.add_frame(repeat) == 0
+    assert shadow.state == "cancelled"
+    assert "different independent truth" in shadow.cancel_reason
+    assert captured == original
+
+
+def test_shadow_truth_pair_lookup_labels_mac_aliases_without_dropping_their_label():
+    captured = frames(count=1, labelled=False)[0]
+    row = captured["observations"][0]
+    device, scanner = "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:12"
+    row.update(device_id=device.upper(), scanner_id=scanner.upper())
+    captured["observations"].append({**deepcopy(row), "device_id": device, "scanner_id": scanner, "stamp": 1001})
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={scanner: 6})
+    assert shadow.add_frame(captured) == 2
+    labelled = deepcopy(captured)
+    labelled["truth"] = [{**truth(1000, device=device), "ranges": {scanner: 2}}]
+    assert shadow.add_frame(labelled) == 2
+    assert shadow.summary()["new_frames"] == 1
+    assert shadow.evaluate()["report"]["counts"]["labelled"] == 2
+
+
+@pytest.mark.parametrize("baseline_has_source", [False, True])
+def test_shadow_physical_source_alias_cannot_relabel_baseline_as_new_evidence(baseline_has_source):
+    source, meta = "aa:bb:cc:dd:ee:01", "ibeacon:physical-one"
+    captured = frames(count=3)
+    for index, frame in enumerate(captured):
+        distance = 2 if index == 0 else 2.2
+        frame["session_epoch"] = 2
+        row = frame["observations"][0]
+        row.update(device_id=meta, source_id=source.upper(), raw_distance=distance, filtered_distance=1)
+        row["rssi"] = -59 - 20 * math.log10(distance)
+        frame["observations"].append({**deepcopy(row), "scanner_id": "scanner-b"})
+        frame["truth"][0].update(device_id=meta, ranges={"scanner-a": distance, "scanner-b": distance})
+    baseline = deepcopy(captured[0])
+    baseline["session_epoch"] = 1
+    for row in baseline["observations"]:
+        row["device_id"] = source
+        if not baseline_has_source:
+            row.pop("source_id")
+    baseline["truth"][0]["device_id"] = source
+    original = deepcopy(captured)
+    shadow = ShadowSession([baseline], model_version="model-1", filter_modes={meta: "pet"})
+    assert shadow.add_frame(captured[0]) == 0
+    for frame in captured[1:]:
+        assert shadow.add_frame(frame) == 2
+    check = shadow.promotion_check(current_model_version="model-1")
+    assert not check["eligible"]
+    assert check["new_labelled_rows"] == 4
+    assert check["new_locations"] == ["site-b"]
+    fresh = deepcopy(captured[-1])
+    fresh["sequence"] += 1
+    fresh["captured_at"] += 1
+    fresh["truth"][0].update(location_id="another-fresh-site", observed=fresh["captured_at"])
+    for row in fresh["observations"]:
+        row["stamp"] += 1
+        row["observed"] += 1
+    assert shadow.add_frame(fresh) == 2
+    check = shadow.promotion_check(current_model_version="model-1")
+    assert check["eligible"], check["reasons"]
+    assert check["new_labelled_rows"] == 6
+    assert captured == original
+
+
+@pytest.mark.parametrize("source", ["aa:bb:cc:dd:ee:01", "Opaque:Source"])
+def test_shadow_physical_source_ids_share_only_valid_mac_case_aliases(source):
+    baseline = frames(count=1)[0]
+    baseline["observations"][0]["source_id"] = source
+    incoming = deepcopy(baseline)
+    incoming["session_epoch"] += 1
+    incoming["observations"][0].update(device_id="ibeacon:alias", source_id=source.upper())
+    incoming["truth"][0]["device_id"] = "ibeacon:alias"
+    shadow = ShadowSession([baseline], model_version="model-1", proposed_offsets={"scanner-a": 6})
+    assert shadow.add_frame(incoming) == (0 if source.startswith("aa:") else 1)
+    assert shadow.state == "active"
+
+
+def test_shadow_source_less_baseline_keeps_logical_exclusion_when_physical_identity_becomes_known():
+    baseline = frames(count=1)[0]
+    incoming = deepcopy(baseline)
+    incoming["session_epoch"] += 1
+    incoming["observations"][0]["source_id"] = "aa:bb:cc:dd:ee:01"
+    shadow = ShadowSession([baseline], model_version="model-1", proposed_offsets={"scanner-a": 6})
+    assert shadow.add_frame(incoming) == 0
+    assert shadow.summary()["new_frames"] == 0
+
+
+def test_shadow_logical_aliases_preserve_model_rows_without_multiplying_receiver_evidence():
+    captured = frames(count=6)
+    devices = ("ibeacon:first", "private:second", "beacon:third")
+    for index, frame in enumerate(captured):
+        original = frame["observations"][0]
+        original["scanner_id"] = "scanner-a" if index < 3 else "scanner-b"
+        frame["observations"] = [
+            {**deepcopy(original), "device_id": device, "source_id": "physical-one"} for device in devices
+        ]
+        frame["truth"] = [
+            {
+                **truth(frame["captured_at"], device=device, location="site-a" if index % 2 else "site-b"),
+                "ranges": {original["scanner_id"]: 2},
+            }
+            for device in devices
+        ]
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={"scanner-a": 6, "scanner-b": 6})
+    for frame in captured:
+        assert shadow.add_frame(frame) == 3
+    check = shadow.promotion_check(current_model_version="model-1")
+    assert check["new_data_range_metrics"]["current"]["count"] == 18
+    assert check["new_labelled_rows"] == 6
+    assert not check["eligible"]
+    assert all(
+        any(scanner in reason and "sufficient independent coverage" in reason for reason in check["reasons"])
+        for scanner in ("scanner-a", "scanner-b")
+    )
+
+
+@pytest.mark.parametrize("conflict", ["location", "range"])
+@pytest.mark.parametrize("same_frame", [False, True])
+def test_shadow_physical_packet_cannot_have_conflicting_truth_through_logical_aliases(conflict, same_frame):
+    captured = frames(count=1)[0]
+    row = captured["observations"][0]
+    row["source_id"] = "aa:bb:cc:dd:ee:01"
+    alias = {**deepcopy(row), "device_id": "ibeacon:alias", "source_id": row["source_id"].upper()}
+    label = {**deepcopy(captured["truth"][0]), "device_id": alias["device_id"]}
+    if conflict == "location":
+        label["location_id"] = "different-site"
+    else:
+        label["ranges"]["scanner-a"] = 3
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={"scanner-a": 6})
+    if same_frame:
+        captured["observations"].append(alias)
+        captured["truth"].append(label)
+    else:
+        assert shadow.add_frame(captured) == 1
+        captured = {**captured, "observations": [alias], "truth": [label]}
+    assert shadow.add_frame(captured) == 0
+    assert shadow.state == "cancelled"
+    assert "physical source observation already has different independent truth" in shadow.cancel_reason
+
+
+@pytest.mark.parametrize("scanner", ["aa:bb:cc:dd:ee:12", "Opaque:Receiver"])
+def test_shadow_truth_ranges_cannot_conflict_for_valid_receiver_mac_aliases(scanner):
+    captured = frames(count=1)[0]
+    captured["observations"][0]["scanner_id"] = scanner
+    captured["truth"][0]["ranges"] = {scanner: 2, scanner.upper(): 3}
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={scanner: 6})
+    is_mac = scanner.startswith("aa:")
+    assert shadow.add_frame(captured) == (0 if is_mac else 1)
+    assert shadow.state == ("cancelled" if is_mac else "active")
+
+
 def test_missing_live_output_is_not_replaced_by_raw_range_or_promotable():
     captured = frames()
     for frame in captured:
