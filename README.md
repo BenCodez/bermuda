@@ -42,6 +42,7 @@ Your Bermuda configuration, devices and settings stay as they are.
 | A truncated iBeacon advert no longer creates a bogus `None_None_None` beacon | [#866](https://github.com/agittins/bermuda/pull/866) |
 | iBeacons nobody tracks are pruned once they go stale, instead of piling up forever | [#867](https://github.com/agittins/bermuda/pull/867) |
 | Deleting a tracked device stops tracking it (iBeacon ids were split at an underscore, and the device list re-enabled it every cycle) | [#868](https://github.com/agittins/bermuda/pull/868) |
+| Fewer recorder rows: Distance is republished only when it moves by max(0.2 m, 10%), and Floor no longer carries the area attributes | [#869](https://github.com/agittins/bermuda/pull/869) |
 
 Problems with this build: [this repository's issues](https://github.com/davidcoulson/bermuda-patched/issues). Everything else, including all the documentation below, is the original's.
 
