@@ -89,6 +89,17 @@ def _same_options(left: dict, right: dict) -> bool:
     return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(right, sort_keys=True, allow_nan=False)
 
 
+def _fixed_reference_profile(reference: dict, profile: dict) -> dict:
+    """Keep verification attached to the power supplied by the same source."""
+    return {
+        "reference_power": reference["reference_power"],
+        "reference_power_verified": (
+            False if "reference_power" in profile else reference.get("reference_power_verified", False)
+        ),
+        **profile,
+    }
+
+
 def _options_digest(options: dict, modified_at: str) -> str:
     value = {"options": options, "modified_at": modified_at}
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -191,11 +202,9 @@ class ToolkitManager:
             settings = deepcopy(settings)
             for device_id, reference in settings["fixed_references"].items():
                 if "reference_power" in reference:
-                    settings["beacon_profiles"][device_id] = {
-                        "reference_power": reference["reference_power"],
-                        "reference_power_verified": reference.get("reference_power_verified", False),
-                        **settings["beacon_profiles"].get(device_id, {}),
-                    }
+                    settings["beacon_profiles"][device_id] = _fixed_reference_profile(
+                        reference, settings["beacon_profiles"].get(device_id, {})
+                    )
         powers = {
             public_device_id(key): device.ref_power
             for key, device in self.coordinator.devices.items()
@@ -500,11 +509,7 @@ class ToolkitManager:
         if "reference_power" in fixed:
             settings = deepcopy(settings)
             existing = settings["beacon_profiles"].get(owner, {})
-            settings["beacon_profiles"][owner] = {
-                "reference_power": fixed["reference_power"],
-                "reference_power_verified": fixed.get("reference_power_verified", False),
-                **existing,
-            }
+            settings["beacon_profiles"][owner] = _fixed_reference_profile(fixed, existing)
         return effective_model(
             settings,
             advert.scanner_address,
@@ -1052,13 +1057,13 @@ class ToolkitManager:
         stored = options.setdefault(CONF_RSSI_OFFSETS, {})
         settings = _settings(options.get(OPTIONS_KEY))
         for key, value in offsets.items():
-            matches = [old for old in stored if old.lower() == key.lower()]
+            matches = [old for old in stored if receiver_value({key: True}, old, False)]
             for old in matches:
                 stored[old] = value
             if not matches:
                 stored[key] = value
             for old, profile in settings["receiver_profiles"].items():
-                if old.lower() == key.lower():
+                if receiver_value({key: True}, old, False):
                     profile.pop("rssi_offset", None)
         options[OPTIONS_KEY] = settings
         return options

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from custom_components.bermuda.const import CONF_RSSI_OFFSETS
+from custom_components.bermuda.bermuda_device import BermudaDevice
 from custom_components.bermuda.toolkit import OPTIONS_KEY
 
 from .test_toolkit_runtime import OFFLINE, SCANNER, _proposal, runtime
@@ -45,6 +46,36 @@ def assert_radio_matches(advert, baseline):
     current = radio(advert)
     for key in current:
         assert current[key] == pytest.approx(baseline[key])
+
+
+async def test_calibration_apply_and_rollback_preserve_case_distinct_opaque_receivers(runtime):
+    manager = runtime.manager
+    source, other = "receiver/case", "receiver/Case"
+    scanner = BermudaDevice(source, runtime.coordinator)
+    scanner._is_scanner = True
+    runtime.coordinator.devices[source] = scanner
+    runtime.coordinator.scanner_list_add(scanner)
+    options = deepcopy(dict(runtime.entry.options))
+    options[CONF_RSSI_OFFSETS].update({source: 2.0, other: 8.0})
+    options[OPTIONS_KEY] = {
+        **manager.settings,
+        "receiver_profiles": {
+            source: {"rssi_offset": 4.0, "notes": "Selected receiver"},
+            other: {"rssi_offset": 7.0, "notes": "Different opaque receiver"},
+        },
+    }
+    await manager._persist_options(options)
+    before_offsets = deepcopy(dict(runtime.entry.options[CONF_RSSI_OFFSETS]))
+    before_profiles = deepcopy(manager.settings["receiver_profiles"])
+    manager.proposal = _proposal(manager, {source: -2.0})
+    await manager.async_dispatch("calibration_apply", {})
+    assert runtime.entry.options[CONF_RSSI_OFFSETS][source] == -2.0
+    assert runtime.entry.options[CONF_RSSI_OFFSETS][other] == 8.0
+    assert manager.settings["receiver_profiles"][source] == {"notes": "Selected receiver"}
+    assert manager.settings["receiver_profiles"][other] == before_profiles[other]
+    await manager.async_dispatch("calibration_rollback", {})
+    assert runtime.entry.options[CONF_RSSI_OFFSETS] == before_offsets
+    assert manager.settings["receiver_profiles"] == before_profiles
 
 
 @pytest.mark.parametrize("prior_key", [SCANNER, SCANNER.upper()])

@@ -125,7 +125,9 @@ def record_scene(state, *, start, first_stamp, fresh=False):
             model = manager.effective_advert_model(state.advert, device_id=public_device_id(beacon))
             for packet in range(4):
                 captured = time.time() if fresh else start + sequence * 0.5
-                raw_distance = rssi_to_metres(physical_rssi + model["rssi_offset"], -55.0, 3.0)
+                raw_distance = rssi_to_metres(
+                    physical_rssi + model["rssi_offset"], model["reference_power"], model["attenuation"]
+                )
                 row = {
                     "device_id": public_device_id(beacon),
                     "scanner_id": SCANNER,
@@ -134,6 +136,7 @@ def record_scene(state, *, start, first_stamp, fresh=False):
                     "rssi": physical_rssi,
                     "rssi_offset": model["rssi_offset"],
                     "reference_power": model["reference_power"],
+                    "reference_power_verified": model["reference_power_verified"],
                     "attenuation": model["attenuation"],
                     "raw_distance": raw_distance,
                     "filtered_distance": raw_distance * 0.9,
@@ -201,6 +204,7 @@ async def test_automatic_trial_compares_saved_effective_baseline_and_rebases_liv
     assert manager.trial["previous_offsets"][SCANNER] == 5.0
     assert manager.trial["offsets"] == pytest.approx({SCANNER: 4.0})
     assert manager._current_offsets()[SCANNER] == pytest.approx(4.0)
+
     assert manager.effective_advert_model(advert)["rssi_offset"] == pytest.approx(4.0)
     assert manager.settings["receiver_profiles"][SCANNER.upper()] == {"manufacturer": "Receiver"}
     assert runtime.entry.options[CONF_RSSI_OFFSETS][SCANNER] == pytest.approx(4.0)
@@ -230,3 +234,83 @@ async def test_automatic_trial_compares_saved_effective_baseline_and_rebases_liv
     assert result["metrics"]["all"]["proposed_mae_m"] == pytest.approx(mean_distance * (1 - 10 ** (-1.0 / 30.0)))
     assert manager.trial["previous_offsets"][SCANNER] == 5.0
     assert manager._current_offsets()[SCANNER] == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    ("profile", "power", "verified"),
+    [
+        ({}, -55.0, True),
+        ({"manufacturer": "Metadata only"}, -55.0, True),
+        ({"reference_power": -55.0}, -55.0, False),
+        ({"reference_power": -59.0}, -59.0, False),
+        ({"reference_power": -59.0, "reference_power_verified": True}, -59.0, True),
+        ({"reference_power": -59.0, "reference_power_verified": False}, -59.0, False),
+    ],
+)
+async def test_fixed_power_verification_belongs_to_the_effective_power_source(runtime, profile, power, verified):
+    manager = runtime.manager
+    device = public_device_id(DEVICE)
+    settings = normalize_toolkit_settings(
+        {
+            "beacon_profiles": {device: profile},
+            "fixed_references": {
+                device: {
+                    "location_id": "measured-shelf",
+                    "ranges": {SCANNER: 2.0},
+                    "reference_power": -55.0,
+                    "reference_power_verified": True,
+                }
+            },
+        }
+    )
+    manager.settings = settings
+    original = deepcopy(settings)
+    model = manager.effective_advert_model(runtime.advert)
+    assert model["reference_power"] == power
+    assert model["reference_power_verified"] is verified
+    materialized = deepcopy(settings)
+    materialized["fixed_references"] = {}
+    materialized["beacon_profiles"][device] = {
+        **profile,
+        "reference_power": power,
+        "reference_power_verified": verified,
+    }
+    assert manager._version_for(settings, runtime.coordinator.options) == manager._version_for(
+        materialized, runtime.coordinator.options
+    )
+    assert settings == original
+
+
+async def test_unverified_profile_power_cannot_borrow_fixed_reference_trust_for_absolute_calibration(runtime):
+    manager = runtime.manager
+    second = BermudaDevice(SECOND, runtime.coordinator)
+    second.create_sensor = True
+    runtime.coordinator.devices[SECOND] = second
+    devices = [public_device_id(beacon) for beacon in (DEVICE, SECOND)]
+    await manager.async_dispatch(
+        "settings",
+        {
+            "settings": {
+                "auto_calibration": True,
+                "beacon_profiles": {device: {"reference_power": -59.0} for device in devices},
+                "fixed_references": {
+                    device: {
+                        "location_id": "measured-shelf",
+                        "ranges": {SCANNER: 2.0},
+                        "reference_power": -55.0,
+                        "reference_power_verified": True,
+                    }
+                    for device in devices
+                },
+            }
+        },
+    )
+    record_scene(runtime, start=time.time() - 20.0, first_stamp=80.0)
+    before = deepcopy(dict(runtime.entry.options[CONF_RSSI_OFFSETS]))
+    proposal = await manager.async_dispatch("calibration_preview", {})
+    assert not proposal["eligible"], proposal
+    assert proposal["coverage"]["samples"] == 16
+    assert proposal["mode"] == "relative"
+    await manager._automatic(time.time())
+    assert manager.trial is None
+    assert runtime.entry.options[CONF_RSSI_OFFSETS] == before
