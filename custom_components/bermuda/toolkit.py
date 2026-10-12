@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from copy import deepcopy
 from functools import partial
@@ -23,6 +24,7 @@ from .const import (
     CONF_RSSI_OFFSETS,
     DEFAULT_ATTENUATION,
     DEFAULT_REF_POWER,
+    DISTANCE_INFINITE,
     DOMAIN,
 )
 from .fingerprints import FingerprintModel
@@ -31,6 +33,7 @@ from .recording import DiagnosticHistory, validate_truth
 from .replay import ReplayEngine, ShadowSession
 from .signal_quality import FilterState
 from .toolkit_store import DurableToolkitStore
+from .util import rssi_to_metres
 
 OPTIONS_KEY = "measurement_toolkit"
 MAX_STATES = 4096
@@ -63,6 +66,20 @@ def _settings(value: Any) -> dict:
     return settings
 
 
+def _rebase_distance(distance: float | None, old_model: dict, new_model: dict) -> float | None:
+    """Project one stored distance through its equivalent RSSI without reseeding filters."""
+    if distance is None or distance == DISTANCE_INFINITE:
+        return distance
+    if not finite_number(distance) or distance <= 0:
+        return None
+    equivalent_rssi = (
+        old_model["reference_power"] - old_model["rssi_offset"] - 10.0 * old_model["attenuation"] * math.log10(distance)
+    )
+    return rssi_to_metres(
+        equivalent_rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
+    )
+
+
 class ToolkitManager:
     """Own runtime hooks, bounded workers, persisted controls and measured trials."""
 
@@ -79,6 +96,7 @@ class ToolkitManager:
         self._background: asyncio.Task | None = None
         self._action_task: asyncio.Task | None = None
         self._closed = False
+        self._available = True
         self._generation = 0
         self._version_cache: str | None = None
         self._boot_id: str | None = None
@@ -161,9 +179,11 @@ class ToolkitManager:
 
     async def async_load(self) -> None:
         """Load only validated bounded local state before scanner identity resolution."""
+        self._available = False
         self._boot_id = await self.hass.async_add_executor_job(_host_clock_id)
         saved = await self.store.async_load()
         if not isinstance(saved, dict):
+            self._available = True
             return
         identities = saved.get("identities", {})
         if isinstance(identities, dict) and len(identities) <= 128:
@@ -207,6 +227,7 @@ class ToolkitManager:
                 field == "last_data_id" and isinstance(value, str)
             ):
                 setattr(self, field, value)
+        self._available = True
 
     def _store_payload(
         self,
@@ -238,7 +259,8 @@ class ToolkitManager:
             await asyncio.shield(self._worker)
         async with self._lock:
             try:
-                await self.store.async_save(self._store_payload())
+                if self._available:
+                    await self.store.async_save(self._store_payload())
             finally:
                 self.history.stop()
                 if self.shadow:
@@ -394,13 +416,33 @@ class ToolkitManager:
         return distance / max(0.2, reliability) if finite_number(reliability) else distance
 
     def area_suggestion(self, device: Any) -> dict:
-        """Return independent advisory classification with explicit override enablement."""
-        return {
-            **deepcopy(
-                self._suggestions.get(public_device_id(device), {"accepted": False, "reasons": [{"code": "untrained"}]})
-            ),
-            "enabled": self.fingerprint_area_selection,
-        }
+        """Classify current source data even while the asynchronous recorder is busy."""
+        device_id = public_device_id(device)
+        epoch, nowstamp = time.time(), monotonic_time_coarse()
+        selected = {}
+        for advert in getattr(device, "adverts", {}).values():
+            scanner, stamp, rssi = advert.scanner_address, getattr(advert, "stamp", None), getattr(advert, "rssi", None)
+            if not finite_number(stamp) or not finite_number(rssi) or stamp <= 0:
+                continue
+            previous = selected.get(scanner)
+            if previous is not None and previous["stamp"] >= stamp:
+                continue
+            if scanner not in selected and len(selected) >= 128:
+                continue
+            age = nowstamp - stamp
+            selected[scanner] = {
+                "device_id": device_id,
+                "scanner_id": scanner,
+                "stamp": stamp,
+                "rssi": rssi,
+                "observed": epoch - age,
+                "age": age,
+                "status": "current" if age >= 0 else "stale",
+                "model_version": self.version(),
+            }
+        result = self.fingerprints.suggest(device_id, list(selected.values()), now=epoch)
+        self._suggestions[device_id] = result
+        return {**deepcopy(result), "enabled": self.fingerprint_area_selection}
 
     def _snapshot(self) -> dict:
         snapshot = async_get_advert_snapshot(self.hass, entry_id=self.entry.entry_id, include_empty=True)
@@ -418,6 +460,9 @@ class ToolkitManager:
 
     def _state(self) -> dict:
         snapshot = self._snapshot()
+        for device in self.coordinator.devices.values():
+            if getattr(device, "create_sensor", False):
+                self.area_suggestion(device)
         areas = [{"id": area.id, "name": area.name} for area in self.coordinator.ar.async_list_areas()]
         return {
             "snapshot": snapshot,
@@ -508,6 +553,26 @@ class ToolkitManager:
     def _adopt_settings(self, settings: dict, options: dict) -> None:
         previous = self.version()
         binding_changed = settings["scanner_bindings"] != self.settings["scanner_bindings"]
+        previous_filters = self.settings["filters"]
+        changed_filters = {
+            device_id
+            for device_id in previous_filters.keys() | settings["filters"].keys()
+            if previous_filters.get(device_id, "legacy") != settings["filters"].get(device_id, "legacy")
+        }
+        # Sources and metadevices can share the same advert object. Freeze its
+        # old radio model/output once before publishing any replacement settings.
+        adverts = {}
+        for device in self.coordinator.devices.values():
+            for advert in getattr(device, "adverts", {}).values():
+                if id(advert) not in adverts:
+                    adverts[id(advert)] = (
+                        advert,
+                        self._device_id(advert),
+                        self.effective_advert_model(advert),
+                        getattr(advert, "rssi_distance", None),
+                        list(getattr(advert, "hist_distance", [])),
+                        list(getattr(advert, "hist_distance_by_interval", [])),
+                    )
         self.settings = settings
         self.coordinator.options[OPTIONS_KEY] = settings
         self.coordinator.options[CONF_RSSI_OFFSETS] = deepcopy(options.get(CONF_RSSI_OFFSETS, {}))
@@ -519,18 +584,38 @@ class ToolkitManager:
         if changed:
             self.proposal = None
             self._proposal_rows = []
-            self._states.clear()
+            for key in list(self._states):
+                if key[0] in changed_filters:
+                    del self._states[key]
             self._quality.clear()
             self._suggestions.clear()
             if self.shadow:
                 self.shadow.cancel("live settings changed")
-            for device in self.coordinator.devices.values():
-                for advert in getattr(device, "adverts", {}).values():
-                    advert.conf_rssi_offset = receiver_value(
-                        options.get(CONF_RSSI_OFFSETS, {}), advert.scanner_address, 0
-                    )
+            radio_fields = ("reference_power", "attenuation", "rssi_offset")
+            for advert, device_id, old_model, filtered, raw_history, filtered_history in adverts.values():
+                advert.conf_rssi_offset = receiver_value(options.get(CONF_RSSI_OFFSETS, {}), advert.scanner_address, 0)
+                new_model = self.effective_advert_model(advert)
+                if any(old_model[field] != new_model[field] for field in radio_fields):
+                    # RSSI states are independent of the distance model. Preserve
+                    # accepted/candidate RSSI, cadence and source freshness while
+                    # reprojecting both raw and filtered distance histories.
                     if finite_number(getattr(advert, "rssi", None)):
-                        advert._update_raw_distance(reading_is_new=False)  # noqa: SLF001
+                        advert.rssi_distance_raw = rssi_to_metres(
+                            advert.rssi + new_model["rssi_offset"],
+                            new_model["reference_power"],
+                            new_model["attenuation"],
+                        )
+                    advert.rssi_distance = _rebase_distance(filtered, old_model, new_model)
+                    advert.hist_distance[:] = [_rebase_distance(value, old_model, new_model) for value in raw_history]
+                    advert.hist_distance_by_interval[:] = [
+                        _rebase_distance(value, old_model, new_model) for value in filtered_history
+                    ]
+                if device_id in changed_filters:
+                    # An explicit policy switch has a new pipeline, unlike a
+                    # radio correction. Await its normal source-age processing.
+                    advert.rssi_distance = None
+                    advert.hist_distance_by_interval.clear()
+                    advert.hist_velocity.clear()
         # Manual scanner mappings affect association only; source keys and historic UIDs survive.
         if binding_changed:
             for scanner in self.coordinator.get_scanners:
@@ -807,8 +892,8 @@ class ToolkitManager:
 
     async def _async_dispatch(self, action: str, payload: dict) -> dict:  # noqa: C901, PLR0911
         """Execute entry-scoped actions; the transport/service verifies administrator access."""
-        if self._closed:
-            msg = "The Bermuda entry is unloading"
+        if self._closed or not self._available:
+            msg = "The Bermuda entry is loading or unloading"
             raise RuntimeError(msg)
         if not isinstance(payload, dict):
             msg = "Action payload must be an object"
@@ -1000,7 +1085,7 @@ class ToolkitManager:
         self._perf["last_update_s"] = duration_s
         self._perf["max_update_s"] = max(self._perf["max_update_s"], duration_s)
         self._version_cache = None
-        if self._closed:
+        if self._closed or not self._available:
             return
         if self._background and not self._background.done():
             self._perf["background_skipped"] += 1
@@ -1011,7 +1096,7 @@ class ToolkitManager:
         """Record real fresh source data; inferred dog locations never become truth."""
         try:
             async with self._lock:
-                if self._closed:
+                if self._closed or not self._available:
                     return
                 snapshot = self._snapshot()
                 rows = [

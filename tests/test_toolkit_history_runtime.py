@@ -38,6 +38,7 @@ async def runtime(hass, monkeypatch):
     advert.rssi_distance_raw = advert.rssi_distance = 4.0
     advert.rssi = -59 - 20 * math.log10(4)
     advert.conf_rssi_offset = 0.0
+    advert.hist_distance_by_interval = []
     manager = coordinator.toolkit = ToolkitManager(coordinator)
     clock = {"utc": time.time() - 10, "stamp": 100.0}
 

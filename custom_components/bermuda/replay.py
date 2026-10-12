@@ -231,24 +231,35 @@ class ReplayEngine:
                     )
                 clocks[stream] = {"stamp": observation["stamp"], "observed": observation["observed"], "origin": origin}
                 candidate_offset = offsets.get(observation["scanner_id"], observation["rssi_offset"])
-                candidate = observation["raw_distance"] * 10 ** (
+                offset_scale = 10 ** (
                     (observation["rssi_offset"] - candidate_offset) / (10 * observation["attenuation"])
                 )
-                finite_number(candidate, "candidate distance", minimum=0)
-                if candidate > 1e6:
+                raw_candidate = observation["raw_distance"] * offset_scale
+                finite_number(raw_candidate, "candidate raw distance", minimum=0)
+                if raw_candidate > 1e6:
                     _fail("candidate range exceeds the diagnostic model bound")
                 mode = modes.get(observation["device_id"])
-                if mode == "legacy":
-                    # The production legacy distance histories are already frozen
-                    # in current output. Do not claim to reconstruct their state.
-                    if observation["filtered_distance"] is not None:
-                        candidate = observation["filtered_distance"] * 10 ** (
-                            (observation["rssi_offset"] - candidate_offset) / (10 * observation["attenuation"])
-                        )
-                    else:
-                        candidate = None
-                elif mode is not None:
-                    state = filter_states.setdefault(stream, FilterState(mode))
+                current_mode = observation["quality"].get("mode", "legacy")
+                pipeline = "preserved_live_filter"
+                unavailable_reason = "frozen live filtered distance is unavailable"
+                # An offset-only candidate keeps the actual live filter pipeline.
+                # Re-seeding even the same mode would change its captured state
+                # and could manufacture improvement over the real current output.
+                candidate = (
+                    observation["filtered_distance"] * offset_scale
+                    if observation["filtered_distance"] is not None
+                    else None
+                )
+                if mode == "legacy" and mode != current_mode:
+                    # Frozen pet/stationary output cannot reconstruct the stock
+                    # legacy histories needed by an explicit pipeline switch.
+                    candidate = None
+                    pipeline = "unavailable_legacy_history"
+                    unavailable_reason = "legacy filter history cannot be reconstructed from this recording"
+                elif mode is not None and mode != current_mode:
+                    state = filter_states.get(stream)
+                    if state is None:
+                        state = filter_states[stream] = FilterState(mode)
                     result = state.process(
                         observation["rssi"],
                         normalized,
@@ -257,15 +268,18 @@ class ReplayEngine:
                     )
                     filtered_rssi = result["filtered_rssi"]
                     candidate = (
-                        candidate * 10 ** ((observation["rssi"] - filtered_rssi) / (10 * observation["attenuation"]))
+                        raw_candidate
+                        * 10 ** ((observation["rssi"] - filtered_rssi) / (10 * observation["attenuation"]))
                         if filtered_rssi is not None
                         else None
                     )
+                    pipeline = f"replayed_{mode}_filter"
+                    unavailable_reason = "candidate filter output is unavailable"
                 if callback is not None:
                     callback_row = deepcopy(observation)
                     callback_row.update(
                         {
-                            "candidate_raw_distance": candidate,
+                            "candidate_raw_distance": raw_candidate,
                             "candidate_rssi_offset": candidate_offset,
                             "session_epoch": frame["session_epoch"],
                         }
@@ -273,6 +287,8 @@ class ReplayEngine:
                     candidate = callback(callback_row, normalized)
                     if candidate is not None:
                         candidate = finite_number(candidate, "candidate filter distance", minimum=0)
+                    pipeline = "explicit_filter_callback"
+                    unavailable_reason = "candidate filter callback output is unavailable"
                 if candidate is not None:
                     candidate = finite_number(candidate, "candidate distance", minimum=0)
                     if candidate > 1e6:
@@ -294,6 +310,8 @@ class ReplayEngine:
                         "raw": observation["raw_distance"],
                         "current": observation["filtered_distance"],
                         "candidate": candidate,
+                        "candidate_pipeline": pipeline,
+                        "candidate_unavailable_reason": unavailable_reason if candidate is None else None,
                         "expected_distance": expected,
                         "location_id": truth["location_id"] if expected is not None else None,
                         "truth_source": truth["source"] if expected is not None else None,
@@ -613,7 +631,7 @@ class ShadowSession:
         current, candidate = comparison["current"], comparison["candidate"]
         if current is None or candidate is None:
             reasons.append("new labelled range metrics are unavailable")
-        elif candidate["mae_m"] > current["mae_m"] * (1 - self.min_relative_improvement):
+        elif current["mae_m"] <= 0 or candidate["mae_m"] > current["mae_m"] * (1 - self.min_relative_improvement):
             reasons.append("candidate does not meet the overall range improvement gate")
         for device, groups in _device_locations(rows).items():
             if len(groups) < self.min_locations:

@@ -27,7 +27,9 @@ def test_range_replay_raw_current_candidate_and_separate_labels():
     )
     assert report["range_metrics"]["raw"]["mae_m"] == 2
     assert report["range_metrics"]["current"]["mae_m"] < 2
-    assert report["range_metrics"]["candidate"]["mae_m"] < 1e-10
+    assert report["range_metrics"]["candidate"]["mae_m"] == pytest.approx(0.5 / 6)
+    assert report["observations"][0]["candidate"] == pytest.approx(1.5)
+    assert report["holdout"]["range_metrics"]["candidate"]["mae_m"] < 1e-10
     assert report["per_device"]["beacon-a"]["raw"]["count"] == 6
     assert report["per_location"]["site-a"]["raw"]["count"] == 3
     assert report["holdout"]["count"] == 3
@@ -152,6 +154,7 @@ def test_replay_rejects_invalid_candidate_offsets(value):
 def test_builtin_filters_have_fresh_independent_repeatable_state(mode):
     captured = frames(count=6)
     captured[3]["observations"][0]["rssi"] -= 20
+    captured[3]["observations"][0]["raw_distance"] *= 10
     first = ReplayEngine().evaluate(captured, filter_modes={"beacon-a": mode})
     second = ReplayEngine().evaluate(captured, filter_modes={"beacon-a": mode})
     assert first == second
@@ -234,3 +237,103 @@ def test_missing_live_output_is_not_replaced_by_raw_range_or_promotable():
     check = shadow.promotion_check(current_model_version="model-1")
     assert not check["eligible"]
     assert any("unavailable" in reason for reason in check["reasons"])
+
+
+@pytest.mark.parametrize("live_mode", [None, "legacy", "pet", "stationary"])
+@pytest.mark.parametrize("explicit_same_mode", [False, True])
+def test_shadow_zero_offset_cannot_promote_raw_accuracy_as_unchanged_live_filter_improvement(
+    live_mode, explicit_same_mode
+):
+    captured = frames(distance=10, expected=10)
+    for frame in captured:
+        row = frame["observations"][0]
+        row["filtered_distance"] = 6
+        if live_mode is not None:
+            row["quality"]["mode"] = live_mode
+    modes = {"beacon-a": live_mode or "legacy"} if explicit_same_mode else {}
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={"scanner-a": 0}, filter_modes=modes)
+    for frame in captured:
+        shadow.add_frame(frame)
+    check = shadow.promotion_check(current_model_version="model-1")
+    assert check["new_data_range_metrics"]["raw"]["mae_m"] == 0
+    assert check["new_data_range_metrics"]["current"]["mae_m"] == 4
+    assert check["new_data_range_metrics"]["candidate"]["mae_m"] == 4
+    assert not check["eligible"]
+    assert any("improvement" in reason for reason in check["reasons"])
+    assert all(
+        row["candidate_pipeline"] == "preserved_live_filter" for row in check["evaluation"]["report"]["observations"]
+    )
+
+
+@pytest.mark.parametrize("live_mode", ["legacy", "pet", "stationary"])
+@pytest.mark.parametrize("explicit_same_mode", [False, True])
+def test_changed_absolute_offset_scales_frozen_current_filter_output(live_mode, explicit_same_mode):
+    captured = frames(distance=10, expected=3)
+    for frame in captured:
+        row = frame["observations"][0]
+        row["filtered_distance"] = 6
+        row["rssi_offset"] = 4
+        row["quality"]["mode"] = live_mode
+    proposed = {"scanner-a": 4 + 20 * math.log10(2)}
+    modes = {"beacon-a": live_mode} if explicit_same_mode else {}
+    report = ReplayEngine().evaluate(captured, proposed_offsets=proposed, filter_modes=modes)
+    assert all(row["candidate"] == pytest.approx(3) and row["raw"] == 10 for row in report["observations"])
+    assert report["range_metrics"]["candidate"]["mae_m"] < 1e-10
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets=proposed, filter_modes=modes)
+    for frame in captured:
+        shadow.add_frame(frame)
+    assert shadow.promotion_check(current_model_version="model-1")["eligible"]
+
+
+@pytest.mark.parametrize("live_mode", ["pet", "stationary"])
+def test_switch_to_legacy_reports_unavailable_history_and_cannot_promote(live_mode):
+    captured = frames(distance=10, expected=10)
+    for frame in captured:
+        row = frame["observations"][0]
+        row["filtered_distance"] = 6
+        row["quality"]["mode"] = live_mode
+    report = ReplayEngine().evaluate(captured, filter_modes={"beacon-a": "legacy"})
+    assert report["range_metrics"]["candidate"] is None
+    assert all(
+        row["candidate"] is None
+        and row["candidate_pipeline"] == "unavailable_legacy_history"
+        and row["candidate_unavailable_reason"]
+        for row in report["observations"]
+    )
+    shadow = ShadowSession([], model_version="model-1", filter_modes={"beacon-a": "legacy"})
+    for frame in captured:
+        shadow.add_frame(frame)
+    assert not shadow.promotion_check(current_model_version="model-1")["eligible"]
+
+
+@pytest.mark.parametrize("candidate_mode", ["pet", "stationary"])
+def test_explicit_changed_filter_replays_actual_raw_rssi_pipeline(candidate_mode):
+    captured = frames(distance=4, expected=4)
+    spike = captured[3]["observations"][0]
+    spike["rssi"] -= 20
+    spike["raw_distance"] *= 10
+    report = ReplayEngine().evaluate(captured, filter_modes={"beacon-a": candidate_mode})
+    filtered_spike = report["observations"][3]
+    assert filtered_spike["raw"] == 40
+    assert filtered_spike["candidate"] == pytest.approx(4)
+    assert filtered_spike["candidate_pipeline"] == f"replayed_{candidate_mode}_filter"
+
+
+def test_explicit_callback_always_receives_raw_candidate_instead_of_preserved_filtered_candidate():
+    captured = frames(distance=10, expected=5)
+    for frame in captured:
+        frame["observations"][0]["filtered_distance"] = 6
+    report = ReplayEngine().evaluate(
+        captured,
+        proposed_offsets={"scanner-a": 20 * math.log10(2)},
+        filter_callback=lambda row, elapsed: row["candidate_raw_distance"],
+    )
+    assert all(row["candidate"] == pytest.approx(5) for row in report["observations"])
+    assert all(row["candidate_pipeline"] == "explicit_filter_callback" for row in report["observations"])
+
+
+def test_unchanged_perfect_current_pipeline_has_no_range_improvement_to_promote():
+    shadow = ShadowSession([], model_version="model-1", proposed_offsets={"scanner-a": 0})
+    for frame in frames(distance=2, expected=2):
+        shadow.add_frame(frame)
+    assert not shadow.promotion_check(current_model_version="model-1")["eligible"]
