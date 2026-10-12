@@ -60,7 +60,7 @@ The HACS repository/package selection changes; Home Assistant's integration conf
 | Deleting a tracked device stops tracking it (iBeacon ids were split at an underscore, and the device list re-enabled it every cycle) | [#868](https://github.com/agittins/bermuda/pull/868) |
 | Fewer recorder rows: Distance is republished only when it moves by max(0.2 m, 10%), and Floor no longer carries the area attributes | [#869](https://github.com/agittins/bermuda/pull/869) |
 
-The fixes above come from the patched baseline and credited upstream pull requests. They are separate from this fork's twelve toolkit additions; their inclusion does not imply an official upstream release. Report fork-specific problems in [BenCodez/bermuda issues](https://github.com/BenCodez/bermuda/issues).
+The fixes above come from the patched baseline and credited upstream pull requests. They are separate from this fork's twelve toolkit additions; their inclusion does not imply an official upstream release. Report fork-specific problems in the relevant [BenCodez/bermuda pull-request discussion](https://github.com/BenCodez/bermuda/pulls); this fork currently has repository issues disabled.
 
 The following general Bermuda documentation and artwork are retained from upstream. The upstream wiki explains shared tracking setup; the [measurement toolkit guide](docs/measurement-toolkit.md) describes this fork's additions.
 
