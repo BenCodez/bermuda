@@ -492,6 +492,107 @@ test("new measured captures gate a previous proposal until another preview compl
   assert.equal(button(component, "Apply accepted proposal").disabled, false);
 });
 
+const proposalInvalidatingControls = [
+  ["history_start", "Start recording", "History & replay"],
+  ["history_stop", "Stop recording", "History & replay"],
+  ["history_clear", "Clear history", "History & replay"],
+  ["history_import", "Import recording", "History & replay"],
+  ["settings", "Save runtime settings", "Settings"],
+  ["profile", "Save profile", "Settings"],
+  ["calibration_apply", "Apply accepted proposal", "Calibration"],
+  ["calibration_rollback", "Rollback calibration", "Calibration"],
+  ["capture", "Capture labelled readings", "Calibration"],
+];
+
+for (const [action, label, tab] of proposalInvalidatingControls) {
+  for (const source of ["cached", "state-only"]) {
+    for (const outcome of ["refreshed", "refresh-failed", "post-failed"]) {
+      test(`${action} ${outcome} keeps the ${source} proposal consistent with the acknowledged action`, async () => {
+        const oldProposal = { proposal_id: "prior-verified-proposal", eligible: true };
+        const freshProposal = { proposal_id: "fresh-verified-proposal", eligible: true };
+        const server = state();
+        server.diagnostics = { model_version: "unchanged-model" };
+        server.calibration = { proposal: oldProposal, unrelated_metadata: "preserved" };
+        server.options.receiver_profiles = { receiver1: { model: "old metadata", rssi_offset: 5 } };
+        const requests = [];
+        let gets = 0;
+        const component = panel(async (method, path, payload) => {
+          if (method === "GET") {
+            gets += 1;
+            if (outcome === "refresh-failed") throw new Error("Synthetic trailing refresh failure");
+            return structuredClone(server);
+          }
+          requests.push(payload);
+          if (payload.action === action && outcome === "post-failed") throw new Error("Synthetic POST failure");
+          if (payload.action === "calibration_preview") {
+            server.calibration.proposal = freshProposal;
+            return { proposal: structuredClone(freshProposal) };
+          }
+          if (payload.action === "calibration_apply") {
+            assert.equal(payload.proposal_id, server.calibration.proposal?.proposal_id, "only the currently verified server proposal can be applied");
+          }
+          server.calibration.proposal = null;
+          if (payload.action === "settings") {
+            server.options = { ...server.options, ...payload.settings };
+            return { options: structuredClone(server.options) };
+          }
+          if (payload.action === "profile") {
+            const profile = { ...server.options.receiver_profiles.receiver1, ...payload.profile };
+            server.options.receiver_profiles.receiver1 = profile;
+            return { profile: structuredClone(profile) };
+          }
+          return { completed: true };
+        });
+        component._state = structuredClone(server);
+        const stateProposal = component._state.calibration.proposal;
+        const cachedPreview = { proposal: structuredClone(oldProposal) };
+        if (source === "cached") component._results.calibration_preview = cachedPreview;
+        component._activeTab = 1; component._render();
+        assert.equal(button(component, "Apply accepted proposal").disabled, false);
+        await edit(component, "Independent location label", "Unsaved measured truth");
+        const truthRevision = component._draftVersions.get("capture-location");
+        await button(component, tab).click();
+        if (action === "history_import") {
+          const text = '{"schema_version":1,"frames":[]}';
+          field(component, "Import recording JSON (maximum 2 MiB)").files = [{ name: "recording.json", size: text.length, text: async () => text }];
+        } else if (action === "settings") await edit(component, "Enable automatic calibration", true);
+        else if (action === "profile") await edit(component, "model", "saved metadata");
+        else if (action === "capture") await edit(component, "Measured slant range to Receiver one (receiver1) (m)", "2.5");
+        await button(component, label).click();
+        assert.equal(requests[0].action, action);
+        assert.equal(component._state.diagnostics.model_version, "unchanged-model");
+        assert.equal(component._state.calibration.unrelated_metadata, "preserved");
+        assert.equal(component._drafts.get("capture-location"), "Unsaved measured truth");
+        assert.equal(component._draftVersions.get("capture-location"), truthRevision);
+        await button(component, "Calibration").click();
+        if (outcome === "post-failed") {
+          assert.equal(gets, 0);
+          assert.equal(component._message, "Synthetic POST failure");
+          assert.equal(component._state.calibration.proposal, stateProposal);
+          assert.equal(component._results.calibration_preview, source === "cached" ? cachedPreview : undefined);
+          assert.equal(button(component, "Apply accepted proposal").disabled, false, "failed mutation leaves the verified proposal available");
+          return;
+        }
+        assert.equal(gets, 1);
+        assert.equal(component._results.calibration_preview, undefined);
+        assert.equal(component._state.calibration.proposal, null, "the old state fallback is retired even when the refresh fails");
+        assert.equal(button(component, "Apply accepted proposal").disabled, true);
+        const requestCount = requests.length;
+        await button(component, "Apply accepted proposal").click();
+        assert.equal(requests.length, requestCount, "a disabled Apply control cannot submit the stale proposal");
+        if (action === "settings") assert.equal(component._options().auto_calibration, true, "options acknowledgement survives invalidation");
+        if (action === "profile") assert.equal(component._profile("receiver", "receiver1").model, "saved metadata", "profile acknowledgement survives invalidation");
+        if (outcome === "refresh-failed") assert.equal(component._message, "Synthetic trailing refresh failure");
+        await button(component, "Preview calibration").click();
+        assert.equal(button(component, "Apply accepted proposal").disabled, false, "a fresh accepted preview restores Apply");
+        await button(component, "Apply accepted proposal").click();
+        assert.equal(requests.at(-1).action, "calibration_apply");
+        assert.equal(requests.at(-1).proposal_id, "fresh-verified-proposal");
+      });
+    }
+  }
+}
+
 test("native textarea and selected-file restrictions hold across all tabs and import renders", async () => {
   assert.throws(() => { new Element("textarea").type = "text"; }, TypeError);
   const nativeFile = new Element("input"); nativeFile.type = "file";

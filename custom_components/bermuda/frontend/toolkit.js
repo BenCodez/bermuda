@@ -208,8 +208,11 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (action === "capture") this._captureNeedsPreview = true;
     if (action === "calibration_apply") delete this._results.calibration_rollback;
     if (action === "calibration_rollback") delete this._results.calibration_apply;
-    if (["settings", "profile", "calibration_apply", "calibration_rollback", "capture"].includes(action)) delete this._results.calibration_preview;
     if (["settings", "profile", "calibration_apply", "calibration_rollback", "capture", "history_start", "history_stop", "history_clear", "history_import"].includes(action)) {
+      delete this._results.calibration_preview;
+      if (this._state?.calibration) {
+        this._state = { ...this._state, calibration: { ...this._state.calibration, proposal: null } };
+      }
       delete this._results.replay;
       delete this._results.shadow_stop;
       delete this._results.shadow_promote;
