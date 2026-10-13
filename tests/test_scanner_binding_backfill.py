@@ -161,7 +161,8 @@ async def test_binding_backfills_only_after_durable_acceptance_and_repeated_save
     )
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        assert backfill.scanner.address_wifi_mac == NETWORK
+        assert backfill.scanner.address_wifi_mac is None
+        assert manager.settings["scanner_bindings"] == {}
         assert backfill.notices == []
         assert all(entity is None for entity in _ranges(backfill).values())
     finally:

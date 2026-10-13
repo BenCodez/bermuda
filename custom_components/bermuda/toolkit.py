@@ -837,39 +837,39 @@ class ToolkitManager:
             msg = "The Bermuda entry is unloading"
             raise RuntimeError(msg)
         self.hass.config_entries.async_update_entry(self.entry, options=options)
-        self._saved_options = deepcopy(options)
-        self._adopt_settings(settings, options)
-        if history is not None:
-            self.history = history
-        if replace_trial:
-            self.trial = deepcopy(trial)
-        self.last_applied, self.last_data_id = after["last_applied"], after["last_data_id"]
         accepted = {
             key: deepcopy(value) for key, value in journal.items() if key not in ("fallback", "previous_options")
         }
         accepted["phase"] = "accepted"
         accepted["desired_anchor"] = _options_digest(options, self.entry.modified_at.isoformat())
-        self._options_journal = accepted
+        # Keep the accepted live pipeline processing actual packets until the
+        # acknowledgement is durable. A provisional filter switch cannot be
+        # undone by options compensation after it has discarded its old state.
+        payload = self._store_payload(trial=trial, replace_trial=replace_trial, history=history)
+        payload.update(options_journal=accepted, last_applied=after["last_applied"], last_data_id=after["last_data_id"])
         try:
-            await self.store.async_save(self._store_payload())
+            await self.store.async_save(payload)
         except (OSError, asyncio.CancelledError):
             self._options_journal = deepcopy(journal)
             if _same_options(dict(self.entry.options), options):
                 self._options_journal["desired_anchor"] = _options_digest(options, self.entry.modified_at.isoformat())
                 self.hass.config_entries.async_update_entry(self.entry, options=baseline_options)
-                self._reconcile_options(baseline_options)
-                self.trial, self.last_applied, self.last_data_id = (
-                    before["trial"],
-                    before["last_applied"],
-                    before["last_data_id"],
-                )
-                if "history" in before:
-                    restored = DiagnosticHistory(window_s=self.settings["history_window_s"], max_bytes=HISTORY_BYTES)
-                    restored.import_data(before["history"], now=time.time(), resume=True)
-                    restored.restore_clocks(before["history_clocks"], now=time.time())
-                    restored.enabled = self.settings["history_enabled"]
-                    self.history = restored
             raise
+        self._options_journal = accepted
+        self._saved_options = deepcopy(options)
+        # HA can accept a later external edit while the Store awaits I/O. Adopt
+        # its actual current policy, without briefly resetting to the stale one.
+        # Keep _saved_options on the witnessed intent so its listener still
+        # records the later edit and requests any required legacy reload.
+        latest = deepcopy(dict(self.entry.options))
+        self._adopt_settings(settings if _same_options(latest, options) else _settings(latest.get(OPTIONS_KEY)), latest)
+        if history is not None:
+            history.reconfigure(window_s=self.settings["history_window_s"], now=time.time())
+            history.enabled = self.settings["history_enabled"]
+            self.history = history
+        if replace_trial:
+            self.trial = deepcopy(trial)
+        self.last_applied, self.last_data_id = after["last_applied"], after["last_data_id"]
         self._notify_scanner_binding_change(previous_bindings)
 
     def _notify_scanner_binding_change(self, previous_bindings: dict) -> None:
