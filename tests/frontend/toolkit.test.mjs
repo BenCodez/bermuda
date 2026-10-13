@@ -664,8 +664,11 @@ test("hardware detection is visible without becoming a saved manual override", (
   };
   component._render();
   assert.match(component.shadowRoot.textContent, /Detected: Reported maker · Reported board · ESP32 \(esphome\)/);
-  assert.equal(field(component, "model").value, "");
-  assert.equal(field(component, "manufacturer").value, "");
+  assert.equal(field(component, "model").value, "Reported board");
+  assert.equal(field(component, "manufacturer").value, "Reported maker");
+  assert.equal(field(component, "hardware type").value, "ESP32");
+  assert.equal(field(component, "model").getAttribute("aria-description"), "Detected hardware");
+  assert.equal(component._drafts.has("profile-model"), false);
   assert.equal(field(component, "Antenna placement").value, "");
   component._activeTab = 4;
   component._render();
@@ -750,7 +753,10 @@ test("legacy receiver offsets remain visible while profile fields inherit and cl
   });
   component._state = structuredClone(saved);
   component._render();
-  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "1.5");
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "-55");
+  assert.equal(field(component, "Path-loss exponent").value, "3");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").getAttribute("aria-description"), "Inherited from Calibration 2");
   assert.match(component.shadowRoot.textContent, /Effective receiver RSSI offset: 1.5 dB \(inherited from existing Calibration 2\)/);
   assert.match(component.shadowRoot.textContent, /Reference power: -55 dBm \(inherited global settings\)/);
   await edit(component, "Receiver RSSI offset (dB)", "4");
@@ -760,9 +766,62 @@ test("legacy receiver offsets remain visible while profile fields inherit and cl
   await edit(component, "Receiver RSSI offset (dB)", "");
   await button(component, "Save profile").click();
   assert.deepEqual(requests[1].remove, ["rssi_offset"]);
-  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "1.5");
   assert.match(component.shadowRoot.textContent, /Effective receiver RSSI offset: 1.5 dB \(inherited from existing Calibration 2\)/);
   assert.equal("rssi_offset" in saved.options.receiver_profiles.receiver1, false);
+});
+
+test("prefilled detection and radio values stay inherited through no-op and antenna-only saves", async () => {
+  const saved = state();
+  saved.snapshot.scanners.receiver1.hardware = { detected: { manufacturer: "Synthetic maker", model: "Synthetic board", hardware_type: "ESP32" }, provenance: "esphome" };
+  saved.receiver_models = { receiver1: { rssi_offset: -6, reference_power: -59, attenuation: 2.5,
+    inherited: { rssi_offset: -6, reference_power: -59, attenuation: 2.5 },
+    inherited_sources: { rssi_offset: "legacy_receiver_offset", reference_power: "global_default", attenuation: "global_default" } } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(saved);
+    calls.push(payload); saved.options.receiver_profiles = { receiver1: { ...payload.profile } };
+    return { profile: structuredClone(payload.profile) };
+  });
+  component._state = structuredClone(saved); component._render();
+  assert.equal(field(component, "model").value, "Synthetic board");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "-6");
+  await button(component, "Save profile").click(); assert.equal(calls.length, 0);
+  await edit(component, "Antenna placement", "true", "change"); await button(component, "Save profile").click();
+  assert.deepEqual(calls[0].profile, { external_antenna: true }); assert.deepEqual(calls[0].remove, []);
+  assert.deepEqual(saved.options.receiver_profiles.receiver1, { external_antenna: true });
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "-6");
+});
+
+for (const baselineAvailable of [true, false]) test(`clearing an override with a failed refresh uses ${baselineAvailable ? "the reported baseline" : "an unavailable state, not the removed offset"}`, async () => {
+  const saved = state(); saved.options.receiver_profiles = { receiver1: { rssi_offset: 4 } };
+  saved.receiver_models = { receiver1: { rssi_offset: 4, sources: { rssi_offset: "receiver_profile" },
+    ...(baselineAvailable ? { inherited: { rssi_offset: -9 }, inherited_sources: { rssi_offset: "legacy_receiver_offset" } } : {}) } };
+  const calls = []; const component = panel(async (method, path, payload) => {
+    if (method === "GET") throw new Error("Synthetic refresh failure");
+    calls.push(payload); return { profile: {} };
+  });
+  component._state = structuredClone(saved); component._render();
+  await edit(component, "Receiver RSSI offset (dB)", ""); await button(component, "Save profile").click();
+  assert.deepEqual(calls[0].profile, {}); assert.deepEqual(calls[0].remove, ["rssi_offset"]);
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, baselineAvailable ? "-9" : "");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").getAttribute("aria-description"), baselineAvailable ? "Inherited from Calibration 2" : "Refresh state for inherited value");
+});
+
+test("inherited zero, unsaved edits and target switches remain distinct", async () => {
+  const saved = state(); saved.snapshot.scanners.receiver2 = { scanner_id: "receiver2", name: "Other synthetic receiver" };
+  saved.receiver_models = { receiver1: { rssi_offset: -6, sources: { rssi_offset: "legacy_receiver_offset" } },
+    receiver2: { rssi_offset: 0, sources: { rssi_offset: "legacy_receiver_offset" } } };
+  const calls = []; const component = panel(async (method, path, payload) => { if (method === "GET") return structuredClone(saved); calls.push(payload); return { profile: payload.profile }; });
+  component._state = structuredClone(saved); component._render();
+  await edit(component, "Receiver RSSI offset (dB)", "0");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").getAttribute("aria-description"), "Unsaved profile edit");
+  await component.refresh(); assert.equal(field(component, "Receiver RSSI offset (dB)").value, "0");
+  await button(component, "Save profile").click(); assert.deepEqual(calls[0].profile, { rssi_offset: 0 });
+  await edit(component, "Profile target", "receiver2", "change");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "0");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").getAttribute("aria-description"), "Inherited from Calibration 2");
+  await button(component, "Save profile").click(); assert.equal(calls.length, 1);
 });
 
 test("role changes clear prior admin state and ignore an in-flight response", async () => {

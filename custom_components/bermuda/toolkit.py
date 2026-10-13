@@ -863,6 +863,14 @@ class ToolkitManager:
         for scanner_id in snapshot["scanners"]:
             profile = receiver_value(self.settings["receiver_profiles"], scanner_id, {})
             legacy_offset = receiver_value(legacy_offsets, scanner_id)
+            inherited = effective_model(
+                {"receiver_profiles": {}, "beacon_profiles": {}},
+                scanner_id,
+                "",
+                reference_power=options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+                attenuation=options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+                rssi_offset=legacy_offset if finite_number(legacy_offset) else 0.0,
+            )
             model = effective_model(
                 self.settings,
                 scanner_id,
@@ -877,7 +885,15 @@ class ToolkitManager:
             }
             if "rssi_offset" not in profile and finite_number(legacy_offset):
                 sources["rssi_offset"] = "legacy_receiver_offset"
-            result[scanner_id] = {**{field: model[field] for field in sources}, "sources": sources}
+            inherited_sources = dict.fromkeys(sources, "global_default")
+            if finite_number(legacy_offset):
+                inherited_sources["rssi_offset"] = "legacy_receiver_offset"
+            result[scanner_id] = {
+                **{field: model[field] for field in sources},
+                "sources": sources,
+                "inherited": {field: inherited[field] for field in sources},
+                "inherited_sources": inherited_sources,
+            }
         return result
 
     async def _run_worker(self, function: Any, *args: Any, **kwargs: Any) -> Any:

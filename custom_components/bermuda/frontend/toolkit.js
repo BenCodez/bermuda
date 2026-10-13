@@ -395,6 +395,11 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (options.required) input.required = true;
     if (options.placeholder) input.placeholder = options.placeholder;
     wrapper.append(input);
+    if (options.note) {
+      input.setAttribute("aria-label", label);
+      input.setAttribute("aria-description", options.note.textContent);
+      wrapper.append(options.note);
+    }
     parent.append(wrapper);
     return input;
   }
@@ -462,6 +467,24 @@ export class BermudaToolkitPanel extends HTMLElement {
     const entries = this._snapshot()[kind === "receiver" ? "scanners" : "devices"] || {};
     return entries[id]?.hardware || {};
   }
+  _profileField(kind, id, key) {
+    const profile = this._profile(kind, id);
+    if (Object.prototype.hasOwnProperty.call(profile, key)) return { value: profile[key], source: "Saved profile" };
+    if (["manufacturer", "model", "hardware_type"].includes(key)) {
+      const detected = this._hardware(kind, id).detected?.[key];
+      if (typeof detected === "string" && detected.trim()) return { value: detected, source: "Detected hardware" };
+    }
+    if (kind === "receiver" && ["rssi_offset", "reference_power", "attenuation"].includes(key)) {
+      const model = receiverValue(this._state?.receiver_models || {}, id, {});
+      const inherited = model.inherited?.[key];
+      const source = Number.isFinite(inherited) ? model.inherited_sources?.[key] : model.sources?.[key];
+      if (source === "receiver_profile") return { value: "", source: "Refresh state for inherited value" };
+      const value = Number.isFinite(inherited) ? inherited : model[key];
+      if (Number.isFinite(value)) return { value, source: source === "legacy_receiver_offset"
+        ? "Inherited from Calibration 2" : source === "global_default" ? "Inherited global setting" : "Effective receiver setting" };
+    }
+    return { value: "", source: "" };
+  }
   _hardwareLabel(hardware, field = "effective") {
     return [hardware[field]?.manufacturer, hardware[field]?.model, hardware[field]?.hardware_type].filter(Boolean).join(" · ") || "Unknown hardware";
   }
@@ -479,7 +502,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       header{justify-content:space-between}h1{font-size:1.6rem}h2{font-size:1.15rem}section{padding:16px;margin:16px 0;border:1px solid var(--divider-color,#aaa);border-radius:8px}
       button,input,select,textarea{font:inherit;color:inherit;background:var(--card-background-color,white);border:1px solid var(--divider-color,#888);border-radius:4px;padding:9px;box-sizing:border-box}
       button{cursor:pointer}button:disabled{opacity:.55;cursor:default}button[aria-selected=true]{border:2px solid var(--primary-color,#03a9f4)}
-      .field{display:flex;flex-direction:column;gap:5px;margin:12px 0;max-width:650px}.field:has(input[type=checkbox]){flex-direction:row;align-items:center}
+      .field{display:flex;flex-direction:column;gap:5px;margin:12px 0;max-width:650px}.field:has(input[type=checkbox]){flex-direction:row;align-items:center}.field small:empty{display:none}
       textarea{min-height:110px;width:100%}pre{overflow:auto;max-height:450px;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--secondary-background-color,#eee);padding:12px}
       table{border-collapse:collapse;width:100%}th,td{padding:8px;text-align:left;border-bottom:1px solid var(--divider-color,#aaa);overflow-wrap:anywhere}.table-wrap{overflow:auto}
       [role=status]{min-height:1.5em;margin:12px 0}p{line-height:1.5}input[type=checkbox]{width:20px;height:20px}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--primary-color,#03a9f4)}
@@ -556,7 +579,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
       return this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true });
     }, { disabled: !this._targetAvailable(device) });
-    const profiles = this._section(parent, "Hardware and radio profile", "Detected hardware comes from a proven Home Assistant registry binding or existing ESPHome information. Empty descriptive fields inherit detection. Physical antenna placement cannot be detected; choose Unknown, Internal or External. Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance.");
+    const profiles = this._section(parent, "Hardware and radio profile", "Fields show saved, detected or inherited values with their source. Save profile writes only fields you edit; clear and save a field to restore inheritance. Physical antenna placement cannot be detected; choose Unknown, Internal or External. Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
     const detectedHardware = node("p");
@@ -564,14 +587,17 @@ export class BermudaToolkitPanel extends HTMLElement {
     profiles.append(detectedHardware, currentRadio);
     const showHardware = () => {
       const hardware = this._hardware(kind.value, target.value);
-      detectedHardware.textContent = `Detected: ${this._hardwareLabel(hardware, "detected")} (${hardware.provenance || "unknown"}). Effective: ${this._hardwareLabel(hardware)}.`;
+      detectedHardware.textContent = `Detected: ${this._hardwareLabel(hardware, "detected")} (${hardware.provenance || "unknown"}).`;
       const model = receiverValue(this._state?.receiver_models || {}, target.value, {});
-      const source = key => model.sources?.[key] === "receiver_profile" ? "profile override" : key === "rssi_offset" && model.sources?.[key] === "legacy_receiver_offset" ? "inherited from existing Calibration 2" : key === "rssi_offset" ? "inherited default" : "inherited global settings";
-      const value = key => Number.isFinite(model[key]) ? model[key] : "unavailable";
-      currentRadio.textContent = kind.value === "receiver" ? `Effective receiver RSSI offset: ${value("rssi_offset")} dB (${source("rssi_offset")}). Reference power: ${value("reference_power")} dBm (${source("reference_power")}). Attenuation: ${value("attenuation")} (${source("attenuation")}). Blank numeric fields keep the inherited settings. Beacon-specific reference power may take precedence for individual readings.` : "";
+      const profile = this._profile(kind.value, target.value);
+      const source = key => Object.prototype.hasOwnProperty.call(profile, key) ? "profile override"
+        : key === "rssi_offset" && (model.inherited_sources?.[key] || model.sources?.[key]) === "legacy_receiver_offset" ? "inherited from existing Calibration 2" : key === "rssi_offset" ? "inherited default" : "inherited global settings";
+      const value = key => { const current = this._profileField(kind.value, target.value, key).value; return Number.isFinite(current) ? current : "unavailable"; };
+      currentRadio.textContent = kind.value === "receiver" ? `Effective receiver RSSI offset: ${value("rssi_offset")} dB (${source("rssi_offset")}). Reference power: ${value("reference_power")} dBm (${source("reference_power")}). Attenuation: ${value("attenuation")} (${source("attenuation")}). Beacon-specific reference power may take precedence for individual readings.` : "";
     };
     showHardware();
     const profileInputs = {};
+    const profileNotes = {};
     const profileKeys = ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"];
     const profileDrafts = [...profileKeys.map(key => `profile-${key}`), "profile-external_antenna", "profile-verified"];
     this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
@@ -579,7 +605,13 @@ export class BermudaToolkitPanel extends HTMLElement {
     const numericLabels = { height_m: "Receiver / beacon mounting height (m)", antenna_gain_dbi: "Antenna gain (dBi; metadata)", distance_accuracy_m: "Distance accuracy (m; metadata)", rssi_offset: "Receiver RSSI offset (dB)", reference_power: "Reference power at 1 m (dBm)", attenuation: "Path-loss exponent" };
     for (const key of profileKeys) {
       const numeric = ["height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"].includes(key);
-      profileInputs[key] = this._field(profiles, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, current[key] ?? "", { type: numeric ? "number" : "text", step: numeric ? .1 : undefined });
+      const display = this._profileField(kind.value, target.value, key);
+      profileNotes[key] = node("small", this._drafts.has(`profile-${key}`) ? "Unsaved profile edit" : display.source);
+      profileInputs[key] = this._field(profiles, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, display.value, { type: numeric ? "number" : "text", step: numeric ? .1 : undefined, note: profileNotes[key] });
+      for (const event of ["input", "change"]) profileInputs[key].addEventListener(event, () => {
+        profileNotes[key].textContent = "Unsaved profile edit";
+        profileInputs[key].setAttribute("aria-description", profileNotes[key].textContent);
+      });
     }
     profileInputs.external_antenna = this._select(profiles, "Antenna placement", "profile-external_antenna", [["", "Unknown"], ["false", "Internal"], ["true", "External"]], current.external_antenna === undefined ? "" : String(current.external_antenna));
     const verified = this._field(profiles, "Reference power independently verified", "profile-verified", current.reference_power_verified, { type: "checkbox" });
@@ -589,7 +621,14 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (parent !== this._content) return;
       this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
       const existing = this._profile(kind.value, target.value);
-      for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
+      for (const [key, input] of Object.entries(profileInputs)) {
+        const display = key === "external_antenna" ? { value: existing[key] ?? "", source: "" } : this._profileField(kind.value, target.value, key);
+        this._resetField(input, display.value);
+        if (profileNotes[key]) {
+          profileNotes[key].textContent = display.source;
+          input.setAttribute("aria-description", display.source);
+        }
+      }
       showHardware();
       this._resetField(verified, existing.reference_power_verified);
       configureKind();
