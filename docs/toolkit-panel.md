@@ -4,6 +4,10 @@ Home Assistant administrators can open **Bermuda toolkit** in the sidebar after 
 
 The **Settings** tab contains optional automatic calibration, reliability weighting, fingerprint area selection, device filter modes, and receiver distance limits. A receiver limit of `0` follows the existing global limit. Legacy filter mode keeps normal Bermuda behavior. Saving one receiver limit or filter patches that target only, preserving other targets' latest settings. Hardware and antenna details are descriptive metadata; only explicitly entered radio model parameters change range calculations. Clearing a beacon's reference-power override in the panel also clears its verification.
 
+**Hardware and radio profile** shows automatic hardware metadata from a proven registry binding or existing ESPHome information, followed by the effective description after manual overrides. Empty descriptive controls inherit detection. Physical antenna placement cannot be autodetected: choose **Unknown**, **Internal** or **External**. Unknown removes the optional `external_antenna` setting; Internal saves `false`, External saves `true`. No antenna choice changes ranging or radio corrections.
+
+The current receiver radio-model summary shows inherited **Calibration 2** offsets alongside effective reference power and attenuation. New override fields can remain blank while existing nonzero offsets are active. Existing settings stay saved where they were; they are not copied into profile fields. Enter an explicit receiver RSSI offset to override it, or clear and save that field to restore the inherited value.
+
 To restore an inherited profile model, clear the corresponding numeric field and save the profile. Empty metadata fields are removed too. The API accepts partial profile changes and an explicit removal list:
 
 ```json
@@ -25,4 +29,4 @@ Fixed reference JSON under **Settings** is an explicit, persistent label for fut
 
 **Fingerprints** trains the selected device in an independently known Home Assistant area chosen from the selector. Train several positions and times, waiting for new receiver packets after changing areas or clearing templates. Cached packets cannot count toward more than one room label for the same device. Results show missing coverage, ambiguity and unknown outcomes. Live area selection remains optional and requires a valid, confident result.
 
-**Health** shows receiver freshness and current observations, and loads or copies full diagnostics including quality and rejection reasons. Raw RSSI and raw distance remain distinct from filtered readings. Private key fields are excluded from toolkit responses.
+**Health** shows receiver hardware, antenna placement, hardware source, freshness and current observations, and loads or copies full diagnostics including quality and rejection reasons. Missing hardware information is shown as unknown. Raw RSSI and raw distance remain distinct from filtered readings. Private key fields are excluded from toolkit responses.

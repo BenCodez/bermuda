@@ -828,6 +828,7 @@ class ToolkitManager:
         return {
             "snapshot": snapshot,
             "options": deepcopy(self.settings),
+            "receiver_models": self._receiver_models(snapshot),
             "areas": areas,
             "calibration": {
                 "proposal": deepcopy(self.proposal),
@@ -844,12 +845,40 @@ class ToolkitManager:
                 "worker_busy": self._worker is not None,
                 "filter_states": len(self._states),
                 "history_persisted": True,
+                "scanner_hardware": {
+                    key: deepcopy(scanner["hardware"]) for key, scanner in snapshot["scanners"].items()
+                },
                 "notes": [
                     "Range error does not establish map position accuracy",
                     "Receiver health describes observations, not proxy connectivity",
                 ],
             },
         }
+
+    def _receiver_models(self, snapshot: dict) -> dict:
+        """Show inherited receiver settings without creating profile overrides."""
+        options = self.coordinator.options
+        legacy_offsets = options.get(CONF_RSSI_OFFSETS, {})
+        result = {}
+        for scanner_id in snapshot["scanners"]:
+            profile = receiver_value(self.settings["receiver_profiles"], scanner_id, {})
+            legacy_offset = receiver_value(legacy_offsets, scanner_id)
+            model = effective_model(
+                self.settings,
+                scanner_id,
+                "",
+                reference_power=options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+                attenuation=options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+                rssi_offset=legacy_offset if finite_number(legacy_offset) else 0.0,
+            )
+            sources = {
+                field: "receiver_profile" if field in profile else "global_default"
+                for field in ("rssi_offset", "reference_power", "attenuation")
+            }
+            if "rssi_offset" not in profile and finite_number(legacy_offset):
+                sources["rssi_offset"] = "legacy_receiver_offset"
+            result[scanner_id] = {**{field: model[field] for field in sources}, "sources": sources}
+        return result
 
     async def _run_worker(self, function: Any, *args: Any, **kwargs: Any) -> Any:
         """A cancelled request keeps the single executor slot until its work really ends."""

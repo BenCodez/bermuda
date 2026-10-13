@@ -34,6 +34,7 @@ from .const import (
     DISTANCE_TIMEOUT,
     DOMAIN,
 )
+from .hardware import hardware_metadata
 from .signal_quality import (
     SOURCE_CLOCK_TOLERANCE_S as SOURCE_CLOCK_TOLERANCE_S,  # noqa: PLC0414 - public compatibility re-export
 )
@@ -168,7 +169,7 @@ def async_get_coordinator(hass: HomeAssistant, entry_id: str | None = None) -> B
     return found
 
 
-def _scanner_metadata(scanner_id: str, scanner: Any, nowstamp: float) -> dict[str, Any]:
+def _scanner_metadata(coordinator: Any, scanner_id: str, scanner: Any, nowstamp: float) -> dict[str, Any]:
     name = _text(getattr(scanner, "name", None)) or scanner_id
     last_seen = _number(getattr(scanner, "last_seen", None))
     aliases = getattr(scanner, "metadevice_sources", None)
@@ -183,6 +184,7 @@ def _scanner_metadata(scanner_id: str, scanner: Any, nowstamp: float) -> dict[st
         "address_ble_mac": _text(getattr(scanner, "address_ble_mac", None)),
         "device_registry_id": _text(getattr(scanner, "entry_id", None)),
         "binding": _json_value(getattr(scanner, "scanner_binding", None)),
+        "hardware": hardware_metadata(coordinator, scanner),
         "source_aliases": [_text(alias) for alias in (aliases or [])[:MAX_ALIASES] if isinstance(alias, str)],
         "area_id": _text(getattr(scanner, "area_id", None)),
         "area_name": _text(getattr(scanner, "area_name", None)),
@@ -382,7 +384,7 @@ def async_get_advert_snapshot(
             continue
         if getattr(device, "is_scanner", False) is True:
             if len(roster) < MAX_SCANNERS:
-                roster[address] = _scanner_metadata(address, device, nowstamp)
+                roster[address] = _scanner_metadata(coordinator, address, device, nowstamp)
             else:
                 omitted["scanners"] += 1
         device_id = public_device_id(address)
@@ -422,7 +424,7 @@ def async_get_advert_snapshot(
                 omitted["observations"] += 1
                 continue
             scanner = registry.get(scanner_id) or getattr(advert, "scanner_device", None)
-            measurement = _scanner_metadata(scanner_id, scanner, nowstamp)
+            measurement = _scanner_metadata(coordinator, scanner_id, scanner, nowstamp)
             measurement.update(
                 _advert_measurement(
                     coordinator, address, scanner_id, advert, nowstamp, observed_now, include_history=include_history
@@ -447,6 +449,12 @@ def async_get_advert_snapshot(
                 ],
                 "tracked": tracked,
                 "address_type": _text(getattr(device, "address_type", None)),
+                "hardware": hardware_metadata(
+                    coordinator,
+                    device,
+                    kind="receiver" if getattr(device, "is_scanner", False) is True else "beacon",
+                    device_id=device_id,
+                ),
                 "area_id": _text(getattr(device, "area_id", None)),
                 "area_name": _text(getattr(device, "area_name", None)),
                 "scanners": scanners,

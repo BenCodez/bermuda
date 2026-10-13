@@ -101,7 +101,9 @@ def normalize_profile(value: Mapping, *, kind: str = "receiver") -> dict:
         msg = "kind must be receiver or beacon"
         raise ValueError(msg)
     profile = _mapping(value, "profile", 20)
-    allowed = _PROFILE_TEXT | _PROFILE_METADATA_NUMBERS | _PROFILE_MODEL_KEYS[kind] | {"antenna_gain_db"}
+    allowed = (
+        _PROFILE_TEXT | _PROFILE_METADATA_NUMBERS | _PROFILE_MODEL_KEYS[kind] | {"antenna_gain_db", "external_antenna"}
+    )
     if set(profile) - allowed:
         msg = f"Unsupported {kind} profile fields"
         raise ValueError(msg)
