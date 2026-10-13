@@ -4,6 +4,8 @@ This custom fork combines the 18 fixes inherited from [bermuda-patched](https://
 
 Install or replace the HACS package using the [README instructions](../README.md#install-this-fork-with-hacs). As an administrator, open `/bermuda-toolkit` on your Home Assistant server when needed; no toolkit sidebar item is added. Radio controls appear first, with optional settings under **Advanced** and descriptive profile fields under **Hardware details**. Its five tabs are **Settings**, **Calibration**, **History & replay**, **Fingerprints** and **Health**. The selected Bermuda configuration entry owns its settings and saved toolkit data. [Panel reference](toolkit-panel.md) describes the controls in more detail.
 
+The integration's **Configure** button under **Settings → Devices & services → Bermuda BLE Trilateration** opens the original options menu: **Global Options**, **Select Devices**, **Calibration 1: Global** and **Calibration 2: Scanner RSSI Offsets**. Use **Select Devices** to choose tracked Bluetooth devices and beacons. The direct-link toolkit adds profile and measurement tools alongside that menu.
+
 ## Defaults and compatibility
 
 | Setting | Default | Control |

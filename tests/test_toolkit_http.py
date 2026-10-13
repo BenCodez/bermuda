@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from homeassistant.setup import async_setup_component
 from homeassistant.components import frontend
+from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bermuda.toolkit_http import (
@@ -229,6 +230,7 @@ async def test_panel_static_http_and_services_register_once_and_survive_reload(h
     assert panel.require_admin is True
     assert panel.sidebar_title is None
     assert panel.sidebar_icon is None
+    assert panel.to_response()["config_panel_domain"] is None
     assert panel.config["entry_id"] == "synthetic-entry"
     assert panel.config["_panel_custom"]["module_url"] == "/bermuda_toolkit/toolkit.js"
     assert panel.config["_panel_custom"]["name"] == "bermuda-toolkit-panel"
@@ -240,7 +242,45 @@ async def test_panel_static_http_and_services_register_once_and_survive_reload(h
     await async_unregister_toolkit(hass, entry.entry_id)
     assert "bermuda-toolkit" not in hass.data[frontend.DATA_PANELS]
     await async_register_toolkit(hass, entry)
-    assert hass.data[frontend.DATA_PANELS]["bermuda-toolkit"].config["entry_id"] == entry.entry_id
+    reloaded_panel = hass.data[frontend.DATA_PANELS]["bermuda-toolkit"]
+    assert reloaded_panel.config["entry_id"] == entry.entry_id
+    assert reloaded_panel.to_response()["config_panel_domain"] is None
+
+
+@pytest.mark.parametrize(
+    ("step", "fields"),
+    [
+        (
+            "globalopts",
+            {
+                "max_area_radius",
+                "max_velocity",
+                "devtracker_nothome_timeout",
+                "update_interval",
+                "smoothing_samples",
+                "attenuation",
+                "ref_power",
+            },
+        ),
+        ("selectdevices", {"configured_devices"}),
+        ("calibration1_global", {"configured_devices", "configured_scanners", "attenuation", "ref_power"}),
+        ("calibration2_scanners", {"configured_devices", "scanner_info"}),
+    ],
+)
+async def test_toolkit_keeps_configure_on_original_options_forms(hass, setup_bermuda_entry, step, fields):
+    """The frontend can reach global, beacon and scanner controls while the toolkit is loaded."""
+    panel = hass.data[frontend.DATA_PANELS]["bermuda-toolkit"].to_response()
+    # HA's Configure button follows a panel claiming this integration domain.
+    assert panel["config_panel_domain"] is None
+    assert panel["title"] is None
+
+    menu = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert menu["type"] == FlowResultType.MENU
+    assert set(menu["menu_options"]) == {"globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"}
+    result = await hass.config_entries.options.async_configure(menu["flow_id"], user_input={"next_step_id": step})
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == step
+    assert fields <= {marker.schema for marker in result["data_schema"].schema}
 
 
 async def test_panel_moves_to_remaining_entry_and_retires_on_last_unload(hass):
@@ -250,7 +290,9 @@ async def test_panel_moves_to_remaining_entry_and_retires_on_last_unload(hass):
     await async_register_toolkit(hass, second)
     assert hass.data[frontend.DATA_PANELS]["bermuda-toolkit"].config["entry_id"] == "entry-a"
     await async_unregister_toolkit(hass, first.entry_id)
-    assert hass.data[frontend.DATA_PANELS]["bermuda-toolkit"].config["entry_id"] == "entry-b"
+    remaining_panel = hass.data[frontend.DATA_PANELS]["bermuda-toolkit"]
+    assert remaining_panel.config["entry_id"] == "entry-b"
+    assert remaining_panel.to_response()["config_panel_domain"] is None
     await async_unregister_toolkit(hass, second.entry_id)
     assert "bermuda-toolkit" not in hass.data[frontend.DATA_PANELS]
 
