@@ -52,7 +52,8 @@ If HACS shows a newer release but Home Assistant's **Settings → System → Upd
 does not, check **Settings → Devices & services → Entities**, filter by **HACS** and
 the `update` domain, and enable this repository's update entity if disabled. A
 manual file replacement does not register the fork with HACS or create its update
-entity. Keep your existing Bermuda integration configuration when switching packages.
+entity. If no update entity exists, reload the HACS integration or restart Home
+Assistant. Keep your existing Bermuda integration configuration when switching packages.
 
 For maintainers: publish a new, higher numeric version tag such as `v1.0.3`,
 targeting the commit containing the release workflow. Wait for the **Release**
