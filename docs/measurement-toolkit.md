@@ -36,6 +36,10 @@ observations = snapshot_observations(snapshot)
 
 Version 1 retains the earlier PR834-shaped fields and adds receiver/device identifiers, source aliases, raw RSSI in dBm, effective offset/reference power/attenuation, raw and filtered ranges in metres, packet age/status, quality and model version. Device keys are opaque: private BLE identities have stable public hashes, while iBeacon keys retain their supported identity. Friendly names and slugs are display fields.
 
+Scanner roster entries and per-device scanner measurements also expose `hardware`. Its `detected` map contains available `manufacturer`, `model` and `hardware_type`; its `effective` map applies explicit manual profile overrides and may include the boolean `external_antenna`. Absent fields mean unknown. `provenance` describes the automatic detection source: `home_assistant_device_registry`, `esphome` when existing ESPHome information contributes, or `unknown`. Manual descriptions do not change that source. The same shape appears on tracked devices when an exact public Bluetooth/MAC registry connection proves their identity; UUID/name/vendor guesses do not identify a physical beacon or collar.
+
+Hardware fields contain bounded descriptive text only. Bermuda does not expose arbitrary registry or ESPHome information, credentials, API keys or network addresses through this metadata, and it never opens an ESPHome API connection to detect hardware. Registry removal or rebinding clears old detected descriptions on the next snapshot.
+
 The snapshot separates capture UTC time, actual observation time and source monotonic stamps. Refreshing or publishing a snapshot never makes an old packet fresh. Raw evidence remains available when a receiver radius excludes it from area selection. Limits are 256 devices, 128 receivers and 4,096 observation pairs, with explicit omission counts. Optional recent API history contains at most five runtime samples per pair; it is not a frozen replay recording.
 
 ### 2. Reliable scanner matching and duplicate-name calibration selectors
@@ -68,7 +72,7 @@ Saving validates the association, durably records it, and schedules a normal rel
 
 ### 3. Scanner health, freshness and rejection reasons
 
-**Health → Scanner health and freshness** shows receivers, last packet age, area and binding. **Current device observations** and **Load full diagnostics** show source stamps, raw/last-valid timestamps, RSSI variability, estimated observed cadence and structured rejection reasons. [signal_quality.py](../custom_components/bermuda/signal_quality.py) and [api.py](../custom_components/bermuda/api.py) supply these fields.
+**Health → Scanner health and freshness** shows receivers, detected/effective hardware, antenna placement, hardware source, last packet age, area and binding. **Current device observations** and **Load full diagnostics** show source stamps, raw/last-valid timestamps, RSSI variability, estimated observed cadence and structured rejection reasons. [signal_quality.py](../custom_components/bermuda/signal_quality.py) and [api.py](../custom_components/bermuda/api.py) supply these fields.
 
 Duplicates and out-of-order stamps do not add measurements. A missing packet ages the last accepted value; a panel refresh does not fill the gap. Diagnostics can distinguish missing/stale data, an unconfirmed RSSI jump, source-clock issues, insufficient calibration coverage and rejected fingerprint matches. Cadence describes gaps between the actual observations Home Assistant received, not the beacon's guaranteed advertising interval. Receiver health describes observed Bluetooth activity, not proof of proxy network connectivity.
 
@@ -123,7 +127,13 @@ Replace placeholders with opaque IDs selected from the panel. Fixed labels asser
 
 Use **Settings → Hardware and radio profile** to select a receiver or beacon. [profiles.py](../custom_components/bermuda/profiles.py) validates the saved profile. Hardware type, manufacturer/model, antenna description, antenna gain in dBi, height and indoor/outdoor notes describe your installation. These descriptions do not invent gain corrections or infer a hardware model from a Bluetooth name.
 
+Bermuda automatically reads manufacturer/model from a securely matched Home Assistant registry device and fills missing fields from that device's already available ESPHome `device_info`. A reported ESPHome platform or explicit hardware type can supply `hardware_type`; a model or vendor alone does not imply one. A registry may report only a generic board model, so an exact physical product remains unknown unless it is actually reported. Legacy adjacent-MAC matching, friendly names and MAC vendor lookups cannot establish hardware identity. The panel shows automatic and effective descriptions separately; manual profile fields take precedence, and clearing a descriptive field resumes detection.
+
+**Antenna placement** is a manual **Unknown / Internal / External** choice. ESPHome firmware and Home Assistant metadata cannot establish whether an external antenna is physically connected. `external_antenna: true` means External, `false` means Internal, and an absent field means Unknown. Selecting Unknown removes the saved boolean. Existing free-text `antenna` descriptions remain supported. These settings persist through reload and never introduce an RSSI/gain correction or change calibration/model versions.
+
 Only explicit radio-model fields change ranging: `reference_power` (−120–0 dBm), `attenuation` (0.1–8) and receiver `rssi_offset` (−30–30 dB). A beacon profile's reference power takes precedence over a nonzero legacy per-device value, then receiver profile power, then global power. Receiver attenuation takes precedence over beacon attenuation, then global attenuation. Clear a numeric field and save to restore inheritance. Profiles accept at most 128 entries of each kind.
+
+The read-only receiver summary shows the current effective RSSI offset, reference power and attenuation and whether each comes from a profile override or existing settings. A blank RSSI offset field inherits the receiver's existing **Calibration 2** value; it does not mean the effective offset is zero. Existing offsets continue using their saved location and are not copied into new profile overrides. Clearing an override restores the original receiver offset. Receiver reference power in this summary can be superseded by beacon-specific power for an individual reading.
 
 ### 8. Receiver reliability and radius limits
 

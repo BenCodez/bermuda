@@ -458,6 +458,13 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (kind === "receiver") return receiverValue(profiles, id, {});
     return Object.prototype.hasOwnProperty.call(profiles, id) ? profiles[id] : {};
   }
+  _hardware(kind, id) {
+    const entries = this._snapshot()[kind === "receiver" ? "scanners" : "devices"] || {};
+    return entries[id]?.hardware || {};
+  }
+  _hardwareLabel(hardware, field = "effective") {
+    return [hardware[field]?.manufacturer, hardware[field]?.model, hardware[field]?.hardware_type].filter(Boolean).join(" · ") || "Unknown hardware";
+  }
   _snapshot() { return this._state?.snapshot || this._state?.advert_snapshot || this._state || {}; }
   _devices() { return rows(this._snapshot().devices).map(d => [d.device_id || d.id || d.address, `${d.name || d.id || d.address} (${d.device_id || d.id || d.address})`]); }
   _scanners() { return rows(this._snapshot().scanners).map(s => [s.scanner_id || s.id || s.address, `${s.name || s.id || s.address} (${s.scanner_id || s.id || s.address})`]); }
@@ -549,12 +556,24 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
       return this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true });
     }, { disabled: !this._targetAvailable(device) });
-    const profiles = this._section(parent, "Hardware and radio profile", "Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance. Leave a numeric field empty to inherit the existing model.");
+    const profiles = this._section(parent, "Hardware and radio profile", "Detected hardware comes from a proven Home Assistant registry binding or existing ESPHome information. Empty descriptive fields inherit detection. Physical antenna placement cannot be detected; choose Unknown, Internal or External. Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
+    const detectedHardware = node("p");
+    const currentRadio = node("p");
+    profiles.append(detectedHardware, currentRadio);
+    const showHardware = () => {
+      const hardware = this._hardware(kind.value, target.value);
+      detectedHardware.textContent = `Detected: ${this._hardwareLabel(hardware, "detected")} (${hardware.provenance || "unknown"}). Effective: ${this._hardwareLabel(hardware)}.`;
+      const model = receiverValue(this._state?.receiver_models || {}, target.value, {});
+      const source = key => model.sources?.[key] === "receiver_profile" ? "profile override" : key === "rssi_offset" && model.sources?.[key] === "legacy_receiver_offset" ? "inherited from existing Calibration 2" : key === "rssi_offset" ? "inherited default" : "inherited global settings";
+      const value = key => Number.isFinite(model[key]) ? model[key] : "unavailable";
+      currentRadio.textContent = kind.value === "receiver" ? `Effective receiver RSSI offset: ${value("rssi_offset")} dB (${source("rssi_offset")}). Reference power: ${value("reference_power")} dBm (${source("reference_power")}). Attenuation: ${value("attenuation")} (${source("attenuation")}). Blank numeric fields keep the inherited settings. Beacon-specific reference power may take precedence for individual readings.` : "";
+    };
+    showHardware();
     const profileInputs = {};
     const profileKeys = ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"];
-    const profileDrafts = [...profileKeys.map(key => `profile-${key}`), "profile-verified"];
+    const profileDrafts = [...profileKeys.map(key => `profile-${key}`), "profile-external_antenna", "profile-verified"];
     this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
     const current = this._profile(kind.value, target.value);
     const numericLabels = { height_m: "Receiver / beacon mounting height (m)", antenna_gain_dbi: "Antenna gain (dBi; metadata)", distance_accuracy_m: "Distance accuracy (m; metadata)", rssi_offset: "Receiver RSSI offset (dB)", reference_power: "Reference power at 1 m (dBm)", attenuation: "Path-loss exponent" };
@@ -562,6 +581,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       const numeric = ["height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"].includes(key);
       profileInputs[key] = this._field(profiles, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, current[key] ?? "", { type: numeric ? "number" : "text", step: numeric ? .1 : undefined });
     }
+    profileInputs.external_antenna = this._select(profiles, "Antenna placement", "profile-external_antenna", [["", "Unknown"], ["false", "Internal"], ["true", "External"]], current.external_antenna === undefined ? "" : String(current.external_antenna));
     const verified = this._field(profiles, "Reference power independently verified", "profile-verified", current.reference_power_verified, { type: "checkbox" });
     const configureKind = () => { profileInputs.rssi_offset.disabled = kind.value !== "receiver"; verified.disabled = kind.value !== "beacon"; };
     configureKind();
@@ -570,6 +590,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
       const existing = this._profile(kind.value, target.value);
       for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
+      showHardware();
       this._resetField(verified, existing.reference_power_verified);
       configureKind();
       profileSave.disabled = this._busy || this._fileBusy || !this._targetAvailable(target);
@@ -590,7 +611,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       for (const [key, input] of Object.entries(profileInputs)) {
         if (input.disabled || !this._drafts.has(input.dataset.draft)) continue;
         edited.push(input);
-        if (input.value.trim()) profile[key] = input.type === "number" ? finiteInput(input) : input.value;
+        if (input.value.trim()) profile[key] = key === "external_antenna" ? input.value === "true" : input.type === "number" ? finiteInput(input) : input.value;
         else remove.push(key);
       }
       if (!verified.disabled && this._drafts.has(verified.dataset.draft)) { profile.reference_power_verified = verified.checked; edited.push(verified); }
@@ -704,12 +725,14 @@ export class BermudaToolkitPanel extends HTMLElement {
     const health = this._section(parent, "Scanner health and freshness", "Observation age belongs to the source packet. Refreshing this panel does not make stale data fresh. Raw and filtered distance are separate measurements.");
     const table = node("table");
     const head = node("tr");
-    for (const title of ["Receiver", "Last packet age (s)", "Area", "Binding"]) head.append(node("th", title, { scope: "col" }));
+    for (const title of ["Receiver", "Hardware", "Antenna", "Hardware source", "Last packet age (s)", "Area", "Binding"]) head.append(node("th", title, { scope: "col" }));
     const thead = node("thead"); thead.append(head); table.append(thead);
     const body = node("tbody");
     for (const scanner of rows(this._snapshot().scanners)) {
       const tr = node("tr");
-      for (const value of [scanner.name || scanner.scanner_id || scanner.id, scanner.scanner_last_seen_age ?? scanner.age ?? "unavailable", scanner.area_name || scanner.area_id || "unassigned", scanner.binding ? pretty(scanner.binding) : "unavailable"]) tr.append(node("td", value));
+      const hardware = scanner.hardware || {};
+      const antenna = hardware.effective?.external_antenna;
+      for (const value of [scanner.name || scanner.scanner_id || scanner.id, this._hardwareLabel(hardware), antenna === true ? "External" : antenna === false ? "Internal" : "Unknown", hardware.provenance || "unknown", scanner.scanner_last_seen_age ?? scanner.age ?? "unavailable", scanner.area_name || scanner.area_id || "unassigned", scanner.binding ? pretty(scanner.binding) : "unavailable"]) tr.append(node("td", value));
       body.append(tr);
     }
     table.append(body);

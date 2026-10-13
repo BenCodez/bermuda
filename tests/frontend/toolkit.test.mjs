@@ -655,6 +655,116 @@ test("profile targets load their own drafts and beacon verification sends correc
   assert.equal(calls[0].remove.includes("rssi_offset"), false);
 });
 
+test("hardware detection is visible without becoming a saved manual override", () => {
+  const component = panel();
+  component._state.snapshot.scanners.receiver1.hardware = {
+    detected: { manufacturer: "Reported maker", model: "Reported board", hardware_type: "ESP32" },
+    effective: { manufacturer: "Reported maker", model: "Reported board", hardware_type: "ESP32", external_antenna: false },
+    provenance: "esphome",
+  };
+  component._render();
+  assert.match(component.shadowRoot.textContent, /Detected: Reported maker · Reported board · ESP32 \(esphome\)/);
+  assert.equal(field(component, "model").value, "");
+  assert.equal(field(component, "manufacturer").value, "");
+  assert.equal(field(component, "Antenna placement").value, "");
+  component._activeTab = 4;
+  component._render();
+  const table = component.shadowRoot.all().find(element => element.tagName === "tbody");
+  assert.match(table.textContent, /Reported maker · Reported board · ESP32/);
+  assert.match(table.textContent, /Internal/);
+  assert.match(table.textContent, /esphome/);
+  delete component._state.snapshot.scanners.receiver1.hardware;
+  component._render();
+  assert.match(component.shadowRoot.textContent, /Unknown hardware/);
+});
+
+test("tri-state antenna settings save booleans, reload, and clear without changing sibling profile fields", async () => {
+  const saved = state();
+  saved.options.receiver_profiles = { receiver1: { model: "Manual board", rssi_offset: 3 } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") {
+      calls.push(payload);
+      const profile = saved.options.receiver_profiles.receiver1;
+      Object.assign(profile, payload.profile);
+      for (const key of payload.remove) delete profile[key];
+      return { profile: structuredClone(profile) };
+    }
+    return structuredClone(saved);
+  });
+  component._state = structuredClone(saved);
+  component._render();
+  assert.equal(field(component, "Antenna placement").value, "");
+  for (const value of ["true", "false", ""]) {
+    await edit(component, "Antenna placement", value, "change");
+    await button(component, "Save profile").click();
+    const request = calls.at(-1);
+    assert.equal(field(component, "Antenna placement").value, value);
+    if (value === "") {
+      assert.deepEqual(request.profile, {});
+      assert.deepEqual(request.remove, ["external_antenna"]);
+      assert.equal("external_antenna" in saved.options.receiver_profiles.receiver1, false);
+    } else {
+      assert.deepEqual(request.profile, { external_antenna: value === "true" });
+      assert.deepEqual(request.remove, []);
+      assert.equal(saved.options.receiver_profiles.receiver1.external_antenna, value === "true");
+    }
+    assert.equal(saved.options.receiver_profiles.receiver1.model, "Manual board");
+    assert.equal(saved.options.receiver_profiles.receiver1.rssi_offset, 3);
+  }
+  const reloaded = panel();
+  reloaded._state = structuredClone(saved);
+  reloaded._render();
+  assert.equal(field(reloaded, "Antenna placement").value, "");
+});
+
+test("antenna selector reloads each target's manual choice and unknown does not become internal", async () => {
+  const component = panel();
+  component._state.snapshot.scanners.receiver2 = { scanner_id: "receiver2", name: "Receiver two" };
+  component._state.options.receiver_profiles = { receiver1: { external_antenna: true }, receiver2: { external_antenna: false } };
+  component._render();
+  assert.equal(field(component, "Antenna placement").value, "true");
+  await edit(component, "Profile target", "receiver2", "change");
+  assert.equal(field(component, "Antenna placement").value, "false");
+  await edit(component, "Profile type", "beacon", "change");
+  assert.equal(field(component, "Antenna placement").value, "");
+});
+
+test("legacy receiver offsets remain visible while profile fields inherit and clearing restores them", async () => {
+  const saved = state();
+  saved.options.receiver_profiles = { receiver1: {} };
+  saved.receiver_models = { receiver1: { rssi_offset: 1.5, reference_power: -55, attenuation: 3, sources: { rssi_offset: "legacy_receiver_offset", reference_power: "global_default", attenuation: "global_default" } } };
+  const requests = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "POST") {
+      requests.push(payload);
+      const profile = saved.options.receiver_profiles.receiver1;
+      Object.assign(profile, payload.profile);
+      for (const key of payload.remove) delete profile[key];
+      const model = saved.receiver_models.receiver1;
+      model.rssi_offset = profile.rssi_offset ?? 1.5;
+      model.sources.rssi_offset = profile.rssi_offset === undefined ? "legacy_receiver_offset" : "receiver_profile";
+      return { profile: structuredClone(profile) };
+    }
+    return structuredClone(saved);
+  });
+  component._state = structuredClone(saved);
+  component._render();
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "");
+  assert.match(component.shadowRoot.textContent, /Effective receiver RSSI offset: 1.5 dB \(inherited from existing Calibration 2\)/);
+  assert.match(component.shadowRoot.textContent, /Reference power: -55 dBm \(inherited global settings\)/);
+  await edit(component, "Receiver RSSI offset (dB)", "4");
+  await button(component, "Save profile").click();
+  assert.deepEqual(requests[0].profile, { rssi_offset: 4 });
+  assert.match(component.shadowRoot.textContent, /Effective receiver RSSI offset: 4 dB \(profile override\)/);
+  await edit(component, "Receiver RSSI offset (dB)", "");
+  await button(component, "Save profile").click();
+  assert.deepEqual(requests[1].remove, ["rssi_offset"]);
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "");
+  assert.match(component.shadowRoot.textContent, /Effective receiver RSSI offset: 1.5 dB \(inherited from existing Calibration 2\)/);
+  assert.equal("rssi_offset" in saved.options.receiver_profiles.receiver1, false);
+});
+
 test("role changes clear prior admin state and ignore an in-flight response", async () => {
   const loading = deferred();
   let posts = 0;
