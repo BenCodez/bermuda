@@ -232,6 +232,33 @@ async def test_unsupported_future_receiver_stays_ineligible_while_two_current_re
     assert _source_state(runtime) == before
 
 
+async def test_future_receiver_does_not_block_training_fresh_peers(trained_runtime):
+    runtime = trained_runtime
+    third_scanner = "aa:bb:cc:dd:ee:33"
+    _add_receiver(runtime.coordinator, runtime.device, third_scanner, runtime.clock.mono)
+    _deliver(runtime, 0.1)
+    bad_stamp = _deliver(runtime, "beyond_boundary", pattern={third_scanner: -70})
+    rows = snapshot_observations(_snapshot(runtime))
+    bad = next(row for row in rows if row["scanner_id"] == third_scanner)
+    assert bad["status"] == "stale" and bad["observed"] is None
+    assert len([row for row in rows if row["status"] == "current"]) == 2
+    before = _source_state(runtime)
+    area = runtime.coordinator.ar.async_create("Synthetic Healthy Training Room")
+    result = await runtime.manager.async_dispatch("fingerprint_train", {"device_id": DEVICE, "location_id": area.id})
+    assert result["accepted"] is True and result["added_samples"] == 1
+    assert "stale_receiver" in {reason["code"] for reason in result["reasons"]}
+    saved = next(
+        label for label in runtime.manager.fingerprints.export_state()["labels"] if label["location_id"] == area.id
+    )
+    assert third_scanner not in saved["frames"][0]["values"]
+    assert third_scanner not in saved["frames"][0]["stamps"]
+    repeated = await runtime.manager.async_dispatch("fingerprint_train", {"device_id": DEVICE, "location_id": area.id})
+    assert repeated["accepted"] is False
+    assert "insufficient_fresh_receivers" in {reason["code"] for reason in repeated["reasons"]}
+    assert runtime.device.get_scanner(third_scanner).stamp == bad_stamp
+    assert _source_state(runtime) == before
+
+
 @pytest.mark.parametrize("age", [-0.8, -0.1, 0, 1, 15, 121])
 def test_shared_source_age_normalization_keeps_supported_semantics(age):
     assert normalize_source_age(age) == max(0, age)

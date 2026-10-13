@@ -119,6 +119,11 @@ class FingerprintModel:
             if not isinstance(row, dict) or row.get("device_id") != device_id:
                 return None, [_reason("wrong_device")]
             scanner = row.get("scanner_id")
+            # Shared API rows retain unusable receivers for diagnostics, with
+            # unavailable measurement fields. They cannot invalidate fresh peers.
+            if _identifier(scanner) and row.get("status", "current") != "current":
+                reasons.append(_reason("stale_receiver", scanner_id=scanner))
+                continue
             rssi = _number(row.get("rssi"), -150.0, 20.0)
             stamp = _number(row.get("stamp"), 0.0, 1e12)
             epoch = _number(row.get("observed"), 0.0, 1e12)
@@ -135,7 +140,7 @@ class FingerprintModel:
                 return None, [_reason("invalid_observation")]
             supplied_age = row.get("age")
             age = _number(supplied_age, 0.0, 1e12) if supplied_age is not None else max(0.0, now - epoch)
-            if row.get("status", "current") != "current" or age is None or age > MAX_AGE_S:
+            if age is None or age > MAX_AGE_S:
                 reasons.append(_reason("stale_receiver", scanner_id=scanner))
                 continue
             if epoch > now + 0.05 or now - epoch > MAX_AGE_S:

@@ -293,6 +293,65 @@ def test_nonfinite_boolean_and_non_numeric_fields_rejected(field, invalid):
     assert model.export_state()["labels"] == []
 
 
+@pytest.mark.parametrize("status", ["stale", "missing"])
+def test_unusable_receiver_does_not_block_fresh_training_or_matching(status):
+    model = FingerprintModel()
+    assert train(model)["ready"]
+    assert train(model, "area:b", ROOM_B, start=10)["ready"]
+    rows = snapshot(20)
+    rows.append(
+        {
+            "device_id": DEVICE,
+            "scanner_id": "scanner:unavailable",
+            "status": status,
+            "rssi": None,
+            "stamp": None,
+            "observed": None,
+            "age": None,
+        }
+    )
+    original = copy.deepcopy(rows)
+    result = model.train(DEVICE, "area:a", rows, independent=True, now=1020)
+    assert result["accepted"] and result["ready"]
+    assert result["added_samples"] == 1
+    assert "stale_receiver" in codes(result)
+    frame = model.export_state()["labels"][0]["frames"][-1]
+    assert "scanner:unavailable" not in frame["values"]
+    assert "scanner:unavailable" not in frame["stamps"]
+    result = model.suggest(DEVICE, rows, now=1020)
+    assert result["accepted"] and result["suggested_area"] == "area:a"
+    assert "stale_receiver" in codes(result)
+    assert rows == original
+    repeated = model.train(DEVICE, "area:a", rows, independent=True, now=1020)
+    assert not repeated["accepted"]
+    assert "insufficient_fresh_receivers" in codes(repeated)
+
+
+@pytest.mark.parametrize("status", ["stale", "missing", "current"])
+def test_unusable_receiver_cannot_supply_required_coverage(status):
+    model = FingerprintModel()
+    rows = snapshot(1)
+    rows[1].update(status=status, observed=None, rssi=None, stamp=None, age=None)
+    result = model.train(DEVICE, "area:a", rows, independent=True, now=1001)
+    assert not result["accepted"]
+    assert model.export_state()["labels"] == []
+    assert not model.suggest(DEVICE, rows, now=1001)["accepted"]
+    expected = "invalid_observation" if status == "current" else "insufficient_receiver_coverage"
+    assert expected in codes(result)
+
+
+@pytest.mark.parametrize("field,value", [("device_id", "other-device"), ("scanner_id", None)])
+def test_discarded_receiver_still_requires_valid_source_identity(field, value):
+    model = FingerprintModel()
+    rows = snapshot(1)
+    unusable = {"device_id": DEVICE, "scanner_id": "scanner:unavailable", "status": "stale"}
+    unusable[field] = value
+    rows.append(unusable)
+    result = model.train(DEVICE, "area:a", rows, independent=True, now=1001)
+    assert not result["accepted"]
+    assert model.export_state()["labels"] == []
+
+
 def test_opaque_ids_retained_verbatim_and_input_observations_detached():
     opaque = "irk:key:aB+/=|iBeacon:any/identity"
     model = FingerprintModel()
