@@ -57,13 +57,11 @@ _PANEL_PATH = "bermuda-toolkit"
 
 
 async def _register_panel(hass: HomeAssistant, entry_id: str) -> None:
-    """Register one administrator sidebar panel bound to an explicit entry."""
+    """Register a direct-link administrator page without a sidebar item."""
     await panel_custom.async_register_panel(
         hass,
         frontend_url_path=_PANEL_PATH,
         webcomponent_name="bermuda-toolkit-panel",
-        sidebar_title="Bermuda toolkit",
-        sidebar_icon="mdi:bluetooth",
         module_url="/bermuda_toolkit/toolkit.js",
         config={"entry_id": entry_id},
         require_admin=True,
@@ -72,7 +70,7 @@ async def _register_panel(hass: HomeAssistant, entry_id: str) -> None:
 
 
 async def async_register_toolkit(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Register HTTP/static/services once, keeping a single admin panel across reloads."""
+    """Register HTTP/static/services once, keeping a direct-link admin page across reloads."""
     # Import here because the service schema shares this module's action allowlist.
     from .toolkit_services import async_register_toolkit_services  # noqa: PLC0415
 

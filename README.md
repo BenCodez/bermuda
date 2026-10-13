@@ -2,7 +2,7 @@
 
 This custom fork adds measurement, independently labelled calibration and diagnostics to [Bermuda by Ashley Gittins](https://github.com/agittins/bermuda), with the 18 fixes inherited from [davidcoulson/bermuda-patched](https://github.com/davidcoulson/bermuda-patched). It is not an official upstream release. The integration domain remains `bermuda`; existing devices, entity identities and settings remain compatible, and legacy tracking stays the default.
 
-Open the administrator **Bermuda toolkit** sidebar panel after installation. Read the [measurement toolkit guide](docs/measurement-toolkit.md) for controls, measured calibration, defaults, limits and privacy, or the [panel reference](docs/toolkit-panel.md) for a shorter walkthrough.
+The toolkit no longer adds a sidebar item. Administrators can open `/bermuda-toolkit` on their Home Assistant server when needed. Radio calibration appears first; optional tuning is under **Advanced**, and descriptive fields are under **Hardware details**. Read the [measurement toolkit guide](docs/measurement-toolkit.md) for controls, measured calibration, defaults, limits and privacy, or the [panel reference](docs/toolkit-panel.md) for a shorter walkthrough.
 
 ## Twelve additions
 
