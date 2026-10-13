@@ -315,6 +315,12 @@ async def test_effective_receiver_summary_shows_legacy_offsets_without_copying_t
             "reference_power": "global_default",
             "attenuation": "global_default",
         },
+        "inherited": {"rssi_offset": 1.5, "reference_power": -55.0, "attenuation": 3.0},
+        "inherited_sources": {
+            "rssi_offset": "legacy_receiver_offset",
+            "reference_power": "global_default",
+            "attenuation": "global_default",
+        },
     }
     assert state["options"]["receiver_profiles"] == {}
     await runtime.manager.async_dispatch(
@@ -323,6 +329,8 @@ async def test_effective_receiver_summary_shows_legacy_offsets_without_copying_t
     state = await runtime.manager.async_dispatch("state", {})
     assert state["receiver_models"][SCANNER]["rssi_offset"] == 4.0
     assert state["receiver_models"][SCANNER]["sources"]["rssi_offset"] == "receiver_profile"
+    assert state["receiver_models"][SCANNER]["inherited"]["rssi_offset"] == 1.5
+    assert state["receiver_models"][SCANNER]["inherited_sources"]["rssi_offset"] == "legacy_receiver_offset"
     await runtime.manager.async_dispatch(
         "profile", {"kind": "receiver", "id": SCANNER, "profile": {}, "remove": ["rssi_offset"]}
     )

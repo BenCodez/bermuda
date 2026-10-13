@@ -227,6 +227,8 @@ async def test_panel_static_http_and_services_register_once_and_survive_reload(h
     await asyncio.gather(async_register_toolkit(hass, entry), async_register_toolkit(hass, entry))
     panel = hass.data[frontend.DATA_PANELS]["bermuda-toolkit"]
     assert panel.require_admin is True
+    assert panel.sidebar_title is None
+    assert panel.sidebar_icon is None
     assert panel.config["entry_id"] == "synthetic-entry"
     assert panel.config["_panel_custom"]["module_url"] == "/bermuda_toolkit/toolkit.js"
     assert panel.config["_panel_custom"]["name"] == "bermuda-toolkit-panel"

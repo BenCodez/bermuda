@@ -60,6 +60,7 @@ export class BermudaToolkitPanel extends HTMLElement {
     this._draftTargets = new Map();
     this._draftRevision = 0;
     this._results = {};
+    this._disclosures = new Map();
     this._captureNeedsPreview = false;
     this._message = "";
   }
@@ -79,6 +80,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._draftVersions.clear();
       this._draftTargets.clear();
       this._results = {};
+      this._disclosures.clear();
       this._captureNeedsPreview = false;
       this._message = denied ? "Administrator access is required." : "";
       if (this._connected) this._render();
@@ -100,6 +102,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._draftVersions.clear();
       this._draftTargets.clear();
       this._results = {};
+      this._disclosures.clear();
       this._message = "";
       this._captureNeedsPreview = false;
       if (this._connected) this._render();
@@ -395,6 +398,11 @@ export class BermudaToolkitPanel extends HTMLElement {
     if (options.required) input.required = true;
     if (options.placeholder) input.placeholder = options.placeholder;
     wrapper.append(input);
+    if (options.note) {
+      input.setAttribute("aria-label", label);
+      input.setAttribute("aria-description", options.note.textContent);
+      wrapper.append(options.note);
+    }
     parent.append(wrapper);
     return input;
   }
@@ -444,6 +452,18 @@ export class BermudaToolkitPanel extends HTMLElement {
     return section;
   }
 
+  _disclosure(parent, title, key) {
+    const details = node("details", undefined, { "data-disclosure": key });
+    details.append(node("summary", title));
+    details.open = this._disclosures.get(key) === true;
+    const content = this._content;
+    details.addEventListener("toggle", () => {
+      if (content === this._content) this._disclosures.set(key, details.open);
+    });
+    parent.append(details);
+    return details;
+  }
+
   _json(parent, value) {
     if (value === undefined || value === null) {
       parent.append(node("p", "Unavailable. Refresh state or collect independent labelled samples to evaluate this feature."));
@@ -462,6 +482,24 @@ export class BermudaToolkitPanel extends HTMLElement {
     const entries = this._snapshot()[kind === "receiver" ? "scanners" : "devices"] || {};
     return entries[id]?.hardware || {};
   }
+  _profileField(kind, id, key) {
+    const profile = this._profile(kind, id);
+    if (Object.prototype.hasOwnProperty.call(profile, key)) return { value: profile[key], source: "Saved profile" };
+    if (["manufacturer", "model", "hardware_type"].includes(key)) {
+      const detected = this._hardware(kind, id).detected?.[key];
+      if (typeof detected === "string" && detected.trim()) return { value: detected, source: "Detected hardware" };
+    }
+    if (kind === "receiver" && ["rssi_offset", "reference_power", "attenuation"].includes(key)) {
+      const model = receiverValue(this._state?.receiver_models || {}, id, {});
+      const inherited = model.inherited?.[key];
+      const source = Number.isFinite(inherited) ? model.inherited_sources?.[key] : model.sources?.[key];
+      if (source === "receiver_profile") return { value: "", source: "Refresh state for inherited value" };
+      const value = Number.isFinite(inherited) ? inherited : model[key];
+      if (Number.isFinite(value)) return { value, source: source === "legacy_receiver_offset"
+        ? "Inherited from Calibration 2" : source === "global_default" ? "Inherited global setting" : "Effective receiver setting" };
+    }
+    return { value: "", source: "" };
+  }
   _hardwareLabel(hardware, field = "effective") {
     return [hardware[field]?.manufacturer, hardware[field]?.model, hardware[field]?.hardware_type].filter(Boolean).join(" · ") || "Unknown hardware";
   }
@@ -479,9 +517,10 @@ export class BermudaToolkitPanel extends HTMLElement {
       header{justify-content:space-between}h1{font-size:1.6rem}h2{font-size:1.15rem}section{padding:16px;margin:16px 0;border:1px solid var(--divider-color,#aaa);border-radius:8px}
       button,input,select,textarea{font:inherit;color:inherit;background:var(--card-background-color,white);border:1px solid var(--divider-color,#888);border-radius:4px;padding:9px;box-sizing:border-box}
       button{cursor:pointer}button:disabled{opacity:.55;cursor:default}button[aria-selected=true]{border:2px solid var(--primary-color,#03a9f4)}
-      .field{display:flex;flex-direction:column;gap:5px;margin:12px 0;max-width:650px}.field:has(input[type=checkbox]){flex-direction:row;align-items:center}
+      .field{display:flex;flex-direction:column;gap:5px;margin:12px 0;max-width:650px}.field:has(input[type=checkbox]){flex-direction:row;align-items:center}.field small:empty{display:none}
       textarea{min-height:110px;width:100%}pre{overflow:auto;max-height:450px;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--secondary-background-color,#eee);padding:12px}
       table{border-collapse:collapse;width:100%}th,td{padding:8px;text-align:left;border-bottom:1px solid var(--divider-color,#aaa);overflow-wrap:anywhere}.table-wrap{overflow:auto}
+      details{margin:16px 0;padding:12px;border:1px solid var(--divider-color,#aaa);border-radius:8px}summary{cursor:pointer;font-weight:600;padding:4px}summary:focus-visible{outline:3px solid var(--primary-color,#03a9f4)}
       [role=status]{min-height:1.5em;margin:12px 0}p{line-height:1.5}input[type=checkbox]{width:20px;height:20px}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--primary-color,#03a9f4)}
       @media(max-width:600px){:host{padding:10px}section{padding:12px}nav button{flex:1 1 40%}}
     `);
@@ -519,44 +558,7 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _settings(parent) {
     const options = this._options();
-    const general = this._section(parent, "Optional runtime settings", "Automatic calibration uses independent reference labels and safety checks. Fingerprint area selection requires a confident, supervised result in a valid Home Assistant area.");
-    const auto = this._field(general, "Enable automatic calibration", "auto", options.auto_calibration, { type: "checkbox" });
-    const area = this._field(general, "Enable fingerprint area selection", "fingerprint-area", options.fingerprint_area_selection, { type: "checkbox" });
-    const reliability = this._field(general, "Enable reliability weighting", "reliability", options.reliability_weighting, { type: "checkbox" });
-    const window = this._field(general, "History window (seconds)", "window", options.history_window_s ?? 3600, { type: "number", min: 60, max: 86400 });
-    this._button(general, "Save runtime settings", () => {
-      const controls = [["auto_calibration", auto], ["fingerprint_area_selection", area], ["reliability_weighting", reliability], ["history_window_s", window]];
-      const edited = controls.filter(([, input]) => this._drafts.has(input.dataset.draft));
-      const settings = Object.fromEntries(edited.map(([key, input]) => [key, input.type === "checkbox" ? input.checked : finiteInput(input, { min: 60, max: 86400 })]));
-      return this._saveSettings(settings, edited.map(([, input]) => input));
-    });
-    const receiver = this._section(parent, "Receiver maximum distance", "A value of 0 follows Bermuda’s existing global maximum distance.");
-    const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
-    this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
-    const limit = this._field(receiver, "Maximum distance (m)", "limit", receiverValue(options.receiver_limits, scanner.value, 0), { type: "number", min: 0, max: 1000, step: .1 });
-    scanner.addEventListener("change", () => {
-      if (parent !== this._content) return;
-      this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
-      this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0));
-    });
-    this._button(receiver, "Save receiver limit", () => {
-      if (!this._targetAvailable(scanner)) throw new Error("Choose an available receiver.");
-      return this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true });
-    }, { disabled: !this._targetAvailable(scanner) });
-    const filters = this._section(parent, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
-    const device = this._select(filters, "Device", "filter-device", this._devices());
-    this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
-    const mode = this._select(filters, "Filter", "filter-mode", ["legacy", "pet", "stationary"].map(x => [x, x]), options.filters?.[device.value] || "legacy");
-    device.addEventListener("change", () => {
-      if (parent !== this._content) return;
-      this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
-      this._resetField(mode, this._options().filters?.[device.value] || "legacy");
-    });
-    this._button(filters, "Save filter mode", () => {
-      if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
-      return this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true });
-    }, { disabled: !this._targetAvailable(device) });
-    const profiles = this._section(parent, "Hardware and radio profile", "Detected hardware comes from a proven Home Assistant registry binding or existing ESPHome information. Empty descriptive fields inherit detection. Physical antenna placement cannot be detected; choose Unknown, Internal or External. Hardware and antenna descriptions are metadata. Only explicit numeric model values change distance.");
+    const profiles = this._section(parent, "Hardware and radio profile", "Save only changes the fields you edit. Clear and save a radio field to restore its inherited setting. Antenna placement and hardware details describe the receiver; they do not apply radio corrections.");
     const kind = this._select(profiles, "Profile type", "profile-kind", [["receiver", "Receiver"], ["beacon", "Beacon"]], "receiver");
     const target = this._select(profiles, "Profile target", "profile-id", kind.value === "beacon" ? this._devices() : this._scanners());
     const detectedHardware = node("p");
@@ -564,32 +566,51 @@ export class BermudaToolkitPanel extends HTMLElement {
     profiles.append(detectedHardware, currentRadio);
     const showHardware = () => {
       const hardware = this._hardware(kind.value, target.value);
-      detectedHardware.textContent = `Detected: ${this._hardwareLabel(hardware, "detected")} (${hardware.provenance || "unknown"}). Effective: ${this._hardwareLabel(hardware)}.`;
+      detectedHardware.textContent = `Detected: ${this._hardwareLabel(hardware, "detected")} (${hardware.provenance || "unknown"}).`;
       const model = receiverValue(this._state?.receiver_models || {}, target.value, {});
-      const source = key => model.sources?.[key] === "receiver_profile" ? "profile override" : key === "rssi_offset" && model.sources?.[key] === "legacy_receiver_offset" ? "inherited from existing Calibration 2" : key === "rssi_offset" ? "inherited default" : "inherited global settings";
-      const value = key => Number.isFinite(model[key]) ? model[key] : "unavailable";
-      currentRadio.textContent = kind.value === "receiver" ? `Effective receiver RSSI offset: ${value("rssi_offset")} dB (${source("rssi_offset")}). Reference power: ${value("reference_power")} dBm (${source("reference_power")}). Attenuation: ${value("attenuation")} (${source("attenuation")}). Blank numeric fields keep the inherited settings. Beacon-specific reference power may take precedence for individual readings.` : "";
+      const profile = this._profile(kind.value, target.value);
+      const source = key => Object.prototype.hasOwnProperty.call(profile, key) ? "profile override"
+        : key === "rssi_offset" && (model.inherited_sources?.[key] || model.sources?.[key]) === "legacy_receiver_offset" ? "inherited from existing Calibration 2" : key === "rssi_offset" ? "inherited default" : "inherited global settings";
+      const value = key => { const current = this._profileField(kind.value, target.value, key).value; return Number.isFinite(current) ? current : "unavailable"; };
+      currentRadio.textContent = kind.value === "receiver" ? `Effective receiver RSSI offset: ${value("rssi_offset")} dB (${source("rssi_offset")}). Reference power: ${value("reference_power")} dBm (${source("reference_power")}). Attenuation: ${value("attenuation")} (${source("attenuation")}). Beacon-specific reference power may take precedence for individual readings.` : "";
     };
     showHardware();
     const profileInputs = {};
-    const profileKeys = ["hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"];
+    const profileNotes = {};
+    const radioKeys = ["rssi_offset", "reference_power", "attenuation"];
+    const profileKeys = [...radioKeys, "hardware_type", "manufacturer", "model", "antenna", "environment", "notes", "height_m", "antenna_gain_dbi", "distance_accuracy_m"];
+    const metadata = node("div");
     const profileDrafts = [...profileKeys.map(key => `profile-${key}`), "profile-external_antenna", "profile-verified"];
     this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
     const current = this._profile(kind.value, target.value);
     const numericLabels = { height_m: "Receiver / beacon mounting height (m)", antenna_gain_dbi: "Antenna gain (dBi; metadata)", distance_accuracy_m: "Distance accuracy (m; metadata)", rssi_offset: "Receiver RSSI offset (dB)", reference_power: "Reference power at 1 m (dBm)", attenuation: "Path-loss exponent" };
     for (const key of profileKeys) {
       const numeric = ["height_m", "antenna_gain_dbi", "distance_accuracy_m", "rssi_offset", "reference_power", "attenuation"].includes(key);
-      profileInputs[key] = this._field(profiles, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, current[key] ?? "", { type: numeric ? "number" : "text", step: numeric ? .1 : undefined });
+      const display = this._profileField(kind.value, target.value, key);
+      profileNotes[key] = node("small", this._drafts.has(`profile-${key}`) ? "Unsaved profile edit" : display.source);
+      profileInputs[key] = this._field(radioKeys.includes(key) ? profiles : metadata, numericLabels[key] || key.replaceAll("_", " "), `profile-${key}`, display.value, { type: numeric ? "number" : "text", step: numeric ? .1 : undefined, note: profileNotes[key] });
+      for (const event of ["input", "change"]) profileInputs[key].addEventListener(event, () => {
+        profileNotes[key].textContent = "Unsaved profile edit";
+        profileInputs[key].setAttribute("aria-description", profileNotes[key].textContent);
+      });
     }
     profileInputs.external_antenna = this._select(profiles, "Antenna placement", "profile-external_antenna", [["", "Unknown"], ["false", "Internal"], ["true", "External"]], current.external_antenna === undefined ? "" : String(current.external_antenna));
     const verified = this._field(profiles, "Reference power independently verified", "profile-verified", current.reference_power_verified, { type: "checkbox" });
+    this._disclosure(profiles, "Hardware details", "profile-hardware").append(metadata);
     const configureKind = () => { profileInputs.rssi_offset.disabled = kind.value !== "receiver"; verified.disabled = kind.value !== "beacon"; };
     configureKind();
     const loadProfile = () => {
       if (parent !== this._content) return;
       this._bindTargetDrafts("profile-id", kind.value, target.value, profileDrafts);
       const existing = this._profile(kind.value, target.value);
-      for (const [key, input] of Object.entries(profileInputs)) this._resetField(input, existing[key] ?? "");
+      for (const [key, input] of Object.entries(profileInputs)) {
+        const display = key === "external_antenna" ? { value: existing[key] ?? "", source: "" } : this._profileField(kind.value, target.value, key);
+        this._resetField(input, display.value);
+        if (profileNotes[key]) {
+          profileNotes[key].textContent = display.source;
+          input.setAttribute("aria-description", display.source);
+        }
+      }
       showHardware();
       this._resetField(verified, existing.reference_power_verified);
       configureKind();
@@ -622,13 +643,51 @@ export class BermudaToolkitPanel extends HTMLElement {
       if (!edited.length) { this._message = "No unsaved profile changes."; this._render(); return; }
       return this._perform("profile", { kind: kind.value, id: target.value, profile, remove }, { draftNames: edited.map(input => input.dataset.draft) });
     }, { disabled: !this._targetAvailable(target) });
-    const fixed = this._section(parent, "Fixed reference labels", "Only permanently fixed beacons belong here. Saving explicitly labels future samples. Use measured slant ranges and an independent location label. Use {} to remove fixed references.");
+    const advanced = this._disclosure(parent, "Advanced", "settings-advanced");
+    const general = this._section(advanced, "Optional runtime settings", "Automatic calibration uses independent reference labels and safety checks. Fingerprint area selection requires a confident, supervised result in a valid Home Assistant area.");
+    const auto = this._field(general, "Enable automatic calibration", "auto", options.auto_calibration, { type: "checkbox" });
+    const area = this._field(general, "Enable fingerprint area selection", "fingerprint-area", options.fingerprint_area_selection, { type: "checkbox" });
+    const reliability = this._field(general, "Enable reliability weighting", "reliability", options.reliability_weighting, { type: "checkbox" });
+    const window = this._field(general, "History window (seconds)", "window", options.history_window_s ?? 3600, { type: "number", min: 60, max: 86400 });
+    this._button(general, "Save runtime settings", () => {
+      const controls = [["auto_calibration", auto], ["fingerprint_area_selection", area], ["reliability_weighting", reliability], ["history_window_s", window]];
+      const edited = controls.filter(([, input]) => this._drafts.has(input.dataset.draft));
+      const settings = Object.fromEntries(edited.map(([key, input]) => [key, input.type === "checkbox" ? input.checked : finiteInput(input, { min: 60, max: 86400 })]));
+      return this._saveSettings(settings, edited.map(([, input]) => input));
+    });
+    const receiver = this._section(advanced, "Receiver maximum distance", "A value of 0 follows Bermuda’s existing global maximum distance.");
+    const scanner = this._select(receiver, "Receiver", "limit-scanner", this._scanners());
+    this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
+    const limit = this._field(receiver, "Maximum distance (m)", "limit", receiverValue(options.receiver_limits, scanner.value, 0), { type: "number", min: 0, max: 1000, step: .1 });
+    scanner.addEventListener("change", () => {
+      if (parent !== this._content) return;
+      this._bindTargetDrafts("limit-scanner", "receiver", scanner.value, ["limit"]);
+      this._resetField(limit, receiverValue(this._options().receiver_limits, scanner.value, 0));
+    });
+    this._button(receiver, "Save receiver limit", () => {
+      if (!this._targetAvailable(scanner)) throw new Error("Choose an available receiver.");
+      return this._saveSettings(this._drafts.has(limit.dataset.draft) ? { receiver_limits: { [scanner.value]: finiteInput(limit, { min: 0, max: 1000 }) } } : {}, [limit], { patchMaps: true });
+    }, { disabled: !this._targetAvailable(scanner) });
+    const filters = this._section(advanced, "Device filter mode", "Legacy preserves normal Bermuda behavior. Pet adapts to movement; stationary smooths stable references. Raw RSSI stays available in diagnostics.");
+    const device = this._select(filters, "Device", "filter-device", this._devices());
+    this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
+    const mode = this._select(filters, "Filter", "filter-mode", ["legacy", "pet", "stationary"].map(x => [x, x]), options.filters?.[device.value] || "legacy");
+    device.addEventListener("change", () => {
+      if (parent !== this._content) return;
+      this._bindTargetDrafts("filter-device", "beacon", device.value, ["filter-mode"]);
+      this._resetField(mode, this._options().filters?.[device.value] || "legacy");
+    });
+    this._button(filters, "Save filter mode", () => {
+      if (!this._targetAvailable(device)) throw new Error("Choose an available device.");
+      return this._saveSettings(this._drafts.has(mode.dataset.draft) ? { filters: { [device.value]: mode.value } } : {}, [mode], { patchMaps: true });
+    }, { disabled: !this._targetAvailable(device) });
+    const fixed = this._section(advanced, "Fixed reference labels", "Only permanently fixed beacons belong here. Saving explicitly labels future samples. Use measured slant ranges and an independent location label. Use {} to remove fixed references.");
     const referenceJSON = this._field(fixed, "Fixed reference map (JSON)", "fixed-references", pretty(options.fixed_references || {}), { multiline: true });
     this._button(fixed, "Save fixed references", () => this._saveSettings(this._drafts.has(referenceJSON.dataset.draft) ? { fixed_references: JSON.parse(referenceJSON.value) } : {}, [referenceJSON]));
-    const binding = this._section(parent, "Explicit scanner bindings", 'Bind an opaque Bluetooth source to its Home Assistant device registry ID using {"source-id":{"device_registry_id":"registry-id"}}. Friendly names are not identity.');
+    const binding = this._section(advanced, "Explicit scanner bindings", 'Bind an opaque Bluetooth source to its Home Assistant device registry ID using {"source-id":{"device_registry_id":"registry-id"}}. Friendly names are not identity.');
     const bindingJSON = this._field(binding, "Source → binding object map (JSON)", "scanner-bindings", pretty(options.scanner_bindings || {}), { multiline: true });
     this._button(binding, "Save scanner bindings", () => this._saveSettings(this._drafts.has(bindingJSON.dataset.draft) ? { scanner_bindings: JSON.parse(bindingJSON.value) } : {}, [bindingJSON]));
-    const recovery = this._section(parent, "Advanced scanner entity identity recovery", 'Use only when upgrading an existing installation whose range entities used an old receiver identity. Associate the exact Bluetooth source with one existing Bermuda range or raw-range entity from this entry using {"source-id":{"entity_id":"sensor.existing_range"}}. Saving schedules a reload; hardware names and areas still come from the current scanner binding.');
+    const recovery = this._section(advanced, "Advanced scanner entity identity recovery", 'Use only when upgrading an existing installation whose range entities used an old receiver identity. Associate the exact Bluetooth source with one existing Bermuda range or raw-range entity from this entry using {"source-id":{"entity_id":"sensor.existing_range"}}. Saving schedules a reload; hardware names and areas still come from the current scanner binding.');
     const recoveryJSON = this._field(recovery, "Source → existing range entity map (JSON)", "scanner-identity-recovery", pretty(options.scanner_identity_recovery || {}), { multiline: true });
     this._button(recovery, "Restore existing scanner entity identities", () => this._saveSettings(this._drafts.has(recoveryJSON.dataset.draft) ? { scanner_identity_recovery: JSON.parse(recoveryJSON.value) } : {}, [recoveryJSON]));
   }
