@@ -144,6 +144,235 @@ test("a prior entry response cannot replace the new target and its drafts", asyn
   assert.deepEqual(calls, ["bermuda/toolkit?entry_id=entry-a", "bermuda/toolkit?entry_id=entry-b"]);
 });
 
+const entryScopedControls = [
+  ["Clear history", 2, "history_clear"],
+  ["Start recording", 2, "history_start"],
+  ["Save runtime settings", 0, "settings"],
+  ["Save profile", 0, "profile"],
+  ["Import recording", 2, "history_import"],
+  ["Export JSON", 2, "history_export"],
+  ["Copy recording", 2, "history_export"],
+  ["Copy full diagnostics", 4, "diagnostics"],
+];
+
+async function prepareEntryControl(component, label, marker, onRead = () => {}) {
+  if (label === "Save runtime settings") await edit(component, "History window (seconds)", marker === "entry-a" ? "1800" : "2400");
+  else if (label === "Save profile") await edit(component, "model", `${marker} profile edit`);
+  else if (label === "Start recording") await edit(component, "Record device (or all tracked devices)", "device1", "change");
+  else if (label === "Import recording") {
+    field(component, "Import recording JSON (maximum 2 MiB)").files = [{ name: "recording.json", size: 2, text: async () => { onRead(); return "{}"; } }];
+  }
+}
+
+for (const [label, tab, action] of entryScopedControls) {
+  for (const failedLoad of [false, true]) {
+    test(`entry changes remove ${label} during a ${failedLoad ? "failed" : "pending"} replacement load and admit fresh controls`, { timeout: 1000 }, async t => {
+      const loading = deferred();
+      const posts = [], copied = [], downloads = [];
+      mockClipboard(t, async text => { copied.push(text); });
+      let gets = 0, reads = 0;
+      const replacement = { ...state(), entry_id: "entry-b" };
+      replacement.options.receiver_profiles = { receiver1: { model: "entry-b model" } };
+      const component = panel(async (method, path, payload) => {
+        if (method === "GET") return ++gets === 1 ? loading.promise : structuredClone(replacement);
+        posts.push(payload);
+        return { completed: true };
+      });
+      t.mock.method(component, "_download", data => { downloads.push(data); });
+      component._entryId = "entry-a";
+      component._activeTab = tab; component._render();
+      await prepareEntryControl(component, label, "entry-a", () => { reads += 1; });
+      const stale = button(component, label);
+      component.panel = { config: { entry_id: "entry-b" } };
+      const loadingPromise = component._refreshPromise;
+      const remainedMounted = component.shadowRoot.querySelectorAll("button").includes(stale);
+      const loadingText = component.shadowRoot.textContent;
+      const staleClick = stale.click();
+      await tick();
+      const prematurePosts = posts.slice();
+      if (failedLoad) loading.reject(new Error("Synthetic entry-b load failure"));
+      else loading.resolve(structuredClone(replacement));
+      await Promise.all([staleClick, loadingPromise]);
+      assert.equal(remainedMounted, false);
+      assert.match(loadingText, /State unavailable/);
+      assert.deepEqual(prematurePosts, []);
+      assert.equal(reads, 0, "a stale import cannot even read its selected A file");
+      assert.deepEqual(copied, []);
+      assert.deepEqual(downloads, []);
+      await stale.click();
+      assert.deepEqual(posts, []);
+      if (failedLoad) {
+        assert.equal(component._state, null);
+        assert.equal(button(component, label), undefined);
+        assert.equal(component._message, "Synthetic entry-b load failure");
+        await button(component, "Refresh state").click();
+      }
+      assert.equal(component._state.entry_id, "entry-b");
+      await prepareEntryControl(component, label, "entry-b");
+      assert.notEqual(button(component, label), stale);
+      await button(component, label).click();
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0].action, action);
+      assert.equal(posts[0].entry_id, "entry-b");
+    });
+  }
+}
+
+test("creation generation rejects stale mounted actions and navigation even if a renderer is deferred", { timeout: 1000 }, async t => {
+  const loading = deferred();
+  const posts = [];
+  let gets = 0;
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return ++gets === 1 ? loading.promise : state();
+    posts.push(payload); return { completed: true };
+  });
+  component._entryId = "entry-a";
+  component._activeTab = 2; component._render();
+  const staleClear = button(component, "Clear history");
+  const staleRefresh = button(component, "Refresh state");
+  const staleTab = button(component, "Settings");
+  // Keep the old controls mounted to exercise generation ownership separately from DOM replacement.
+  t.mock.method(component, "_render", () => {});
+  component.panel = { config: { entry_id: "entry-b" } };
+  const loadingPromise = component._refreshPromise;
+  const refreshing = staleRefresh.click();
+  const clearing = staleClear.click();
+  await staleTab.click();
+  await tick();
+  const tabAfterStaleClick = component._activeTab;
+  loading.resolve(state());
+  await Promise.all([clearing, refreshing, loadingPromise]);
+  assert.deepEqual(posts, []);
+  assert.equal(gets, 1, "an old refresh cannot queue work for entry B");
+  assert.equal(tabAfterStaleClick, 2, "an old navigation callback cannot change entry B's active tab");
+  assert.equal(component._results.history_clear, undefined);
+});
+
+test("a tab's queued keyboard event cannot navigate a replacement entry", { timeout: 1000 }, async () => {
+  const loading = deferred();
+  const component = panel(async () => loading.promise);
+  component._entryId = "entry-a"; component._activeTab = 2; component._render();
+  const staleTab = button(component, "Settings");
+  component.panel = { config: { entry_id: "entry-b" } };
+  let prevented = 0;
+  await staleTab.dispatch("keydown", { key: "End", preventDefault() { prevented += 1; } });
+  const tabAfterEvent = component._activeTab;
+  loading.resolve({ ...state(), entry_id: "entry-b" });
+  await component._refreshPromise;
+  assert.equal(tabAfterEvent, 2);
+  assert.equal(prevented, 0);
+  await button(component, "Settings").dispatch("keydown", { key: "End", preventDefault() { prevented += 1; } });
+  assert.equal(component._activeTab, 4, "fresh entry-b keyboard navigation remains usable");
+  assert.equal(prevented, 1);
+});
+
+for (const [label, tab] of entryScopedControls.filter(([name]) => name !== "Start recording" && name !== "Import recording")) {
+  for (const failedLoad of [false, true]) {
+    test(`an admitted entry-a ${label} completion cannot change entry-b after its ${failedLoad ? "failed" : "successful"} load`, { timeout: 1000 }, async t => {
+      const posting = deferred(), loading = deferred();
+      const posts = [], copied = [], downloads = [];
+      mockClipboard(t, async text => { copied.push(text); });
+      let gets = 0;
+      const replacement = { ...state(), entry_id: "entry-b" };
+      replacement.options.receiver_profiles = { receiver1: { model: "entry-b model" } };
+      const component = panel(async (method, path, payload) => {
+        if (method === "GET") return ++gets === 1 ? loading.promise : structuredClone(replacement);
+        posts.push(payload);
+        return posts.length === 1 ? posting.promise : { profile: { model: payload.profile?.model } };
+      });
+      t.mock.method(component, "_download", data => { downloads.push(data); });
+      component._entryId = "entry-a";
+      component._activeTab = tab; component._render();
+      await prepareEntryControl(component, label, "entry-a");
+      const admitted = button(component, label).click();
+      assert.equal(posts[0].entry_id, "entry-a");
+      component.panel = { config: { entry_id: "entry-b" } };
+      const loadingPromise = component._refreshPromise;
+      const removedImmediately = button(component, label) === undefined;
+      if (failedLoad) loading.reject(new Error("Synthetic entry-b load failure"));
+      else loading.resolve(structuredClone(replacement));
+      await loadingPromise;
+      assert.equal(component._busy, true);
+      let draftVersion;
+      if (!failedLoad) {
+        await button(component, "Settings").click();
+        await edit(component, "model", "entry-b newer draft");
+        draftVersion = component._draftVersions.get("profile-model");
+        assert.equal(button(component, "Save profile").disabled, true, "the admitted operation retains busy ownership until it completes");
+      }
+      component._message = "Current entry-b status";
+      posting.resolve({ private_entry_a: true, options: { auto_calibration: true }, profile: { model: "entry-a acknowledgement" } });
+      await admitted;
+      assert.equal(removedImmediately, true);
+      assert.equal(component._busy, false);
+      assert.deepEqual(component._results, {});
+      assert.deepEqual(downloads, []);
+      assert.deepEqual(copied, []);
+      assert.equal(component._message, "Current entry-b status");
+      if (failedLoad) {
+        assert.equal(component._state, null);
+        await button(component, "Refresh state").click();
+        await button(component, "Settings").click();
+        await edit(component, "model", "entry-b newer draft");
+      } else {
+        assert.equal(component._draftVersions.get("profile-model"), draftVersion);
+        assert.equal(component._drafts.get("profile-model"), "entry-b newer draft");
+      }
+      assert.equal(component._state.entry_id, "entry-b");
+      assert.equal(component._profile("receiver", "receiver1").model, "entry-b model");
+      await button(component, "Save profile").click();
+      assert.equal(posts.length, 2);
+      assert.equal(posts[1].entry_id, "entry-b");
+      assert.deepEqual(posts[1].profile, { model: "entry-b newer draft" });
+    });
+  }
+}
+
+test("a connected entry update removes controls even before hass is supplied", () => {
+  const component = panel(); component._entryId = "entry-a"; component._activeTab = 2; component._render();
+  const stale = button(component, "Clear history");
+  component._hass = undefined;
+  component.panel = { config: { entry_id: "entry-b" } };
+  assert.equal(component._state, null);
+  assert.equal(component.shadowRoot.querySelectorAll("button").includes(stale), false);
+  assert.match(component.shadowRoot.textContent, /State unavailable/);
+  assert.equal(component._refreshPromise, undefined);
+});
+
+test("a disconnected entry update rejects old navigation and reconnects with entry-b controls", { timeout: 1000 }, async () => {
+  const loading = deferred(), calls = [];
+  const replacement = { ...state(), entry_id: "entry-b" };
+  const component = panel(async (method, path, payload) => { calls.push([method, path, payload]); return method === "GET" ? loading.promise : {}; });
+  component._entryId = "entry-a"; component._activeTab = 2; component._render();
+  const staleTab = button(component, "Settings");
+  component.disconnectedCallback();
+  component.panel = { config: { entry_id: "entry-b" } };
+  await staleTab.click();
+  assert.equal(component._activeTab, 2);
+  assert.equal(calls.length, 0);
+  component.connectedCallback();
+  assert.equal(button(component, "Clear history"), undefined);
+  loading.resolve(replacement);
+  await component._refreshPromise;
+  await button(component, "Clear history").click();
+  assert.equal(calls[1][2].entry_id, "entry-b");
+});
+
+test("a panel update for the same entry preserves current controls and drafts", { timeout: 1000 }, async () => {
+  const posts = [];
+  const component = panel(async (method, path, payload) => { if (method === "POST") posts.push(payload); return state(); });
+  component._entryId = "entry-a"; component._render();
+  await edit(component, "model", "same-entry unsaved metadata");
+  const save = button(component, "Save profile"), generation = component._generation;
+  component.panel = { config: { entry_id: "entry-a", title: "Updated panel" } };
+  assert.equal(component._generation, generation);
+  assert.equal(button(component, "Save profile"), save);
+  assert.equal(component._drafts.get("profile-model"), "same-entry unsaved metadata");
+  await save.click();
+  assert.equal(posts[0].entry_id, "entry-a");
+  assert.deepEqual(posts[0].profile, { model: "same-entry unsaved metadata" });
+});
+
 test("action admission is reserved before awaiting so repeated clicks send once", async () => {
   const pending = deferred();
   const calls = [];

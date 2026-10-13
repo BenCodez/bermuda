@@ -102,6 +102,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       this._results = {};
       this._message = "";
       this._captureNeedsPreview = false;
+      if (this._connected) this._render();
       if (this._connected && this._hass) void this.refresh();
     }
   }
@@ -401,11 +402,12 @@ export class BermudaToolkitPanel extends HTMLElement {
 
   _button(parent, label, callback, { disabled = false, allowBusy = false } = {}) {
     const button = node("button", label, { type: "button" });
+    const generation = this._generation;
     button.disabled = (!allowBusy && (this._busy || this._fileBusy)) || disabled;
     button.addEventListener("click", async () => {
+      if (generation !== this._generation) return;
       if ((!allowBusy && (this._busy || this._fileBusy)) || button.disabled) return;
       if (![...this.shadowRoot.querySelectorAll("button")].includes(button)) return;
-      const generation = this._generation;
       try { await callback(); } catch (error) {
         if (this._isCurrent(generation)) { this._message = this._errorText(error); this._render(); }
       }
@@ -470,7 +472,9 @@ export class BermudaToolkitPanel extends HTMLElement {
       tab.setAttribute("aria-selected", String(this._activeTab === index));
       tab.setAttribute("aria-controls", "toolkit-content");
       tab.tabIndex = this._activeTab === index ? 0 : -1;
+      const generation = this._generation;
       tab.addEventListener("keydown", event => {
+        if (generation !== this._generation || !this._connected || ![...this.shadowRoot.querySelectorAll("button")].includes(tab)) return;
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
         this._activeTab = event.key === "Home" ? 0 : event.key === "End" ? TABS.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + TABS.length) % TABS.length;
