@@ -381,7 +381,10 @@ class BermudaDevice:
         if self._scanner_identity_resolved:
             return
         toolkit = getattr(self._coordinator, "toolkit", None)
-        if getattr(toolkit, "scanner_identity_ready", True) is False:
+        if (
+            getattr(self._coordinator, "scanner_identity_pending", False) is True
+            or getattr(toolkit, "scanner_identity_ready", True) is False
+        ):
             # Bluetooth callbacks may discover receivers while their persisted
             # identities are still loading. Keep packets and binding metadata,
             # then freeze the identity when that state is available.

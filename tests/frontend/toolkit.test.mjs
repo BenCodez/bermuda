@@ -1940,3 +1940,37 @@ test("clearing receiver reference power sends no beacon verification field and r
   assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
   assert.equal(field(component, "model").value, "Known receiver");
 });
+
+for (const fails of [false, true]) test(`explicit scanner identity recovery preserves newer JSON and acknowledgement when save fails=${fails}`, async () => {
+  const source = "dc:06:75:4e:89:4a";
+  const initial = { [source]: { entity_id: "sensor.synthetic_old_range" } };
+  const selected = { [source]: { entity_id: "sensor.synthetic_selected_range" } };
+  const newer = { [source]: { entity_id: "sensor.synthetic_newer_range_raw" } };
+  const server = state(); server.options.scanner_identity_recovery = initial;
+  const pending = deferred(); const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") throw new Error("Bermuda entry is reloading");
+    calls.push(payload); return pending.promise;
+  });
+  component._state = structuredClone(server); component._render();
+  const label = "Source → existing range entity map (JSON)";
+  assert.deepEqual(JSON.parse(field(component, label).value), initial);
+  await button(component, "Restore existing scanner entity identities").click();
+  assert.equal(calls.length, 0, "an unchanged recovery map does not save or reload");
+  await edit(component, label, JSON.stringify(selected));
+  const saving = button(component, "Restore existing scanner entity identities").click();
+  assert.deepEqual(calls[0].settings, { scanner_identity_recovery: selected });
+  await edit(component, label, JSON.stringify(newer));
+  if (fails) pending.reject(new Error("Synthetic recovery save failure"));
+  else pending.resolve({ options: { ...server.options, scanner_identity_recovery: selected }, reload_scheduled: true });
+  await saving;
+  assert.deepEqual(JSON.parse(field(component, label).value), newer);
+  assert.equal(component._drafts.get("scanner-identity-recovery"), JSON.stringify(newer));
+  if (fails) {
+    assert.match(component._message, /Synthetic recovery save failure/);
+    assert.deepEqual(component._options().scanner_identity_recovery, initial);
+  } else {
+    assert.match(component._message, /settings completed\..*Newer edits remain unsaved.*Bermuda is reloading.*Refresh failed:/);
+    assert.deepEqual(component._options().scanner_identity_recovery, selected);
+  }
+});

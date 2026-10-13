@@ -45,6 +45,7 @@ _SETTINGS_KEYS = frozenset(
         "history_enabled",
         "history_window_s",
         "scanner_bindings",
+        "scanner_identity_recovery",
         "reliability_weighting",
     }
 )
@@ -200,6 +201,7 @@ def normalize_toolkit_settings(value: Mapping | None) -> dict:
         "history_enabled": False,
         "history_window_s": 3600.0,
         "scanner_bindings": {},
+        "scanner_identity_recovery": {},
         "reliability_weighting": False,
     }
     for key, kind in (("receiver_profiles", "receiver"), ("beacon_profiles", "beacon")):
@@ -224,6 +226,20 @@ def normalize_toolkit_settings(value: Mapping | None) -> dict:
         result["scanner_bindings"][_identifier(identifier, "scanner_id")] = {
             "device_registry_id": _identifier(fields["device_registry_id"], "device_registry_id")
         }
+    for identifier, recovery in _mapping(
+        source.get("scanner_identity_recovery", {}), "scanner_identity_recovery"
+    ).items():
+        fields = _mapping(recovery, "scanner_identity_recovery", 1)
+        if set(fields) != {"entity_id"}:
+            msg = "Scanner identity recovery must contain only entity_id"
+            raise ValueError(msg)
+        key = _identifier(identifier, "scanner_id")
+        key = receiver_value({key.lower(): key.lower()}, key, key)
+        target = {"entity_id": _identifier(fields["entity_id"], "entity_id")}
+        if key in result["scanner_identity_recovery"] and result["scanner_identity_recovery"][key] != target:
+            msg = "Conflicting scanner identity recovery aliases"
+            raise ValueError(msg)
+        result["scanner_identity_recovery"][key] = target
     for key in ("auto_calibration", "fingerprint_area_selection", "history_enabled", "reliability_weighting"):
         if key in source:
             result[key] = _boolean(source[key], key)

@@ -209,6 +209,7 @@ export class BermudaToolkitPanel extends HTMLElement {
       const pending = result?.eligible === false || result?.accepted === false || result?.status === "pending" || result?.state === "absent";
       this._message = pending ? `${action.replaceAll("_", " ")} needs more evidence; see results and rejection reasons.` : `${action.replaceAll("_", " ")} completed.`;
       if (submitted.some(([name]) => this._drafts.has(name))) this._message += " Newer edits remain unsaved.";
+      if (result?.reload_scheduled) this._message += " Bermuda is reloading to restore the selected existing entity identities.";
       const completedMessage = this._message;
       if (download) this._download(result, "bermuda-history.json");
       const refreshed = await this.refresh();
@@ -606,6 +607,9 @@ export class BermudaToolkitPanel extends HTMLElement {
     const binding = this._section(parent, "Explicit scanner bindings", 'Bind an opaque Bluetooth source to its Home Assistant device registry ID using {"source-id":{"device_registry_id":"registry-id"}}. Friendly names are not identity.');
     const bindingJSON = this._field(binding, "Source → binding object map (JSON)", "scanner-bindings", pretty(options.scanner_bindings || {}), { multiline: true });
     this._button(binding, "Save scanner bindings", () => this._saveSettings(this._drafts.has(bindingJSON.dataset.draft) ? { scanner_bindings: JSON.parse(bindingJSON.value) } : {}, [bindingJSON]));
+    const recovery = this._section(parent, "Advanced scanner entity identity recovery", 'Use only when upgrading an existing installation whose range entities used an old receiver identity. Associate the exact Bluetooth source with one existing Bermuda range or raw-range entity from this entry using {"source-id":{"entity_id":"sensor.existing_range"}}. Saving schedules a reload; hardware names and areas still come from the current scanner binding.');
+    const recoveryJSON = this._field(recovery, "Source → existing range entity map (JSON)", "scanner-identity-recovery", pretty(options.scanner_identity_recovery || {}), { multiline: true });
+    this._button(recovery, "Restore existing scanner entity identities", () => this._saveSettings(this._drafts.has(recoveryJSON.dataset.draft) ? { scanner_identity_recovery: JSON.parse(recoveryJSON.value) } : {}, [recoveryJSON]));
   }
 
   _calibration(parent) {

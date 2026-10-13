@@ -56,6 +56,16 @@ For an exceptional association, use **Settings → Explicit scanner bindings**. 
 
 Use the actual IDs from your installation. Changing this association does not create a second copy of existing entities or infer an adjacent MAC/name match.
 
+On the first upgrade, Bermuda retains an existing scanner identity when its saved toolkit state, scanner device registry entry, or an existing range entity's exact current/restored `area_scanner_mac` proves the association. Corrected hardware matching still supplies the receiver's current name, area and network address separately.
+
+Older versions could select the last device in a set of neighboring MAC matches. A range entity's unique ID records that selected suffix, but does not by itself prove which scanner owned it. Bermuda does not guess from neighboring MACs or friendly names. If exact source evidence is absent or conflicting, use **Settings → Advanced scanner entity identity recovery** to explicitly associate a source with one existing range or raw-range entity belonging to this Bermuda entry:
+
+```json
+{"dc:06:75:4e:89:4a":{"entity_id":"sensor.synthetic_existing_receiver_range"}}
+```
+
+Saving validates the association, durably records it, and schedules a normal reload. This explicit choice overrides a provisional identity saved during the first upgrade and preserves the selected entity's established ID; it does not delete other entity registry entries. Use the actual source and entity IDs from your installation.
+
 ### 3. Scanner health, freshness and rejection reasons
 
 **Health → Scanner health and freshness** shows receivers, last packet age, area and binding. **Current device observations** and **Load full diagnostics** show source stamps, raw/last-valid timestamps, RSSI variability, estimated observed cadence and structured rejection reasons. [signal_quality.py](../custom_components/bermuda/signal_quality.py) and [api.py](../custom_components/bermuda/api.py) supply these fields.

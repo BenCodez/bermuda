@@ -15,6 +15,8 @@ from typing import Any
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import restore_state
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .api import async_get_advert_snapshot, public_device_id, snapshot_observations
@@ -73,12 +75,12 @@ def _settings(value: Any) -> dict:
     for field in ("beacon_profiles", "filters", "fixed_references"):
         canonical = {}
         for key, item in settings[field].items():
-            public = public_device_id(key)
-            if public in canonical:
-                msg = "Multiple settings refer to the same beacon"
-                raise ValueError(msg)
+            public = _candidate_identity(public_device_id(key))
             if field == "fixed_references":
                 item["device_id"] = public
+            if public in canonical and canonical[public] != item:
+                msg = "Multiple settings refer to the same beacon"
+                raise ValueError(msg)
             canonical[public] = item
         settings[field] = canonical
     return settings
@@ -306,6 +308,9 @@ class ToolkitManager:
     def _finish_identity_loading(self) -> None:
         """Resolve receivers discovered during loading before platforms create IDs."""
         self._identities_ready = True
+        pending = getattr(self.coordinator, "scanner_identity_pending", False) is True
+        if pending:
+            self.coordinator.scanner_identity_pending = False
         try:
             for scanner in tuple(getattr(self.coordinator, "get_scanners", ())):
                 resolve = getattr(scanner, "async_as_scanner_resolve_device_entries", None)
@@ -313,6 +318,8 @@ class ToolkitManager:
                     resolve()
         except BaseException:
             self._identities_ready = False
+            if pending:
+                self.coordinator.scanner_identity_pending = True
             raise
         self._available = True
 
@@ -486,7 +493,14 @@ class ToolkitManager:
         """Keep exactly evidenced historic entity identities when improving bindings."""
         if not self._identities_ready:
             return {}
-        key = source.lower()
+        key = _candidate_identity(source)
+        explicit = self.settings["scanner_identity_recovery"].get(key)
+        if explicit and (target := self._range_entity_identity(explicit["entity_id"])) is not None:
+            identity = {"unique_id": target, "entity_id_address": target}
+            if self._identities.get(key) != identity and (key in self._identities or len(self._identities) < 128):
+                self._identities[key] = identity
+                self._identity_dirty = True
+            return deepcopy(identity)
         if key not in self._identities:
             from .api import scanner_identity_from_registry_entry  # noqa: PLC0415
 
@@ -502,12 +516,94 @@ class ToolkitManager:
                 if (identity := scanner_identity_from_registry_entry(historical, source)) is not None
             ]
             preserved = evidenced[0] if evidenced and all(identity == evidenced[0] for identity in evidenced) else None
+            if not evidenced:
+                sources = self._range_entity_sources()
+                candidates = [identity for identity, owners in sources.items() if owners == {key}]
+                claimed = {
+                    _candidate_identity(value["entity_id_address"])
+                    for owner, value in self._identities.items()
+                    if owner != key
+                }
+                if len(candidates) == 1 and _candidate_identity(candidates[0]) not in claimed:
+                    preserved = {"unique_id": candidates[0], "entity_id_address": candidates[0]}
             identity = preserved or {"unique_id": proposed_uid, "entity_id_address": proposed_uid}
             if len(self._identities) < 128:
                 self._identities[key] = identity
                 self._identity_dirty = True
             return deepcopy(identity)
         return deepcopy(self._identities[key])
+
+    def _range_entity_identity(self, entity_id: str) -> str | None:
+        """Read a per-receiver suffix only from this entry's actual beacon device."""
+        registry = er.async_get(self.hass)
+        entity = registry.async_get(entity_id)
+        if entity is None or entity.platform != DOMAIN or entity.config_entry_id != self.entry.entry_id:
+            return None
+        unique_id = entity.unique_id
+        if (
+            not entity_id.startswith("sensor.")
+            or not isinstance(unique_id, str)
+            or not unique_id.endswith(("_range", "_range_raw"))
+        ):
+            return None
+        suffix = "_range_raw" if unique_id.endswith("_range_raw") else "_range"
+        device = self.coordinator.dr.async_get(entity.device_id) if entity.device_id else None
+        if device is None:
+            return None
+        owner = getattr(device, "config_entry_id", None)
+        if self.entry.entry_id not in ((owner,) if owner else getattr(device, "config_entries", ())):
+            return None
+        identities = {
+            unique_id[len(identifier) + 1 : -len(suffix)]
+            for domain, identifier in device.identifiers
+            if domain == DOMAIN and unique_id.startswith(f"{identifier}_")
+        }
+        if len(identities) != 1:
+            return None
+        identity = identities.pop()
+        return identity if 0 < len(identity) <= 256 else None
+
+    def _range_entity_sources(self) -> dict[str, set[str]]:
+        """Require exact current or restored source attributes; neighboring MACs are not proof."""
+        stored = restore_state.async_get(self.hass).last_states
+        sources: dict[str, set[str]] = {}
+        for entity in er.async_entries_for_config_entry(er.async_get(self.hass), self.entry.entry_id):
+            identity = self._range_entity_identity(entity.entity_id)
+            if identity is None:
+                continue
+            previous = stored.get(entity.entity_id)
+            for state in (self.hass.states.get(entity.entity_id), previous.state if previous else None):
+                source = state.attributes.get("area_scanner_mac") if state else None
+                if isinstance(source, str) and source:
+                    sources.setdefault(identity, set()).add(_candidate_identity(source))
+        return sources
+
+    def _validate_identity_recovery(self, settings: dict) -> None:
+        """Validate deliberate associations without changing any live or persisted identity."""
+        recoveries = settings["scanner_identity_recovery"]
+        if not recoveries:
+            return
+        known = {
+            _candidate_identity(scanner.address) for scanner in self.coordinator.get_scanners
+        } | self._identities.keys()
+        sources = self._range_entity_sources()
+        resolved = {}
+        for source, recovery in recoveries.items():
+            identity = self._range_entity_identity(recovery["entity_id"])
+            if source not in known or identity is None:
+                msg = "Choose a known scanner and an existing Bermuda range entity from this entry"
+                raise ValueError(msg)
+            if sources.get(identity, {source}) != {source}:
+                msg = "The selected range entity has evidence of a different scanner"
+                raise ValueError(msg)
+            resolved[source] = identity
+        claims = {
+            owner: value["entity_id_address"] for owner, value in self._identities.items() if owner not in resolved
+        }
+        claims.update(resolved)
+        if len({_candidate_identity(identity) for identity in claims.values()}) != len(claims):
+            msg = "Multiple scanners cannot claim the same existing entity identity"
+            raise ValueError(msg)
 
     def _device_id(self, advert: Any) -> str:
         return self._owners.get(advert, public_device_id(advert.device_address))
@@ -517,7 +613,7 @@ class ToolkitManager:
         options = self.coordinator.options
         reference = options.get(CONF_REF_POWER, DEFAULT_REF_POWER)
         offset = receiver_value(options.get(CONF_RSSI_OFFSETS, {}), advert.scanner_address, 0.0)
-        owner = device_id or self._device_id(advert)
+        owner = _candidate_identity(device_id or self._device_id(advert))
         settings = self.settings
         fixed = settings["fixed_references"].get(owner, {})
         if "reference_power" in fixed:
@@ -768,12 +864,18 @@ class ToolkitManager:
         """Durably prepare and acknowledge a recoverable normal HA options update."""
         baseline_options = deepcopy(dict(self.entry.options))
         previous_bindings = deepcopy(self.settings["scanner_bindings"])
+        previous_recovery = deepcopy(self.settings["scanner_identity_recovery"])
         baseline_modified = self.entry.modified_at.isoformat()
         previous_journal = deepcopy(self._options_journal)
         before = self._trial_state()
         settings = _settings(options.get(OPTIONS_KEY))
+        self._validate_identity_recovery(settings)
         options = deepcopy(options)
         namespace = dict(options.get(OPTIONS_KEY) or {}) if preserve_namespace else settings
+        if preserve_namespace:
+            for field in ("beacon_profiles", "filters", "fixed_references", "scanner_identity_recovery"):
+                if field in namespace:
+                    namespace[field] = deepcopy(settings[field])
         options[OPTIONS_KEY] = {**namespace, COMMIT_KEY: uuid.uuid4().hex}
         candidate_history = history or self.history
         if candidate_history.window_s != settings["history_window_s"]:
@@ -871,6 +973,12 @@ class ToolkitManager:
             self.trial = deepcopy(trial)
         self.last_applied, self.last_data_id = after["last_applied"], after["last_data_id"]
         self._notify_scanner_binding_change(previous_bindings)
+        if (
+            previous_recovery != self.settings["scanner_identity_recovery"]
+            and not self._closed
+            and not preserve_namespace
+        ):
+            self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     def _notify_scanner_binding_change(self, previous_bindings: dict) -> None:
         """Backfill receiver entities only after their binding is accepted."""
@@ -971,6 +1079,7 @@ class ToolkitManager:
         async with self._lock:
             if self._closed:
                 return True
+            previous_recovery = deepcopy(self.settings["scanner_identity_recovery"])
             new = deepcopy(dict(entry.options))
             excluded = {OPTIONS_KEY, CONF_RSSI_OFFSETS}
             old_other = {key: value for key, value in self._saved_options.items() if key not in excluded}
@@ -1001,7 +1110,7 @@ class ToolkitManager:
                         self._saved_options = latest
                         self._notify_scanner_binding_change(previous_bindings)
                     new_other = {key: value for key, value in latest.items() if key not in excluded}
-            if old_other != new_other:
+            if old_other != new_other or previous_recovery != self.settings["scanner_identity_recovery"]:
                 return False
         return True
 
@@ -1353,10 +1462,14 @@ class ToolkitManager:
                             touched.add(slot)
                         patched[field] = merged
                     change = patched
+                previous_recovery = deepcopy(self.settings["scanner_identity_recovery"])
                 options = deepcopy(dict(self.entry.options))
                 options[OPTIONS_KEY] = _settings({**self.settings, **change})
                 await self._persist_options(options)
-                return {"options": deepcopy(self.settings)}
+                return {
+                    "options": deepcopy(self.settings),
+                    "reload_scheduled": previous_recovery != self.settings["scanner_identity_recovery"],
+                }
             if action == "profile":
                 kind, key = payload.get("kind"), payload.get("id")
                 if kind not in ("receiver", "beacon") or not isinstance(key, str) or not key:
@@ -1375,7 +1488,7 @@ class ToolkitManager:
                 slot = (
                     receiver_value({existing: existing for existing in profiles}, key, key)
                     if kind == "receiver"
-                    else public_device_id(key)
+                    else _candidate_identity(public_device_id(key))
                 )
                 current = {**profiles.get(slot, {}), **profile}
                 for field in remove:

@@ -45,7 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> b
 
     if hass.data.get(DOMAIN) is None:
         _LOGGER.info(STARTUP_MESSAGE)
-    coordinator = BermudaDataUpdateCoordinator(hass, entry)
+    coordinator = BermudaDataUpdateCoordinator(hass, entry, defer_scanner_identities=True)
     coordinator.toolkit = ToolkitManager(coordinator)
     entry.runtime_data = BermudaData(coordinator)
 

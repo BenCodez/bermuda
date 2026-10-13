@@ -140,10 +140,15 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self,
         hass: HomeAssistant,
         entry: BermudaConfigEntry,
+        *,
+        defer_scanner_identities: bool = False,
     ) -> None:
         """Initialize."""
         self.platforms = []
         self.config_entry = entry
+        # Buffered Bluetooth callbacks can resolve scanners in this constructor,
+        # before the toolkit owner is attached and its saved identities are loaded.
+        self.scanner_identity_pending = defer_scanner_identities
 
         self.sensor_interval = entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
 
