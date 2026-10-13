@@ -39,6 +39,10 @@ def _ranges(backfill):
 def _assert_bound_entities(backfill):
     assert backfill.scanner.entry_id == backfill.target.id
     assert backfill.scanner.address_wifi_mac == NETWORK
+    assert backfill.scanner.address == backfill.scanner.address_ble_mac == SOURCE
+    assert backfill.scanner.area_id == backfill.target.area_id
+    assert backfill.scanner.name_by_user == "Synthetic Bound User Name"
+    assert backfill.scanner.name == "Synthetic Bound User Name"
     assert backfill.scanner.unique_id == backfill.identity["unique_id"]
     assert backfill.scanner.entity_id_address == backfill.identity["entity_id_address"]
     assert backfill.manager._identities[SOURCE] == backfill.identity
@@ -52,6 +56,9 @@ def _assert_bound_entities(backfill):
         assert registered.config_entry_id == backfill.entry.entry_id
     for device, advert in backfill.adverts.items():
         assert backfill.coordinator.devices[device].get_scanner(SOURCE) is advert
+        assert advert.scanner_address == SOURCE
+        assert advert.area_id == backfill.target.area_id
+        assert advert.name == "Synthetic Bound User Name"
         assert (advert.stamp, advert.rssi) == backfill.sources[device]
     return entities
 
@@ -139,10 +146,12 @@ async def backfill(hass, device_registry, tmp_path, monkeypatch, setup_bermuda_e
             assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+@pytest.mark.parametrize("binding_key", [SOURCE, SOURCE.upper()])
 async def test_binding_backfills_only_after_durable_acceptance_and_repeated_save_has_no_duplicates(
-    backfill, monkeypatch
+    backfill, monkeypatch, binding_key
 ):
     manager = backfill.manager
+    bindings = {binding_key: {"device_registry_id": backfill.target.id}}
     actual = manager.store._async_write_data
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
@@ -156,9 +165,7 @@ async def test_binding_backfills_only_after_durable_acceptance_and_repeated_save
         await actual(data)
 
     monkeypatch.setattr(manager.store, "_async_write_data", gated)
-    pending = asyncio.create_task(
-        manager.async_dispatch("settings", {"settings": {"scanner_bindings": backfill.bindings}})
-    )
+    pending = asyncio.create_task(manager.async_dispatch("settings", {"settings": {"scanner_bindings": bindings}}))
     try:
         await asyncio.wait_for(entered.wait(), 2)
         assert backfill.scanner.address_wifi_mac is None
@@ -169,11 +176,62 @@ async def test_binding_backfills_only_after_durable_acceptance_and_repeated_save
         release.set()
         await pending
     await backfill.hass.async_block_till_done()
+    assert manager.settings["scanner_bindings"] == bindings
+    assert backfill.entry.options[OPTIONS_KEY]["scanner_bindings"] == bindings
     entities = _assert_bound_entities(backfill)
     assert backfill.notices == [True]
-    await manager.async_dispatch("settings", {"settings": {"scanner_bindings": backfill.bindings}})
+    await manager.async_dispatch("settings", {"settings": {"scanner_bindings": bindings}})
     await backfill.hass.async_block_till_done()
     assert _assert_bound_entities(backfill) == entities
+    assert backfill.notices == [True]
+
+
+async def test_late_ordinary_registry_resolution_backfills_same_backend_once(backfill, device_registry):
+    matching_mac = "aa:bb:cc:dd:ee:10"
+    entry = MockConfigEntry(domain="esphome", entry_id="synthetic-late-network-proof", unique_id=matching_mac, data={})
+    entry.add_to_hass(backfill.hass)
+    target = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        connections={("mac", matching_mac)},
+        name="Synthetic Late Network Receiver",
+    )
+    area = backfill.coordinator.ar.async_create("Synthetic Late Receiver Area")
+    target = device_registry.async_update_device(target.id, area_id=area.id, name_by_user="Synthetic Late User Name")
+    await backfill.hass.async_block_till_done()
+    assert backfill.scanner.address_wifi_mac is None
+    assert all(entity is None for entity in _ranges(backfill).values())
+    backend = backfill.scanner._hascanner
+    source_connections = set(target.connections)
+    backfill.notices.clear()
+
+    backfill.coordinator._refresh_scanners(force=True)
+    await backfill.hass.async_block_till_done()
+    assert backfill.scanner._hascanner is backend
+    assert backfill.scanner.entry_id == target.id
+    assert backfill.scanner.address_wifi_mac == matching_mac
+    assert backfill.scanner.address == SOURCE
+    assert backfill.scanner.scanner_binding["method"] == "legacy_mac_offset"
+    assert backfill.scanner.area_id == area.id
+    assert backfill.scanner.name == "Synthetic Late User Name"
+    assert backfill.scanner.unique_id == backfill.identity["unique_id"]
+    assert backfill.scanner.entity_id_address == backfill.identity["entity_id_address"]
+    assert backfill.manager._identities[SOURCE] == backfill.identity
+    assert backfill.manager.settings["scanner_bindings"] == {}
+    assert device_registry.async_get(target.id).connections == source_connections
+    entities = _ranges(backfill)
+    assert all(entities.values())
+    assert len(set(entities.values())) == 4
+    assert backfill.notices == [True]
+    for device, advert in backfill.adverts.items():
+        assert backfill.coordinator.devices[device].get_scanner(SOURCE) is advert
+        assert advert.scanner_address == SOURCE
+        assert advert.area_id == area.id
+        assert advert.name == "Synthetic Late User Name"
+        assert (advert.stamp, advert.rssi) == backfill.sources[device]
+
+    backfill.coordinator._refresh_scanners(force=True)
+    await backfill.hass.async_block_till_done()
+    assert _ranges(backfill) == entities
     assert backfill.notices == [True]
 
 

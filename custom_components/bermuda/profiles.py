@@ -154,7 +154,15 @@ def normalize_fixed_reference(value: Mapping, *, device_id: str | None = None) -
         msg = "Fixed reference needs at least one measured range"
         raise ValueError(msg)
     for scanner, distance in ranges.items():
-        result["ranges"][_identifier(scanner, "scanner_id")] = _number(distance, 0.05, 1000.0, "range")
+        scanner_id = _identifier(scanner, "scanner_id")
+        # One physical receiver must have one measured truth before live
+        # lookups or recording can select different case representations.
+        scanner_id = receiver_value({scanner_id.lower(): scanner_id.lower()}, scanner_id, scanner_id)
+        measured = _number(distance, 0.05, 1000.0, "range")
+        if scanner_id in result["ranges"] and result["ranges"][scanner_id] != measured:
+            msg = "Fixed reference contains conflicting receiver aliases"
+            raise ValueError(msg)
+        result["ranges"][scanner_id] = measured
     if "reference_power" in reference:
         result["reference_power"] = _number(reference["reference_power"], -120.0, 0.0, "reference_power")
     if "reference_power_verified" in reference:

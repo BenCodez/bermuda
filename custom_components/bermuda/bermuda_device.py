@@ -53,6 +53,7 @@ from .const import (
     METADEVICE_PRIVATE_BLE_DEVICE,
     METADEVICE_TYPE_IBEACON_SOURCE,
 )
+from .profiles import receiver_value
 from .util import mac_math_offset, mac_norm
 from .util import mac_octet_offset as _mac_octet_offset
 
@@ -269,7 +270,13 @@ class BermudaDevice:
             # Actual object has not changed, but what the user has set on its
             # device registry entries may have.
             if force:
+                was_unresolved = self.address_wifi_mac is None
                 self.async_as_scanner_resolve_device_entries()
+                if self._is_remote_scanner and was_unresolved and self.address_wifi_mac is not None:
+                    # The sensor platform skipped this receiver while its
+                    # registry address was missing. Announce its eligibility
+                    # only after the refresh has resolved its metadata.
+                    self._coordinator.scanner_list_add(self)
             return
 
         # If we don't already have a self._hascanner, then this must be our
@@ -349,7 +356,7 @@ class BermudaDevice:
                     proofs[entry.entry_id] = mac_norm(base_mac)
         namespace = self.options.get("measurement_toolkit", {})
         bindings = namespace.get("scanner_bindings", {}) if isinstance(namespace, Mapping) else {}
-        binding = bindings.get(self.address) if isinstance(bindings, Mapping) else None
+        binding = receiver_value(bindings, self.address) if isinstance(bindings, Mapping) else None
         registry_id = binding.get("device_registry_id") if isinstance(binding, Mapping) else None
         return proofs, registry_id if isinstance(registry_id, str) else None
 

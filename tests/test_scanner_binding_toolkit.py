@@ -246,6 +246,38 @@ def test_missing_manual_binding_is_reported_without_rekey(hass, device_registry)
     assert scanner.address == SOURCE
 
 
+@pytest.mark.parametrize(
+    ("address", "bindings", "expected"),
+    [
+        (SOURCE, {SOURCE.upper(): {"device_registry_id": "upper"}}, "upper"),
+        (SOURCE.upper(), {SOURCE: {"device_registry_id": "lower"}}, "lower"),
+        (
+            SOURCE,
+            {SOURCE: {"device_registry_id": "exact"}, SOURCE.upper(): {"device_registry_id": "other"}},
+            "exact",
+        ),
+        (
+            SOURCE,
+            {
+                SOURCE.upper(): {"device_registry_id": "upper"},
+                "Aa:Bb:Cc:Dd:Ee:12": {"device_registry_id": "mixed"},
+            },
+            None,
+        ),
+        ("CaseSensitive/Source", {"CaseSensitive/Source": {"device_registry_id": "exact"}}, "exact"),
+        ("CaseSensitive/Source", {"casesensitive/source": {"device_registry_id": "other"}}, None),
+        ("zz:bb:cc:dd:ee:12", {"ZZ:BB:CC:DD:EE:12": {"device_registry_id": "invalid-mac"}}, None),
+    ],
+)
+def test_binding_lookup_uses_exact_then_unambiguous_valid_mac_alias(address, bindings, expected):
+    scanner = SimpleNamespace(
+        address=address,
+        options={"measurement_toolkit": {"scanner_bindings": bindings}},
+        _coordinator=SimpleNamespace(hass=None),
+    )
+    assert BermudaDevice._scanner_registry_proofs(scanner) == ({}, expected)
+
+
 def _flow(hass, names=("Shared Name", "Shared Name"), saved=None):
     scanners = {
         f"aa:bb:cc:dd:ee:{index + 1:02x}": SimpleNamespace(
