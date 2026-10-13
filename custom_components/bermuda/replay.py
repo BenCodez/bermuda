@@ -33,6 +33,35 @@ def _source_identity(identifier: str) -> str:
     return receiver_value({canonical: canonical}, identifier, identifier)
 
 
+def _source_stream(observation: dict[str, Any], epoch: int) -> tuple[int, str, str]:
+    return epoch, _source_identity(observation["device_id"]), _source_identity(observation["scanner_id"])
+
+
+def _accepted_observation(observation: dict[str, Any], previous: dict[str, Any] | None) -> bool:
+    return observation["status"] == "current" and (
+        previous is None
+        or (observation["stamp"] > previous["stamp"] and observation["observed"] >= previous["observed"])
+    )
+
+
+def _changed_filter_streams(frames: list[dict[str, Any]], modes: dict[str, str]) -> set[tuple[int, str, str]]:
+    """Choose a continuous candidate only when its accepted stream changes policy."""
+    changed = set()
+    if not modes:
+        return changed
+    clocks = {}
+    for frame in frames:
+        for observation in frame["observations"]:
+            stream = _source_stream(observation, frame["session_epoch"])
+            if not _accepted_observation(observation, clocks.get(stream)):
+                continue
+            clocks[stream] = observation
+            mode = receiver_value(modes, observation["device_id"])
+            if mode in ("pet", "stationary") and mode != observation["quality"].get("mode", "legacy"):
+                changed.add(stream)
+    return changed
+
+
 def _range_scale(delta_db: float, attenuation: float) -> float:
     """Reject unrepresentable candidates even for supported tiny legacy exponents."""
     try:
@@ -233,6 +262,7 @@ class ReplayEngine:
         rows = []
         clocks = {}
         filter_states = {}
+        changed_filter_streams = _changed_filter_streams(frames, modes)
         gaps = []
         duplicate_count = 0
         previous_capture = -1.0
@@ -242,16 +272,9 @@ class ReplayEngine:
             previous_capture = frame["captured_at"]
             labels = {truth["device_id"]: truth for truth in frame["truth"]}
             for observation in frame["observations"]:
-                stream = (
-                    frame["session_epoch"],
-                    _source_identity(observation["device_id"]),
-                    _source_identity(observation["scanner_id"]),
-                )
+                stream = _source_stream(observation, frame["session_epoch"])
                 previous = clocks.get(stream)
-                if observation["status"] != "current" or (
-                    previous
-                    and (observation["stamp"] <= previous["stamp"] or observation["observed"] < previous["observed"])
-                ):
+                if not _accepted_observation(observation, previous):
                     duplicate_count += 1
                     continue
                 origin = previous["origin"] if previous else observation["stamp"]
@@ -289,7 +312,10 @@ class ReplayEngine:
                     candidate = None
                     pipeline = "unavailable_legacy_history"
                     unavailable_reason = "legacy filter history cannot be reconstructed from this recording"
-                elif mode is not None and mode != current_mode:
+                elif stream in changed_filter_streams:
+                    # A changed policy runs over the entire retained stream.
+                    # Matching live segments may have reset their own state;
+                    # mixing those outputs would pause this candidate pipeline.
                     state = filter_states.get(stream)
                     if state is None:
                         state = filter_states[stream] = FilterState(mode)
