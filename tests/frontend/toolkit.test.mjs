@@ -811,7 +811,7 @@ for (const [action, label, tab] of proposalInvalidatingControls) {
         assert.equal(requests.length, requestCount, "a disabled Apply control cannot submit the stale proposal");
         if (action === "settings") assert.equal(component._options().auto_calibration, true, "options acknowledgement survives invalidation");
         if (action === "profile") assert.equal(component._profile("receiver", "receiver1").model, "saved metadata", "profile acknowledgement survives invalidation");
-        if (outcome === "refresh-failed") assert.equal(component._message, "Synthetic trailing refresh failure");
+        if (outcome === "refresh-failed") assert.match(component._message, /(?:completed\.|needs more evidence;).*Refresh failed: Synthetic trailing refresh failure/);
         await button(component, "Preview calibration").click();
         assert.equal(button(component, "Apply accepted proposal").disabled, false, "a fresh accepted preview restores Apply");
         await button(component, "Apply accepted proposal").click();
@@ -1120,7 +1120,7 @@ for (const action of ["profile", "settings"]) {
           assert.equal(component._drafts.has(draftName), newerEdit);
           assert.equal(component._draftVersions.get(draftName), draftVersion);
           if (newerEdit) assert.equal(component._drafts.get(draftName), newer);
-          if (trailingFails) assert.equal(component._message, "Synthetic trailing refresh failure");
+          if (trailingFails) assert.match(component._message, /completed\..*Refresh failed: Synthetic trailing refresh failure/);
           else {
             assert.equal(field(component, "Receiver RSSI offset (dB)").value, "7");
             assert.equal(field(component, "Enable reliability weighting").checked, true);
@@ -1802,4 +1802,141 @@ test("new entry reverts remain scoped to the new entry after an old acknowledgem
   assert.equal(field(component, "model").value, "original");
   assert.equal(component._drafts.get("profile-model"), "original");
   assert.equal(component._entryId, "new-entry");
+});
+
+function historySummary(enabled, rows = 0) {
+  return { enabled, session_epoch: 2, frames: rows ? 1 : 0, rows, bytes: rows ? 500 : 2, selected_devices: ["device1"], dropped_rows: 0,
+    limits: { window_s: 1200, max_frames: 512, max_rows: 8192, max_bytes: 2 * 1024 * 1024 }, persistence: "in memory; integration controls explicit import and local persistence" };
+}
+
+for (const [action, label] of [["history_start", "Start recording"], ["history_stop", "Stop recording"], ["history_clear", "Clear history"], ["history_import", "Import recording"]]) {
+  for (const refreshFails of [false, true]) test(`${action} acknowledgement adopts real enabled summary when refresh fails=${refreshFails}`, async () => {
+    const initial = historySummary(action !== "history_start", 3);
+    const accepted = historySummary(action !== "history_stop", action === "history_import" ? 2 : 0);
+    const server = { ...state(), history: { ...initial, running: initial.enabled }, calibration: { proposal: { eligible: true, proposal_id: "old" } } };
+    server.options.history_enabled = initial.enabled;
+    const requests = [];
+    const component = panel(async (method, path, payload) => {
+      if (method === "POST") {
+        requests.push(payload);
+        server.history = { ...accepted, running: accepted.enabled };
+        server.options.history_enabled = accepted.enabled;
+        server.calibration.proposal = null;
+        return structuredClone(accepted);
+      }
+      if (refreshFails) throw new Error("Synthetic trailing history refresh failure");
+      return structuredClone(server);
+    });
+    component._state = structuredClone(server); component._activeTab = 1; component._render();
+    await edit(component, "Independent location label", "Newer measured label");
+    component._activeTab = 2; component._render();
+    if (action === "history_import") {
+      field(component, "Import recording JSON (maximum 2 MiB)").files = [{ size: 32, text: async () => '{"schema_version":1,"frames":[]}' }];
+    }
+    await button(component, label).click();
+    assert.equal(requests.length, 1);
+    assert.deepEqual(component._state.history, { ...accepted, running: accepted.enabled });
+    assert.equal(component._options().history_enabled, accepted.enabled);
+    assert.equal(component._state.calibration.proposal, null);
+    assert.equal(component._drafts.get("capture-location"), "Newer measured label");
+    assert.match(component._message, new RegExp(`${action.replaceAll("_", " ")} completed\\.`));
+    if (refreshFails) assert.match(component._message, /Refresh failed: Synthetic trailing history refresh failure/);
+    assert.equal(button(component, "Start recording").disabled, accepted.enabled);
+    if (accepted.enabled) {
+      // A source packet received after the acknowledgement must not be cleared by a retry.
+      server.history.rows += 1;
+      button(component, "Start recording").disabled = false;
+      await button(component, "Start recording").click();
+      assert.equal(requests.length, 1);
+      assert.equal(server.history.rows, accepted.rows + 1);
+    }
+  });
+}
+
+for (const action of ["capture", "settings"]) {
+  for (const refreshFails of [false, true]) test(`${action} acknowledgement updates coupled recording state when refresh fails=${refreshFails}`, async () => {
+    const accepted = historySummary(true, 4);
+    const server = { ...state(), history: { ...historySummary(false), running: false } };
+    server.options.history_enabled = false;
+    const requests = [];
+    const component = panel(async (method, path, payload) => {
+      if (method === "POST") {
+        requests.push(payload); server.history = { ...accepted, running: true };
+        server.options = { ...server.options, history_enabled: true, history_window_s: 1200 };
+        return action === "capture" ? { captured: 1, history: structuredClone(accepted) } : { options: structuredClone(server.options) };
+      }
+      if (refreshFails) throw new Error("Synthetic coupled refresh failure");
+      return structuredClone(server);
+    });
+    component._state = structuredClone(server); component._activeTab = action === "capture" ? 1 : 0; component._render();
+    if (action === "capture") {
+      await edit(component, "Independent location label", "Synthetic independent capture site");
+      await edit(component, "Measured slant range to Receiver one (receiver1) (m)", "2.5");
+      await button(component, "Capture labelled readings").click();
+    } else {
+      await edit(component, "History window (seconds)", "1200");
+      await button(component, "Save runtime settings").click();
+    }
+    assert.equal(requests[0].action, action);
+    assert.equal(component._state.history.running, true);
+    assert.equal(component._state.history.enabled, true);
+    assert.equal(component._options().history_enabled, true);
+    assert.equal(component._state.history.limits.window_s, 1200);
+    if (action === "capture") assert.equal(component._state.history.rows, 4);
+    assert.match(component._message, /completed\./);
+    if (refreshFails) assert.match(component._message, /Refresh failed: Synthetic coupled refresh failure/);
+    component._activeTab = 2; component._render();
+    assert.equal(button(component, "Start recording").disabled, true);
+  });
+}
+
+test("a coalesced older GET cannot undo accepted recording or hide a failed trailing refresh", async () => {
+  const older = deferred(); const trailing = deferred(); let gets = 0; const accepted = historySummary(true, 1);
+  const component = panel(async method => method === "POST" ? structuredClone(accepted) : (++gets === 1 ? older.promise : trailing.promise));
+  component._state = { ...state(), history: { ...historySummary(false), running: false } };
+  component._activeTab = 2; component._render();
+  const reading = component.refresh();
+  const starting = button(component, "Start recording").click();
+  await tick();
+  assert.equal(component._state.history.running, true);
+  older.resolve({ ...state(), history: { ...historySummary(false), running: false } }); await tick();
+  assert.equal(component._state.history.running, true);
+  assert.equal(gets, 2);
+  trailing.reject(new Error("Synthetic coalesced trailing failure")); await Promise.all([reading, starting]);
+  assert.deepEqual(component._state.history, { ...accepted, running: true });
+  assert.match(component._message, /history start completed\. Refresh failed: Synthetic coalesced trailing failure/);
+  assert.equal(button(component, "Start recording").disabled, true);
+});
+
+test("history export remains a recording payload when its trailing refresh fails", async () => {
+  const history = { ...historySummary(true, 3), running: true };
+  const exported = { schema_version: 1, session_epoch: 2, selected_devices: ["device1"], frames: [] };
+  const component = panel(async method => { if (method === "POST") return exported; throw new Error("Synthetic export refresh failure"); });
+  component._state = { ...state(), history }; component._activeTab = 2; component._download = () => {}; component._render();
+  await button(component, "Export JSON").click();
+  assert.deepEqual(component._state.history, history);
+  assert.equal(component._results.history_export, exported);
+  assert.match(component._message, /history export completed\. Refresh failed:/);
+});
+
+test("clearing receiver reference power sends no beacon verification field and restores inheritance", async () => {
+  const server = state(); server.options.receiver_profiles = { receiver1: { reference_power: -61, rssi_offset: 5, model: "Known receiver" } };
+  const calls = [];
+  const component = panel(async (method, path, payload) => {
+    if (method === "GET") return structuredClone(server);
+    calls.push(payload);
+    assert.deepEqual(payload.profile, {});
+    assert.deepEqual(payload.remove, ["reference_power"]);
+    const merged = { ...server.options.receiver_profiles.receiver1, ...payload.profile };
+    for (const key of payload.remove) delete merged[key];
+    assert.equal(Object.hasOwn(merged, "reference_power_verified"), false);
+    server.options.receiver_profiles.receiver1 = merged;
+    return { profile: structuredClone(merged) };
+  });
+  component._state = structuredClone(server); component._render();
+  await edit(component, "Reference power at 1 m (dBm)", ""); await button(component, "Save profile").click();
+  assert.equal(calls.length, 1);
+  assert.equal(field(component, "Reference power at 1 m (dBm)").value, "");
+  assert.equal(field(component, "Receiver RSSI offset (dB)").value, "5");
+  assert.equal(field(component, "model").value, "Known receiver");
 });

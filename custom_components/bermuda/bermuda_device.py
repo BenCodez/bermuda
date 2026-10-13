@@ -857,10 +857,16 @@ class BermudaDevice:
             nearest_scanner = None
             uses_filter = getattr(toolkit, "advert_uses_optional_filter", None)
             optional_filter = False
+            has_limit = getattr(toolkit, "receiver_has_limit", None)
+            configured_selection = (
+                bool(self.adverts) and getattr(toolkit, "settings", {}).get("reliability_weighting", False) is True
+            )
             for advert in self.adverts.values():
                 distance = advert.set_ref_power(new_ref_power)
                 if callable(uses_filter) and uses_filter(advert):
                     optional_filter = True
+                if callable(has_limit) and has_limit(advert.scanner_address) is True:
+                    configured_selection = True
                 if distance is not None and distance < nearest_distance:
                     nearest_distance = distance
                     nearest_scanner = advert
@@ -872,9 +878,9 @@ class BermudaDevice:
             # changed due to ref_power), we still call apply so that the new area_distance
             # gets applied.
             # if nearest_scanner is not None:
-            if optional_filter:
-                # Optional filters elect from accepted ranges, using the same
-                # eligibility, receiver caps and reliability as ordinary updates.
+            if optional_filter or configured_selection:
+                # Optional filters and configured receiver policies use ordinary
+                # eligibility, caps, reliability and area-election hysteresis.
                 self._coordinator._refresh_area_by_min_distance(self)  # noqa: SLF001
             else:
                 self.apply_scanner_selection(nearest_scanner)

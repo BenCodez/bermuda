@@ -28,7 +28,11 @@ _PROFILE_NUMBERS = {
     "antenna_gain_dbi": (-30.0, 30.0),
     "distance_accuracy_m": (0.0, 100.0),
 }
-_PROFILE_BOOLS = frozenset({"reference_power_verified"})
+_PROFILE_MODEL_KEYS = {
+    "receiver": frozenset({"reference_power", "attenuation", "rssi_offset"}),
+    "beacon": frozenset({"reference_power", "attenuation", "reference_power_verified"}),
+}
+_PROFILE_METADATA_NUMBERS = _PROFILE_NUMBERS.keys() - {"reference_power", "attenuation", "rssi_offset"}
 _SETTINGS_KEYS = frozenset(
     {
         "receiver_profiles",
@@ -96,9 +100,9 @@ def normalize_profile(value: Mapping, *, kind: str = "receiver") -> dict:
         msg = "kind must be receiver or beacon"
         raise ValueError(msg)
     profile = _mapping(value, "profile", 20)
-    allowed = _PROFILE_TEXT | _PROFILE_NUMBERS.keys() | _PROFILE_BOOLS | {"antenna_gain_db"}
+    allowed = _PROFILE_TEXT | _PROFILE_METADATA_NUMBERS | _PROFILE_MODEL_KEYS[kind] | {"antenna_gain_db"}
     if set(profile) - allowed:
-        msg = "Unknown profile fields"
+        msg = f"Unsupported {kind} profile fields"
         raise ValueError(msg)
     result = {}
     for raw_key, item in profile.items():

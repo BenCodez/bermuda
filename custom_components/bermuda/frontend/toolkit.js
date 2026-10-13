@@ -131,8 +131,10 @@ export class BermudaToolkitPanel extends HTMLElement {
       return this._refreshPromise;
     }
     this._refreshPromise = (async () => {
+      let outcome = {};
       do {
         this._refreshAgain = false;
+        outcome = {};
         const generation = this._generation;
         const snapshotRevision = this._snapshotRevision;
         const path = this._entryId ? `bermuda/toolkit?entry_id=${encodeURIComponent(this._entryId)}` : "bermuda/toolkit";
@@ -146,13 +148,15 @@ export class BermudaToolkitPanel extends HTMLElement {
           }
         } catch (error) {
           if (this._isCurrent(generation) && snapshotRevision === this._snapshotRevision) {
+            outcome = { error };
             this._message = this._errorText(error);
             this._render();
           }
         }
       } while (this._refreshAgain && this._isCurrent(this._generation));
+      return outcome;
     })();
-    try { await this._refreshPromise; } finally { this._refreshPromise = null; }
+    try { return await this._refreshPromise; } finally { this._refreshPromise = null; }
   }
 
   _errorText(error) {
@@ -182,7 +186,18 @@ export class BermudaToolkitPanel extends HTMLElement {
           this._draftVersions.delete(name);
         }
       }
-      if (result?.options && this._state) this._state = { ...this._state, options: result.options };
+      if (result?.options && this._state) {
+        const history = { ...this._state.history };
+        if (typeof result.options.history_enabled === "boolean") history.enabled = history.running = result.options.history_enabled;
+        if (Number.isFinite(result.options.history_window_s)) history.limits = { ...history.limits, window_s: result.options.history_window_s };
+        this._state = { ...this._state, options: result.options, history };
+      }
+      const history = ["history_start", "history_stop", "history_clear", "history_import"].includes(action) ? result : action === "capture" ? result?.history : null;
+      if (this._state && typeof history?.enabled === "boolean") {
+        const options = { ...this._options(), history_enabled: history.enabled };
+        if (Number.isFinite(history.limits?.window_s)) options.history_window_s = history.limits.window_s;
+        this._state = { ...this._state, history: { ...history, running: history.enabled }, options };
+      }
       if (action === "profile" && result?.profile && this._state) {
         const key = `${payload.kind}_profiles`;
         const options = this._options();
@@ -194,9 +209,13 @@ export class BermudaToolkitPanel extends HTMLElement {
       const pending = result?.eligible === false || result?.accepted === false || result?.status === "pending" || result?.state === "absent";
       this._message = pending ? `${action.replaceAll("_", " ")} needs more evidence; see results and rejection reasons.` : `${action.replaceAll("_", " ")} completed.`;
       if (submitted.some(([name]) => this._drafts.has(name))) this._message += " Newer edits remain unsaved.";
+      const completedMessage = this._message;
       if (download) this._download(result, "bermuda-history.json");
-      await this.refresh();
-      if (this._isCurrent(generation)) return result;
+      const refreshed = await this.refresh();
+      if (this._isCurrent(generation)) {
+        if (refreshed?.error) this._message = `${completedMessage} Refresh failed: ${this._errorText(refreshed.error)}`;
+        return result;
+      }
     } catch (error) {
       if (this._isCurrent(generation)) this._message = this._errorText(error);
     } finally {
@@ -626,9 +645,10 @@ export class BermudaToolkitPanel extends HTMLElement {
     const devices = this._targetSelect(history, "Record device (or all tracked devices)", "history-device", "recording", [], "");
     const buttons = node("div", undefined, { class: "buttons" });
     this._button(buttons, "Start recording", () => {
+      if (this._state.history?.running === true) return;
       if (!this._targetAvailable(devices)) throw new Error("Choose an available device or all tracked devices.");
       return this._perform("history_start", { devices: devices.value ? [devices.value] : [] });
-    }, { disabled: !this._targetAvailable(devices) });
+    }, { disabled: this._state.history?.running === true || !this._targetAvailable(devices) });
     this._button(buttons, "Stop recording", () => this._perform("history_stop"));
     this._button(buttons, "Clear history", () => this._perform("history_clear"));
     const redact = this._field(history, "Redact recording identifiers for sharing", "history-redact", true, { type: "checkbox" });

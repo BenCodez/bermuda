@@ -242,7 +242,7 @@ def test_huge_integers_and_booleans_are_not_finite_radio_numbers():
 
 def test_profile_verification_requires_an_explicit_reference_power():
     with pytest.raises(ValueError):
-        normalize_profile({"reference_power_verified": True})
+        normalize_profile({"reference_power_verified": True}, kind="beacon")
     with pytest.raises(ValueError):
         normalize_profile({"antenna_gain_db": 1, "antenna_gain_dbi": 1})
 
