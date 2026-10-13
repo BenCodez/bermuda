@@ -41,6 +41,28 @@ To replace upstream or bermuda-patched while preserving your installation:
 
 The HACS repository/package selection changes; Home Assistant's integration configuration entries stay in place. Only one downloaded implementation can occupy `custom_components/bermuda`, so install this as a replacement, not a parallel integration. To return to upstream, replace only the HACS package with the upstream package and restart, retaining the Home Assistant integration entries. Existing legacy options remain in their original namespace.
 
+### Release update notifications
+
+HACS provides the Home Assistant update entity for this fork. Register and download
+**BenCodez/bermuda**, select a numbered release rather than `main`, and restart Home
+Assistant. Releases appear after HACS refreshes its repository information; use
+the repository's **Update information** action to check sooner.
+
+If HACS shows a newer release but Home Assistant's **Settings → System → Updates**
+does not, check **Settings → Devices & services → Entities**, filter by **HACS** and
+the `update` domain, and enable this repository's update entity if disabled. A
+manual file replacement does not register the fork with HACS or create its update
+entity. Keep your existing Bermuda integration configuration when switching packages.
+
+For maintainers: publish a new, higher numeric version tag such as `v1.0.3`,
+targeting the commit containing the release workflow. Wait for the **Release**
+action to attach `bermuda.zip`; the ZIP's manifest and runtime versions are stamped
+from the tag and verified. The component domain remains `bermuda`, and the ZIP
+continues to be signed. Draft releases do not trigger packaging. Prereleases such
+as `v1.0.3-beta.1` require beta releases enabled in HACS; use a normal release for
+standard update notifications. Publishing a release does not push an immediate
+notification to Home Assistant.
+
 ## Patched baseline: 18 inherited fixes
 
 | Fix | Upstream PR |
