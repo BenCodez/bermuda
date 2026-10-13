@@ -605,16 +605,39 @@ class DiagnosticHistory:
     def _pseudonym(self, identifier: str) -> str:
         return "id_" + hashlib.sha256((self._redaction_salt + identifier).encode()).hexdigest()[:24]
 
+    @classmethod
+    def _validate_receiver_clocks(cls, frames: list[dict[str, Any]]) -> None:
+        """Reject clock collisions that canonical receiver pseudonyms would merge."""
+        clocks = {}
+        for frame in frames:
+            for row in frame["observations"]:
+                key = frame["session_epoch"], row["device_id"], cls._clock_id(row["scanner_id"])
+                previous = clocks.get(key)
+                if previous and (row["stamp"] <= previous[0] or row["observed"] < previous[1]):
+                    _fail("history contains duplicate or backwards receiver clocks after MAC normalization")
+                clocks[key] = row["stamp"], row["observed"]
+
     def _redact_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
         result = deepcopy(frame)
         for row in result["observations"]:
-            row["device_id"], row["scanner_id"] = self._pseudonym(row["device_id"]), self._pseudonym(row["scanner_id"])
-            if "source_id" in row:
-                row["source_id"] = self._pseudonym(row["source_id"])
+            source = row.get("source_id", row["device_id"])
+            canonical_source = self._clock_id(source)
+            # Logical device IDs remain exact. Preserve a legacy row's physical
+            # MAC fallback explicitly when its logical pseudonym would differ.
+            if "source_id" in row or canonical_source != source:
+                row["source_id"] = self._pseudonym(canonical_source)
+            row["device_id"] = self._pseudonym(row["device_id"])
+            row["scanner_id"] = self._pseudonym(self._clock_id(row["scanner_id"]))
         for label in result["truth"]:
             label["device_id"] = self._pseudonym(label["device_id"])
             label["location_id"] = self._pseudonym(label["location_id"])
-            label["ranges"] = {self._pseudonym(scanner): distance for scanner, distance in label["ranges"].items()}
+            ranges = {}
+            for scanner, distance in label["ranges"].items():
+                canonical_scanner = self._clock_id(scanner)
+                if canonical_scanner in ranges:
+                    _fail("truth ranges contain MAC case aliases that cannot be redacted")
+                ranges[canonical_scanner] = distance
+            label["ranges"] = {self._pseudonym(scanner): distance for scanner, distance in ranges.items()}
         return result
 
     def _frame_budget(self, frame: dict[str, Any]) -> int:
@@ -685,6 +708,8 @@ class DiagnosticHistory:
         """Export already-redacted frozen data without any path or private key fields."""
         if type(redact) is not bool:
             _fail("redact must be a boolean")
+        if redact:
+            self._validate_receiver_clocks(self._frames)
         result = {
             "schema_version": SCHEMA_VERSION,
             "session_epoch": self.session_epoch,
@@ -846,6 +871,7 @@ class DiagnosticHistory:
                 if previous and (row["stamp"] <= previous[0] or row["observed"] < previous[1]):
                     _fail("import contains duplicate or backwards source clocks")
                 clocks[key] = row["stamp"], row["observed"]
+        self._validate_receiver_clocks(frames)
         imported_epoch = epoch if resume else epoch + 1
         # Numeric normalization and identifier redaction can enlarge valid raw
         # JSON. Apply the producer's canonical/redacted budget to detached data,
