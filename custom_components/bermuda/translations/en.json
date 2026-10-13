@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Bermuda BLE Trilateration",
-        "description": "If you need help with the configuration have a look at our [GitHub page](https://github.com/agittins/bermuda)",
+        "description": "If you need help with the configuration have a look at our GitHub page",
         "data": {
           "username": "Username",
           "password": "Password"
@@ -20,6 +20,8 @@
   "options": {
     "error": {
       "some_active": "You have at least some active devices, this is good.",
+      "scanner_changed": "Scanner identities changed while this form was open. Reopen calibration before saving offsets.",
+      "invalid_scanner_offsets": "Enter a finite numeric RSSI offset for each selected scanner.",
       "no_scanners": "You need to configure some bluetooth scanners before Bermuda will have anything to work with. \nAny one of esphome bluetooth_proxy, Shelly bluetooth proxy or local bluetooth adaptor should get you started.",
       "no_devices": "No bluetooth devices are actively being reported from your scanners. \nYou will need to solve this before Bermuda can be of much help."
     },

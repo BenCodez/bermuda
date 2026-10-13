@@ -97,7 +97,12 @@ class BermudaNumber(BermudaEntity, RestoreNumber):
         await super().async_added_to_hass()
         self.restored_data = await self.async_get_last_number_data()
         if self.restored_data is not None and self.restored_data.native_value is not None:
-            self.coordinator.devices[self.address].set_ref_power(self.restored_data.native_value)
+            self._set_ref_power_and_invalidate(self.restored_data.native_value)
+
+    def _set_ref_power_and_invalidate(self, value: float) -> None:
+        """A changed effective beacon model invalidates advisory evidence too."""
+        device = self.coordinator.devices[self.address]
+        device.set_ref_power(value, invalidate_model=True)
 
     @property
     def native_value(self) -> float | None:
@@ -109,7 +114,7 @@ class BermudaNumber(BermudaEntity, RestoreNumber):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set value."""
-        self.coordinator.devices[self.address].set_ref_power(value)
+        self._set_ref_power_and_invalidate(value)
         self.async_write_ha_state()
         # Beware that STATE_DUMP_INTERVAL for restore_state's dump_state
         # is 15 minutes, so if HA is killed instead of exiting cleanly,

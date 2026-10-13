@@ -1,6 +1,78 @@
+# Bermuda BLE Trilateration: BenCodez measurement toolkit fork
+
+This custom fork adds measurement, independently labelled calibration and diagnostics to [Bermuda by Ashley Gittins](https://github.com/agittins/bermuda), with the 18 fixes inherited from [davidcoulson/bermuda-patched](https://github.com/davidcoulson/bermuda-patched). It is not an official upstream release. The integration domain remains `bermuda`; existing devices, entity identities and settings remain compatible, and legacy tracking stays the default.
+
+Open the administrator **Bermuda toolkit** sidebar panel after installation. Read the [measurement toolkit guide](docs/measurement-toolkit.md) for controls, measured calibration, defaults, limits and privacy, or the [panel reference](docs/toolkit-panel.md) for a shorter walkthrough.
+
+## Twelve additions
+
+1. **Stable measurement API:** source IDs/stamps, raw RSSI, raw/filtered range, quality and effective models without hundreds of distance entities.
+2. **Reliable scanner matching:** explicit Bluetooth/config-entry bindings, preserved scanner identities and duplicate-name calibration selectors.
+3. **Scanner health:** packet freshness, cadence, last-valid data and structured rejection reasons.
+4. **Live corrections:** calibration preview, explicit apply and saved applicable rollback.
+5. **Guided measured calibration:** slant distances in metres, independent locations/beacons and held-out validation.
+6. **Safe automatic calibration:** opt-in independent evidence, capped steps, cooldown and regression rollback.
+7. **Receiver/beacon profiles:** hardware notes and explicit radio parameters, with inherited defaults.
+8. **Receiver reliability and radius limits:** optional election weights and local limits while preserving distant raw observations.
+9. **Per-device filtering:** optional pet/stationary policies that reject spikes and accept sustained movement; legacy remains default.
+10. **Bounded history, replay and shadow:** locally saved labelled snapshots, redacted exports and explicit validated promotion.
+11. **Supervised room fingerprints:** independent user labels, unknown/ambiguity rejection, advisory Suggested Area and optional guarded live selection.
+12. **Runtime performance diagnostics:** completed update timing, observation counts, bounded workers and skipped background cycles.
+
+Automatic calibration, reliability weighting, fingerprint live area selection and continuous recording are **off by default**. Hardware descriptions and antenna ratings do not create invented calibration corrections. Explicit measured captures and configured fixed references can save bounded local evidence while continuous recording is off. Range error measures ranging, not map position accuracy.
+
+## Install this fork with HACS
+
+Use the custom repository **`https://github.com/BenCodez/bermuda`**, category **Integration**:
+
+[![Open this fork in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
+
+For a new installation, add that repository in **HACS → Custom repositories**, download its Bermuda package, restart Home Assistant and add **Bermuda BLE Trilateration** under **Settings → Devices & services**.
+
+Normal HACS downloads require a published release from this fork with its `bermuda.zip` asset. While the feature PR is unmerged or unreleased, its branch source ZIP can be used for the manual replacement below.
+
+To replace upstream or bermuda-patched while preserving your installation:
+
+1. **Keep the existing Bermuda integration entries under Settings → Devices & services**; do not delete their devices/entities/settings or add a second Bermuda entry.
+2. In HACS, remove the previously downloaded Bermuda package and install this fork's release before restarting. If HACS displays **Integration is configured**, use **Ignore** when offered to retain the Home Assistant configuration. If HACS requires deleting the integration and offers no **Ignore**, use the manual replacement below. Add the BenCodez custom repository above and check the repository owner when similarly named entries appear.
+3. Restart Home Assistant. The existing `bermuda` entries load the fork and keep their established entity identities and option keys.
+
+**Manual replacement:** Keep the Home Assistant entries and `.storage` intact. Replace only `config/custom_components/bermuda` with this fork's component files. From a branch source ZIP, copy its `custom_components/bermuda` directory. A release's `bermuda.zip` contains the component files at the archive root; extract them directly into `config/custom_components/bermuda`, without another nested `bermuda` folder. Complete the replacement before restarting Home Assistant. If the old HACS repository remains registered, an update from it can overwrite these files; switch HACS to this fork's repository for future updates.
+
+The HACS repository/package selection changes; Home Assistant's integration configuration entries stay in place. Only one downloaded implementation can occupy `custom_components/bermuda`, so install this as a replacement, not a parallel integration. To return to upstream, replace only the HACS package with the upstream package and restart, retaining the Home Assistant integration entries. Existing legacy options remain in their original namespace.
+
+## Patched baseline: 18 inherited fixes
+
+| Fix | Upstream PR |
+|---|---|
+| Metadevices now copy their source's name, manufacturer and beacon fields (the copy loop was a no-op) | [#832](https://github.com/agittins/bermuda/pull/832) |
+| A duplicate entry in the prune list no longer raises `KeyError` and aborts the update cycle | [#833](https://github.com/agittins/bermuda/pull/833) |
+| One scanner that cannot be resolved no longer stops entity creation for every other scanner, and a scanner that comes up after startup gets its distance sensors without a reload | [#835](https://github.com/agittins/bermuda/pull/835) |
+| IRKs are no longer written in full to diagnostics or the debug log | [#840](https://github.com/agittins/bermuda/pull/840) |
+| `bermuda.dump_devices` requires an admin when the call carries a user | [#842](https://github.com/agittins/bermuda/pull/842) |
+| Changing a proxy's area takes effect without a reload (and the "no AREA" repair clears) | [#857](https://github.com/agittins/bermuda/pull/857) |
+| A proxy is matched to its own registry entry, not a neighbour's with an adjacent MAC (#859) | [#860](https://github.com/agittins/bermuda/pull/860) |
+| A proxy's own entry beats a router integration's entry for the same MAC (wrong name, "no AREA" repair, #722) | [#862](https://github.com/agittins/bermuda/pull/862) |
+| Random BLE addresses are classified correctly (a bitwise `&` where `==` was meant left random-static ones mislabelled) | [#863](https://github.com/agittins/bermuda/pull/863) |
+| Device pruning no longer raises `IndexError` when too few devices can be pruned, and prunes the right number | [#848](https://github.com/agittins/bermuda/pull/848) (by @barneyonline) |
+| Scanners are found with Home Assistant's supported registry lookup (the old one is removed in 2027.9) | [#847](https://github.com/agittins/bermuda/pull/847) (by @barneyonline) |
+| Scanner lists in the options and calibration screens are sorted by name | [#836](https://github.com/agittins/bermuda/pull/836) (by @BrawnyBravo) |
+| An attenuation of 0 (or NaN) in the options no longer aborts every update cycle; both distance settings are validated | [#864](https://github.com/agittins/bermuda/pull/864) |
+| A ref_power change shows the new distances at once (the cache-bypass check could never pass) | [#865](https://github.com/agittins/bermuda/pull/865) |
+| A truncated iBeacon advert no longer creates a bogus `None_None_None` beacon | [#866](https://github.com/agittins/bermuda/pull/866) |
+| iBeacons nobody tracks are pruned once they go stale, instead of piling up forever | [#867](https://github.com/agittins/bermuda/pull/867) |
+| Deleting a tracked device stops tracking it (iBeacon ids were split at an underscore, and the device list re-enabled it every cycle) | [#868](https://github.com/agittins/bermuda/pull/868) |
+| Fewer recorder rows: Distance is republished only when it moves by max(0.2 m, 10%), and Floor no longer carries the area attributes | [#869](https://github.com/agittins/bermuda/pull/869) |
+
+The fixes above come from the patched baseline and credited upstream pull requests. They are separate from this fork's twelve toolkit additions; their inclusion does not imply an official upstream release. Report fork-specific problems in the relevant [BenCodez/bermuda pull-request discussion](https://github.com/BenCodez/bermuda/pulls); this fork currently has repository issues disabled.
+
+The following general Bermuda documentation and artwork are retained from upstream. The upstream wiki explains shared tracking setup; the [measurement toolkit guide](docs/measurement-toolkit.md) describes this fork's additions.
+
+---
+
 ![Bermuda Logo](img/logo@2x.png)
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+[![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 # Bermuda BLE Trilateration
 
@@ -9,14 +81,14 @@
 - (eventually) Triangulate device positions! Like, on a map. Maybe.
 
 
-[![GitHub Release][releases-shield]][releases]
+[![Upstream Bermuda Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
 [![License][license-shield]](LICENSE)
 [![HomeAssistant Minimum Version][haminverbadge]][haminver]
 [![pre-commit][pre-commit-shield]][pre-commit]
 [![Black][black-shield]][black]
 [![hacs][hacsbadge]][hacs]
-[![Project Maintenance][maintenance-shield]][user_profile]
+[![Upstream Project Maintenance][maintenance-shield]][user_profile]
 [![Discord][discord-shield]][discord]
 [![Community Forum][forum-shield]][forum]
 
@@ -49,7 +121,7 @@ Bermuda aims to let you track any bluetooth device, and have Home Assistant tell
 - Some bluetooth BLE devices you want to track. Phones, smart watches, beacon tiles, thermometers etc.
 
 - Bermuda! I strongly recommend installing Bermuda via HACS:
-  [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+  [![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 ## Documentation and help
 
@@ -135,10 +207,9 @@ a fair amount of ESPresense's wheel.
 
 ## Installation
 
-You can install Bermuda by opening HACS on your Home Assistant instance and searching for "Bermuda".
-Alternatively you can click the button below to be automatically redirected.
+Install this fork through its HACS custom repository as described in [Install this fork with HACS](#install-this-fork-with-hacs). Searching the default catalog can instead select upstream Bermuda. The button below opens the BenCodez repository.
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=agittins&repository=bermuda&category=Integration)
+[![Open this fork in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=BenCodez&repository=bermuda&category=Integration)
 
 You should now be able to add the `Bermuda BLE Trilateration` integration. Once you have done that,
 you need to restart Home Assistant, then in `Settings`, `Devices & Services` choose `Add Integration`
@@ -183,11 +254,11 @@ Code template was mainly taken from [@Ludeeus](https://github.com/ludeeus)'s [in
 [buymecoffee]: https://www.buymeacoffee.com/AshleyGittins
 [buymecoffeebadge]: https://img.shields.io/badge/buy%20me%20a%20coffee-Caffeinate-green.svg?style=for-the-badge
 
-[commits-shield]: https://img.shields.io/github/commit-activity/y/agittins/bermuda.svg?style=for-the-badge
-[commits]: https://github.com/agittins/bermuda/commits/main
+[commits-shield]: https://img.shields.io/github/commit-activity/y/BenCodez/bermuda.svg?style=for-the-badge
+[commits]: https://github.com/BenCodez/bermuda/commits/main
 
 [hacs]: https://hacs.xyz
-[hacsbadge]: https://img.shields.io/badge/HACS-Default-green.svg?style=for-the-badge
+[hacsbadge]: https://img.shields.io/badge/HACS-Custom-blue.svg?style=for-the-badge
 
 [haminver]: https://github.com/agittins/bermuda/commits/main/hacs.json
 [haminverbadge]: https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fagittins%2Fbermuda%2Fraw%2Fmain%2Fhacs.json&query=%24.homeassistant&style=for-the-badge&logo=homeassistant&logoColor=%2311BDF2&label=Minimum%20HA%20Version

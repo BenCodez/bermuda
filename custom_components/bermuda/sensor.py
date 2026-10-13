@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+from statistics import median
 from typing import TYPE_CHECKING, Any
 
+from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components.sensor import RestoreSensor, SensorEntity
 from homeassistant.components.sensor.const import SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
@@ -15,6 +18,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
+from .api import public_device_id
 from .const import (
     _LOGGER,
     ADDR_TYPE_IBEACON,
@@ -78,6 +82,7 @@ async def async_setup_entry(
             entities.append(BermudaSensorRssi(coordinator, entry, address))
             entities.append(BermudaSensorAreaLastSeen(coordinator, entry, address))
             entities.append(BermudaSensorAreaSwitchReason(coordinator, entry, address))
+            entities.append(BermudaSensorAreaSuggestion(coordinator, entry, address))
 
             # _LOGGER.debug("Sensor received new_device signal for %s", address)
             # We set update before add to False because we are being
@@ -98,17 +103,31 @@ async def async_setup_entry(
         # go over time. So we need to maintain our matrix of which ones we have already
         # spun-up so we don't duplicate any.
 
-        for scanner in coordinator.get_scanners:
-            if (
-                scanner.is_remote_scanner is None  # usb/HCI scanner's are fine.
-                or (scanner.is_remote_scanner and scanner.address_wifi_mac is None)
-            ):
-                # This scanner doesn't have a wifi mac yet, bail out
-                # until they are all filled out.
-                return
+        # A scanner whose wifi mac hasn't resolved yet is skipped rather than
+        # blocking everyone: this used to `return` here, which meant a SINGLE
+        # such scanner anywhere in the whole system silently froze entity
+        # creation for every device against every OTHER scanner too, forever
+        # (until that one scanner resolved, which some device types - a kiosk
+        # or panel acting as a BLE scanner rather than an ESPHome/Shelly proxy
+        # - never do). Measured in production: two such scanners had frozen
+        # backfill for the entire install, capping every tracked device's
+        # registered scanners at whatever existed the moment those two
+        # appeared - worst for whichever device was tracked most recently.
+        # Safe to skip just the unresolved one: unique_id already falls back
+        # to `.address` when `address_wifi_mac` is None (see
+        # BermudaSensorScannerRange.unique_id below), so nothing here actually
+        # depended on waiting.
+        unresolved_scanners = {
+            scanner.address
+            for scanner in coordinator.get_scanners
+            if scanner.is_remote_scanner is None  # usb/HCI scanner's are fine.
+            or (scanner.is_remote_scanner and scanner.address_wifi_mac is None)
+        }
 
         entities = []
         for scanner in coordinator.scanner_list:
+            if scanner in unresolved_scanners:
+                continue
             for address in created_devices:
                 if address not in created_scanners.get(scanner, []):
                     _LOGGER.debug(
@@ -123,7 +142,8 @@ async def async_setup_entry(
         # _LOGGER.debug("Sensor received new_device signal for %s", address)
         # We set update before add to False because we are being
         # call(back(ed)) from the update, so causing it to call another would be... bad.
-        async_add_entities(entities, False)
+        if entities:
+            async_add_entities(entities, False)
 
     @callback
     def scanners_changed() -> None:
@@ -225,7 +245,17 @@ class BermudaSensor(BermudaEntity, SensorEntity):
         # since oft-changing attribs cause more db writes than sensors
         # "last_seen": self.coordinator.dt_mono_to_datetime(self._device.last_seen),
         attribs = {}
-        if self.name in ["Area", "Floor"]:
+        if self.name == "Floor":
+            # Only what the floor itself is. The area attributes (and the
+            # current MAC, already on the Area sensor) change on every area
+            # switch, so carrying them here wrote a recorder row for the
+            # floor sensor each time its state had not changed: about half of
+            # all Floor rows were attribute-only.
+            attribs["floor_id"] = self._device.floor_id
+            attribs["floor_name"] = self._device.floor_name
+            attribs["floor_level"] = self._device.floor_level
+            return attribs
+        if self.name == "Area":
             attribs["area_id"] = self._device.area_id
             attribs["area_name"] = self._device.area_name
             attribs["floor_id"] = self._device.floor_id
@@ -306,6 +336,40 @@ class BermudaSensorRssi(BermudaSensor):
         return SensorStateClass.MEASUREMENT
 
 
+# A device's distance is republished only when it moves by at least this
+# much from the value last published: DISTANCE_DEADBAND_M, or
+# DISTANCE_DEADBAND_FRACTION of the distance when that is larger (BLE noise
+# grows with distance). It is checked against the median of the last update
+# interval's readings, and a new value is published at most once per
+# interval: a single reading is noisier than the deadband, so with every
+# reading checked nearly every interval had one outside it, while a median
+# lets a sustained move through within about an interval of its start.
+DISTANCE_DEADBAND_M = 0.2
+DISTANCE_DEADBAND_FRACTION = 0.1
+# A drop this large (DISTANCE_FAST_FALL_M, or DISTANCE_FAST_FALL_FRACTION of
+# the distance when that is larger) is shown at once, so a device coming up
+# to a proxy is not held for the rest of the interval.
+DISTANCE_FAST_FALL_M = 1.0
+DISTANCE_FAST_FALL_FRACTION = 0.25
+# Distances are rounded to 0.1 m but held as binary floats, so a move of
+# exactly a threshold (2.0 -> 1.8 is 0.19999999999999996) must not read as
+# smaller than it.
+DISTANCE_DEADBAND_TOLERANCE = 1e-6
+# The most readings kept for the median (a 10 s interval at about one update
+# a second needs ten or eleven).
+DISTANCE_READINGS_MAX = 64
+
+
+def distance_deadband(last: float) -> float:
+    """How far a distance must move from ``last`` before it is published again."""
+    return max(DISTANCE_DEADBAND_M, DISTANCE_DEADBAND_FRACTION * abs(last))
+
+
+def distance_fast_fall(last: float) -> float:
+    """How far a distance must drop from ``last`` to be published at once."""
+    return max(DISTANCE_FAST_FALL_M, DISTANCE_FAST_FALL_FRACTION * abs(last))
+
+
 class BermudaSensorRange(BermudaSensor):
     """Extra sensor for range-to-closest-area."""
 
@@ -323,11 +387,56 @@ class BermudaSensorRange(BermudaSensor):
 
     @property
     def native_value(self):
-        """Return the native value of the sensor."""
+        """
+        Return the native value of the sensor.
+
+        The median of the readings over the last update interval is compared
+        with the distance last published, and published when it differs by
+        the deadband (see distance_deadband), at most once per interval. BLE
+        jitter is wider than the 0.1 m rounding, so without this nearly every
+        interval wrote a new recorder row for every tracked device. A large
+        drop (see distance_fast_fall) and a radio-model change (calibration)
+        show at once. Radio revisions remain pending until actual selection,
+        so an early property read cannot consume a correction against old data.
+        """
+        model_revision = getattr(self._device, "model_revision", 0)
+        selection_ready = not getattr(self._device, "model_selection_pending", False)
+        model_changed = selection_ready and getattr(self, "bermuda_model_revision", 0) != model_revision
+        if selection_ready:
+            self.bermuda_model_revision = model_revision
         distance = self._device.area_distance
-        if distance is not None:
-            return self._cached_ratelimit(round(distance, 1))
-        return None
+        if distance is None:
+            # Out of range (or not yet heard): forget the last value, so the
+            # first reading when it comes back is published as it is rather
+            # than measured against a distance from before it went.
+            self.bermuda_last_state, self.bermuda_last_stamp = None, 0
+            self._distance_readings = []
+            return None
+        value = round(distance, 1)
+        nowstamp = monotonic_time_coarse()
+        last = self.bermuda_last_state
+        window_start = nowstamp - self.bermuda_update_interval
+        readings = [r for r in getattr(self, "_distance_readings", None) or () if r[0] >= window_start]
+        readings = [*readings[-(DISTANCE_READINGS_MAX - 1) :], (nowstamp, value)]
+        self._distance_readings = readings
+        if (
+            model_changed  # Calibrated model changes bypass the deadband even after a delayed first read.
+            or self._device.ref_power_changed >= nowstamp - 2  # Legacy direct calibration stamp compatibility
+            or self.bermuda_last_stamp <= 0  # nothing published yet (the cache starts at 0)
+            or not isinstance(last, int | float)
+            or last - value >= distance_fast_fall(last) - DISTANCE_DEADBAND_TOLERANCE
+        ):
+            self.bermuda_last_state, self.bermuda_last_stamp = value, nowstamp
+            self._distance_readings = []
+            return value
+        if nowstamp - self.bermuda_last_stamp <= self.bermuda_update_interval:
+            return last
+        typical = round(median(reading for _, reading in readings), 1)
+        if abs(typical - last) < distance_deadband(last) - DISTANCE_DEADBAND_TOLERANCE:
+            return last
+        self.bermuda_last_state, self.bermuda_last_stamp = typical, nowstamp
+        self._distance_readings = []
+        return typical
 
     @property
     def device_class(self):
@@ -363,7 +472,10 @@ class BermudaSensorScannerRange(BermudaSensorRange):
     @property
     def unique_id(self):
         # Retaining legacy wifi mac for unique_id
-        return f"{self._device.unique_id}_{self._scanner.address_wifi_mac or self._scanner.address}_range"
+        scanner_identity = (
+            getattr(self._scanner, "entity_id_address", None) or self._scanner.address_wifi_mac or self._scanner.address
+        )
+        return f"{self._device.unique_id}_{scanner_identity}_range"
 
     @property
     def name(self):
@@ -406,7 +518,10 @@ class BermudaSensorScannerRangeRaw(BermudaSensorScannerRange):
         # Using address_wifi_mac as a legacy action, because esphome changed from
         # sending WIFI MAC to BLE MAC as its source address, in ESPHome 2025.3.0
         #
-        return f"{self._device.unique_id}_{self._scanner.address_wifi_mac or self._scanner.address}_range_raw"
+        scanner_identity = (
+            getattr(self._scanner, "entity_id_address", None) or self._scanner.address_wifi_mac or self._scanner.address
+        )
+        return f"{self._device.unique_id}_{scanner_identity}_range_raw"
 
     @property
     def name(self):
@@ -473,6 +588,89 @@ class BermudaSensorAreaLastSeen(BermudaSensor, RestoreSensor):
         if (sensor_data := await self.async_get_last_sensor_data()) is not None:
             self._attr_native_value = str(sensor_data.native_value)
             self._device.area_last_seen = str(sensor_data.native_value)
+
+
+class BermudaSensorAreaSuggestion(BermudaSensor):
+    """Optional supervised fingerprint advisory, separate from the live area."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_icon = "mdi:map-marker-question"
+
+    @property
+    def unique_id(self):
+        return f"{self._device.unique_id}_area_suggestion"
+
+    @property
+    def name(self):
+        return "Suggested Area"
+
+    def _suggestion(self) -> dict[str, Any]:
+        manager = getattr(self.coordinator, "toolkit", None)
+        hook = getattr(manager, "area_suggestion", None)
+        suggestion = hook(self._device) if callable(hook) else None
+        return suggestion if isinstance(suggestion, dict) else {}
+
+    def _suggested_area(self, suggestion: dict[str, Any]):
+        area_id = suggestion.get("suggested_area")
+        if suggestion.get("accepted") is True and isinstance(area_id, str):
+            return self.ar.async_get_area(area_id)
+        return None
+
+    @property
+    def native_value(self):
+        suggestion = self._suggestion()
+        area = self._suggested_area(suggestion)
+        return area.name if area is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        suggestion = self._suggestion()
+        area = self._suggested_area(suggestion)
+        confidence = suggestion.get("confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+            or not math.isfinite(confidence)
+        ):
+            confidence = None
+        reasons = suggestion.get("reasons", [])
+        if isinstance(reasons, list):
+            reasons = [reason.get("code") if isinstance(reason, dict) else reason for reason in reasons[:16]]
+            reasons = [reason[:256] for reason in reasons if isinstance(reason, str)]
+        else:
+            reasons = []
+        if suggestion.get("accepted") is True and area is None:
+            reasons = [*reasons, "invalid_home_assistant_area"]
+        if not suggestion:
+            reasons = ["fingerprint_model_unavailable"]
+        coverage = suggestion.get("coverage")
+        if isinstance(coverage, dict):
+            coverage = {
+                key: value
+                for key, value in coverage.items()
+                if key in {"fresh_scanners", "required_scanners", "trained_scanners", "missing_scanners"}
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= 128
+            }
+        elif (
+            isinstance(coverage, (int, float))
+            and not isinstance(coverage, bool)
+            and 0 <= coverage <= 1
+            and math.isfinite(coverage)
+        ):
+            coverage = float(coverage)
+        else:
+            coverage = None
+        return {
+            "device_id": public_device_id(self._device),
+            "suggested_area_id": area.id if area is not None else None,
+            "confidence": confidence,
+            "coverage": coverage,
+            "rejection_reasons": reasons,
+        }
 
 
 class BermudaGlobalSensor(BermudaGlobalEntity, SensorEntity):

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import binascii
 import re
-from typing import TYPE_CHECKING, Final
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Final
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components.bluetooth import (
@@ -52,7 +53,15 @@ from .const import (
     METADEVICE_PRIVATE_BLE_DEVICE,
     METADEVICE_TYPE_IBEACON_SOURCE,
 )
+from .profiles import receiver_value
 from .util import mac_math_offset, mac_norm
+from .util import mac_octet_offset as _mac_octet_offset
+
+# Integrations that provide Bluetooth scanners. When two registry entries
+# carry the same MAC - an ESPHome proxy and the router integration that also
+# tracks it as a network client - the scanner's own entry is the one from
+# one of these.
+SCANNER_DOMAINS: Final = frozenset({"bluetooth", "esphome", "shelly", "ruuvi_gateway"})
 
 if TYPE_CHECKING:
     from bleak.backends.scanner import AdvertisementData
@@ -60,7 +69,7 @@ if TYPE_CHECKING:
     from .coordinator import BermudaDataUpdateCoordinator
 
 
-class BermudaDevice(dict):
+class BermudaDevice:
     """
     This class is to represent a single bluetooth "device" tracked by Bermuda.
 
@@ -91,6 +100,8 @@ class BermudaDevice(dict):
         self._coordinator: BermudaDataUpdateCoordinator = coordinator
         self.ref_power: float = 0  # If non-zero, use in place of global ref_power.
         self.ref_power_changed: float = 0  # Stamp for last change to ref_power, for cache zapping.
+        self.model_revision: int = 0  # Each entity consumes a radio change once, even after delayed reads.
+        self.model_selection_pending: bool = False  # Closest output must reflect the new model before consumption.
         self.options = self._coordinator.options
         self.unique_id: str | None = _address  # mac address formatted.
         self.address_type = BDADDR_TYPE_UNKNOWN
@@ -121,6 +132,9 @@ class BermudaDevice(dict):
         self._hascanner: BaseHaRemoteScanner | BaseHaScanner | None = None  # HA's scanner
         self._is_scanner: bool = False
         self._is_remote_scanner: bool | None = None
+        self.scanner_binding: dict[str, Any] | None = None
+        self.entity_id_address: str | None = None
+        self._scanner_identity_resolved = False
         self.stamps: dict[str, float] = {}
         self.metadevice_type: set = set()
         self.metadevice_sources: list[str] = []  # list of MAC addresses that have/should match this beacon
@@ -205,17 +219,23 @@ class BermudaDevice(dict):
                     self.address_type = BDADDR_TYPE_NOT_MAC48
             elif len(self.address) == 17:
                 top_bits = int(self.address[0:1], 16) >> 2
-                # The two MSBs of the first octet dictate the random type...
-                if top_bits & 0b00:  # First char will be in [0 1 2 3]
+                # The two MSBs of the first octet dictate the random type. These
+                # are EQUALITY tests: this used to use `&`, under which
+                # `top_bits & 0b00` is never true (non-resolvable addresses stayed
+                # UNKNOWN), `top_bits & 0b01` matched 0b11 as well (every random
+                # STATIC address was labelled resolvable and fed to the IRK
+                # resolver, which can never resolve it), and the 0b11 branch was
+                # unreachable, so BDADDR_TYPE_RANDOM_STATIC was never assigned.
+                if top_bits == 0b00:  # First char will be in [0 1 2 3]
                     self.address_type = BDADDR_TYPE_RANDOM_UNRESOLVABLE
-                elif top_bits & 0b01:  # Addresses where the first char will be 4,5,6 or 7
+                elif top_bits == 0b01:  # Addresses where the first char will be 4,5,6 or 7
                     _LOGGER.debug("Identified Resolvable Private (potential IRK source) Address on %s", self.address)
                     self.address_type = BDADDR_TYPE_RANDOM_RESOLVABLE
                     self._coordinator.irk_manager.check_mac(self.address)
-                elif top_bits & 0b10:
+                elif top_bits == 0b10:
                     self.address_type = "reserved"
                     _LOGGER.debug("Hey, got one of those reserved MACs, %s", self.address)
-                elif top_bits & 0b11:
+                else:  # 0b11, first char in [c d e f]
                     self.address_type = BDADDR_TYPE_RANDOM_STATIC
 
             else:
@@ -239,14 +259,24 @@ class BermudaDevice(dict):
         self._is_remote_scanner = False
         self._coordinator.scanner_list_del(self)
 
-    def async_as_scanner_init(self, ha_scanner: BaseHaScanner):
+    def async_as_scanner_init(self, ha_scanner: BaseHaScanner, *, force: bool = False):
         """
         Configure this device as a scanner device.
 
-        Use to set up a device as a scanner.
+        Use to set up a device as a scanner. With force, a scanner that is
+        already set up re-reads its device registry entries (area, name).
         """
         if self._hascanner is ha_scanner:
-            # Actual object has not changed, we're good.
+            # Actual object has not changed, but what the user has set on its
+            # device registry entries may have.
+            if force:
+                was_unresolved = self.address_wifi_mac is None
+                self.async_as_scanner_resolve_device_entries()
+                if self._is_remote_scanner and was_unresolved and self.address_wifi_mac is not None:
+                    # The sensor platform skipped this receiver while its
+                    # registry address was missing. Announce its eligibility
+                    # only after the refresh has resolved its metadata.
+                    self._coordinator.scanner_list_add(self)
             return
 
         # If we don't already have a self._hascanner, then this must be our
@@ -261,10 +291,14 @@ class BermudaDevice(dict):
             self._is_remote_scanner = True
         else:
             self._is_remote_scanner = False
-        self._coordinator.scanner_list_add(self)
 
         # Find the relevant device entries in HA for this scanner and apply the names, addresses etc
+        # This must happen before scanner_list_add(), which tells the sensor platform the roster
+        # changed. The platform skips scanners whose wifi mac hasn't resolved yet, and a scanner
+        # that arrives after startup gets no other signal, so it would otherwise go without its
+        # per-scanner entities until the integration is reloaded.
         self.async_as_scanner_resolve_device_entries()
+        self._coordinator.scanner_list_add(self)
 
         # Call the per-update processor as well, but only
         # if this is our first ha_scanner.
@@ -272,6 +306,132 @@ class BermudaDevice(dict):
         # where the scanner_update might call us.
         if _first_init:
             self.async_as_scanner_update(ha_scanner)
+
+    def _from_scanner_integration(self, devreg_device) -> bool:
+        """
+        Whether a device-registry entry belongs to an integration that
+        provides Bluetooth scanners (SCANNER_DOMAINS).
+        """
+        hass = getattr(self._coordinator, "hass", None)
+        get_entry = getattr(getattr(hass, "config_entries", None), "async_get_entry", None)
+        if get_entry is None:
+            return False
+        # A device belongs to one config entry from Home Assistant 2026.10
+        # (``config_entry_id``); reading ``config_entries`` there is deprecated
+        # (removed in 2027.10), so it is only the fallback for older cores.
+        entry_id = getattr(devreg_device, "config_entry_id", None)
+        entry_ids = (entry_id,) if entry_id else getattr(devreg_device, "config_entries", None) or ()
+        for entry_id in entry_ids:
+            entry = get_entry(entry_id)
+            if getattr(entry, "domain", None) in SCANNER_DOMAINS:
+                return True
+        return False
+
+    def _scanner_registry_proofs(self) -> tuple[dict[str, str], str | None]:
+        """
+        Find explicit ESPHome BLE→base MAC proof and an optional manual binding.
+
+        ESPHome persists the Bluetooth MAC independently of its network MAC.
+        This proof can resolve different interfaces without inventing an offset
+        or matching a friendly name. A manual association changes metadata only:
+        scanner addresses, beacon ownership and existing entity IDs stay intact.
+        """
+        hass = getattr(self._coordinator, "hass", None)
+        entries = getattr(getattr(hass, "config_entries", None), "async_entries", None)
+        proofs: dict[str, str] = {}
+        if callable(entries):
+            for entry in entries("esphome"):
+                data = getattr(entry, "data", None)
+                if not isinstance(data, Mapping):
+                    continue
+                info = getattr(getattr(entry, "runtime_data", None), "device_info", None)
+                bluetooth_mac = data.get("bluetooth_mac_address") or getattr(info, "bluetooth_mac_address", None)
+                base_mac = getattr(info, "mac_address", None) or getattr(entry, "unique_id", None)
+                if (
+                    isinstance(bluetooth_mac, str)
+                    and mac_norm(bluetooth_mac) == self.address
+                    and isinstance(base_mac, str)
+                    and re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac_norm(base_mac))
+                ):
+                    proofs[entry.entry_id] = mac_norm(base_mac)
+        namespace = self.options.get("measurement_toolkit", {})
+        bindings = namespace.get("scanner_bindings", {}) if isinstance(namespace, Mapping) else {}
+        binding = receiver_value(bindings, self.address) if isinstance(bindings, Mapping) else None
+        registry_id = binding.get("device_registry_id") if isinstance(binding, Mapping) else None
+        return proofs, registry_id if isinstance(registry_id, str) else None
+
+    def _registry_entry_ids(self, device) -> tuple[str, ...]:
+        entry_id = getattr(device, "config_entry_id", None)
+        if isinstance(entry_id, str):
+            return (entry_id,)
+        return tuple(getattr(device, "config_entries", ()) or ())
+
+    def _registry_mac_rank(self, device, mac: str, proofs: dict[str, str], manual_id: str | None) -> int:
+        """Rank explicit associations before the legacy interface heuristics."""
+        if device.id == manual_id:
+            return -2
+        if any(proofs.get(entry_id) == mac_norm(mac) for entry_id in self._registry_entry_ids(device)):
+            return -1
+        if any(conn[0] == "bluetooth" and conn[1].lower() == self.address for conn in device.connections):
+            return 0
+        return {2: 1, -1: 2}.get(_mac_octet_offset(self.address, mac), 3)
+
+    def _freeze_scanner_identity(self, proposed_id: str, network_address: str | None) -> None:
+        """Retain entity identity through re-resolution and managed reloads."""
+        if self._scanner_identity_resolved:
+            return
+        toolkit = getattr(self._coordinator, "toolkit", None)
+        if (
+            getattr(self._coordinator, "scanner_identity_pending", False) is True
+            or getattr(toolkit, "scanner_identity_ready", True) is False
+        ):
+            # Bluetooth callbacks may discover receivers while their persisted
+            # identities are still loading. Keep packets and binding metadata,
+            # then freeze the identity when that state is available.
+            return
+        self.unique_id = proposed_id
+        self.entity_id_address = network_address or self.address
+        identity_hook = getattr(toolkit, "scanner_identity", None)
+        if callable(identity_hook):
+            identity = identity_hook(self.address, proposed_id)
+            if isinstance(identity, Mapping):
+                if isinstance(identity.get("unique_id"), str):
+                    self.unique_id = identity["unique_id"]
+                if isinstance(identity.get("entity_id_address"), str):
+                    self.entity_id_address = identity["entity_id_address"]
+        self._scanner_identity_resolved = True
+
+    @staticmethod
+    def _bound_scanner_candidates(manual_device, bluetooth_candidates, mac_candidates):
+        """An explicit registry binding owns both interface metadata choices."""
+        if manual_device is None:
+            return bluetooth_candidates, mac_candidates
+        return (
+            [candidate for candidate in bluetooth_candidates if candidate[2].id == manual_device.id],
+            [candidate for candidate in mac_candidates if candidate[3].id == manual_device.id],
+        )
+
+    def _apply_scanner_registry_metadata(self, manual_device, name, name_by_user, area_id) -> None:
+        """Apply explicit metadata before refreshing existing advert copies."""
+        previous = (self.name, self.area_id, self.area_name, self.is_remote_scanner)
+        if manual_device is not None:
+            name, name_by_user, area_id = manual_device.name, manual_device.name_by_user, manual_device.area_id
+            self.entry_id = manual_device.id
+        self.name_devreg = name
+        self.name_by_user = name_by_user
+        self.make_name()
+        self._update_area_and_floor(area_id)
+        if previous == (self.name, self.area_id, self.area_name, self.is_remote_scanner):
+            return
+        devices = getattr(self._coordinator, "devices", None)
+        if not isinstance(devices, Mapping):
+            return
+        for device in devices.values():
+            adverts = getattr(device, "adverts", None)
+            if isinstance(adverts, Mapping):
+                for advert in adverts.values():
+                    if isinstance(advert, BermudaAdvert) and advert.scanner_address == self.address:
+                        advert.apply_new_scanner(self)
 
     def async_as_scanner_resolve_device_entries(self):
         """From the known MAC address, resolve any relevant device entries and names etc."""
@@ -307,6 +467,7 @@ class BermudaDevice(dict):
         scanner_devreg_mac = None
         scanner_devreg_mac_address = None
         scanner_devreg_bt_address = None
+        esphome_proofs, manual_registry_id = self._scanner_registry_proofs()
 
         # We don't know which address is being reported/used. So create the full
         # range of possible addresses, and see what we find in the device registry,
@@ -317,10 +478,42 @@ class BermudaDevice(dict):
                 connlist.add(("mac", altmac))
                 maclist.add(altmac)
 
-        # Requires 2025.3
-        devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
+        for base_mac in esphome_proofs.values():
+            connlist.add(("mac", base_mac))
+            maclist.add(base_mac)
+
+        if hasattr(self._coordinator.dr, "async_get_devices"):
+            devreg_devices = self._coordinator.dr.async_get_devices(connections=connlist)
+        else:
+            # Compatibility with older HA versions (minimum 2025.3), before
+            # the public multi-device lookup replaced direct container access.
+            devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
+        devreg_devices = list(devreg_devices)
+        manual_device = None
+        if manual_registry_id:
+            manual_device = self._coordinator.dr.async_get(manual_registry_id)
+            if manual_device is not None and all(device.id != manual_registry_id for device in devreg_devices):
+                devreg_devices.append(manual_device)
         devreg_count = 0  # can't len() an iterable.
         devreg_stringlist = ""  # for debug logging
+        # Rank the matches rather than letting the LAST one iterated win.
+        # The +-3 octet window is wide enough to also catch a NEIGHBOUR's
+        # registry entry: an ESPHome proxy at BLE dc:..:4a (WiFi ..:48) and an
+        # unrelated ESPHome light at WiFi ..:4c both match, and whichever the
+        # registry happened to return last became this scanner's name,
+        # unique_id and wifi mac - measured in production as a bedroom proxy
+        # reported as a basement light, so it could never be placed as the
+        # bedroom receiver it is. Prefer, in order: a device whose bluetooth
+        # connection IS this address; then the espressif rule this window
+        # exists for (BLE = WiFi + 2); then Ethernet (BLE = Ether - 1); then
+        # anything else. Registry order only breaks exact ties.
+        # Equal ranks go to the entry from an integration that provides
+        # Bluetooth scanners: a router integration (TP-Link, UniFi, Fritz)
+        # can register the same hardware under the same WiFi MAC, with its
+        # own name ("linux") and no area (#722).
+        bt_candidates: list[tuple[int, int, Any, str]] = []
+        mac_candidates: list[tuple[int, int, int, Any, str]] = []
+        selected_proof = "manual" if manual_device is not None else "legacy_mac_offset"
         for devreg_device in devreg_devices:
             devreg_count += 1
             # _LOGGER.debug("DevregScanner: %s", devreg_device)
@@ -328,12 +521,22 @@ class BermudaDevice(dict):
             for conn in devreg_device.connections:
                 if conn[0] == "bluetooth":
                     # Bluetooth component's device!
-                    scanner_devreg_bt = devreg_device
-                    scanner_devreg_bt_address = conn[1].lower()
+                    addr = conn[1].lower()
+                    rank = -2 if devreg_device.id == manual_registry_id else 0 if addr == self.address else 1
+                    bt_candidates.append((rank, devreg_count, devreg_device, addr))
                 if conn[0] == "mac":
                     # ESPHome, Shelly
-                    scanner_devreg_mac = devreg_device
-                    scanner_devreg_mac_address = conn[1]
+                    rank = self._registry_mac_rank(devreg_device, conn[1], esphome_proofs, manual_registry_id)
+                    foreign = 0 if self._from_scanner_integration(devreg_device) else 1
+                    mac_candidates.append((rank, foreign, devreg_count, devreg_device, conn[1]))
+        bt_candidates, mac_candidates = self._bound_scanner_candidates(manual_device, bt_candidates, mac_candidates)
+        if bt_candidates:
+            _rank, _order, scanner_devreg_bt, scanner_devreg_bt_address = min(bt_candidates, key=lambda c: c[:2])
+        if mac_candidates:
+            _rank, _foreign, _order, scanner_devreg_mac, scanner_devreg_mac_address = min(
+                mac_candidates, key=lambda c: c[:3]
+            )
+            selected_proof = "esphome_bluetooth_mac" if _rank == -1 else selected_proof
 
         if devreg_count not in (1, 2, 3):
             # We expect just the bt, or bt and another like esphome/shelly, or
@@ -347,13 +550,24 @@ class BermudaDevice(dict):
                 devreg_stringlist,
             )
 
-        if scanner_devreg_bt is None and scanner_devreg_mac is None:
+        if scanner_devreg_bt is None and scanner_devreg_mac is None and manual_device is None:
             _LOGGER_SPAM_LESS.error(
                 f"scanner_not_in_devreg_{self.address:s}",
                 "Failed to find scanner %s (%s) in Device Registry",
                 self._hascanner.name,
                 self._hascanner.source,
             )
+            # A removed or compensated binding must not retain its last registry
+            # winner. Its source and frozen entity identities remain unchanged.
+            had_association = (
+                self.entry_id is not None or self.address_wifi_mac is not None or self.scanner_binding is not None
+            )
+            self.entry_id = None
+            self.address_wifi_mac = None
+            self.address_ble_mac = self.address
+            self.scanner_binding = None
+            if had_association:
+                self._apply_scanner_registry_metadata(None, None, None, None)
             return
 
         # We found the device entry and have created our scannerdevice,
@@ -361,6 +575,10 @@ class BermudaDevice(dict):
         # First clear the existing to make prioritising the bt/mac matches
         # easier (feel free to refactor, bear in mind we prefer bt first)
         _area_id = None
+        # A re-resolve (a registry change) starts from nothing: the entry_id
+        # of an earlier, wrong winner - a router's entry for the same MAC -
+        # must not survive next to the new winner's name and area.
+        self.entry_id = None
 
         _bt_name = None
         _mac_name = None
@@ -378,26 +596,53 @@ class BermudaDevice(dict):
             self.entry_id = self.entry_id or scanner_devreg_mac.id
             _mac_name = scanner_devreg_mac.name
             _mac_name_by_user = scanner_devreg_mac.name_by_user
+            if _area_id is None:
+                # Still no area: another entry for the same hardware (the
+                # same MAC) may have one - the user put the device in a room
+                # once, on whichever integration's page they found it.
+                for cand in sorted(mac_candidates, key=lambda c: c[:3]):
+                    if cand[4].lower() == str(scanner_devreg_mac_address).lower() and cand[3].area_id:
+                        _area_id = cand[3].area_id
+                        break
 
         # As of ESPHome 2025.3.0 (via aioesphomeapi 29.3.1) ESPHome proxies now
         # report their BLE MAC address instead of their WIFI MAC in the hascanner
         # details.
         # To work around breaking the existing distance_to entities, retain the
         # ESPHome / Shelly integration's MAC as the unique_id
-        self.unique_id = scanner_devreg_mac_address or scanner_devreg_bt_address or self._hascanner.source
-        self.address_ble_mac = scanner_devreg_bt_address or scanner_devreg_mac_address or self._hascanner.source
+        proposed_id = scanner_devreg_mac_address or scanner_devreg_bt_address or self._hascanner.source
+        self._freeze_scanner_identity(proposed_id, scanner_devreg_mac_address)
+        # A proven ESPHome source is its BLE address even when the Bluetooth
+        # registry entry is not present yet; never substitute the network MAC.
+        self.address_ble_mac = (
+            self.address
+            if selected_proof in {"esphome_bluetooth_mac", "manual"}
+            else (scanner_devreg_bt_address or scanner_devreg_mac_address or self._hascanner.source)
+        )
         self.address_wifi_mac = scanner_devreg_mac_address
+        self.scanner_binding = {
+            "method": selected_proof,
+            "source_id": self.address,
+            "device_registry_id": scanner_devreg_mac.id if scanner_devreg_mac is not None else self.entry_id,
+            "configured_registry_id": manual_registry_id,
+            "status": "missing_manual_binding" if manual_registry_id and selected_proof != "manual" else "resolved",
+        }
 
         # Populate the possible metadevice source MACs so that we capture any
         # data the scanner is sending (Shelly's already send broadcasts, and
         # future ESPHome Bermuda templates will, too). We can't easily tell
         # if our base address is the wifi mac, ble mac or ether mac, so whack
         # 'em all in and let the loop sort it out.
-        for mac in (
-            self.address_ble_mac,  # BLE mac, if known
-            mac_math_offset(self.address_wifi_mac, 2),  # WIFI+2=BLE
-            mac_math_offset(self.address_wifi_mac, -1),  # ETHER-1=BLE
-        ):
+        source_macs = (
+            (
+                self.address_ble_mac,  # BLE mac, if known
+                mac_math_offset(self.address_wifi_mac, 2),  # WIFI+2=BLE
+                mac_math_offset(self.address_wifi_mac, -1),  # ETHER-1=BLE
+            )
+            if selected_proof == "legacy_mac_offset"
+            else (self.address,)
+        )
+        for mac in source_macs:
             if (
                 mac is not None
                 and mac not in self.metadevice_sources
@@ -407,13 +652,13 @@ class BermudaDevice(dict):
 
         # Bluetooth integ names scanners by address, so prefer the source integration's
         # autogenerated name over that.
-        self.name_devreg = _mac_name or _bt_name
-        # Bluetooth device reg is newer, so use the user-given name there if it exists.
-        self.name_by_user = _bt_name_by_user or _mac_name_by_user
-        # Apply any name changes.
-        self.make_name()
-
-        self._update_area_and_floor(_area_id)
+        # Bluetooth metadata remains the legacy preference unless the user has
+        # explicitly bound this source to a different device registry entry.
+        self._apply_scanner_registry_metadata(
+            manual_device, _mac_name or _bt_name, _bt_name_by_user or _mac_name_by_user, _area_id
+        )
+        if manual_device is not None:
+            self.scanner_binding["device_registry_id"] = manual_device.id
 
     def _update_area_and_floor(self, area_id: str | None):
         """Given an area_id, update the area and floor properties."""
@@ -593,33 +838,59 @@ class BermudaDevice(dict):
 
         return self.name
 
-    def set_ref_power(self, new_ref_power: float):
+    def set_ref_power(self, new_ref_power: float, *, invalidate_model: bool = False):
         """
         Set a new reference power for this device and immediately apply
         an interim distance calculation.
 
         This gets called by the calibration routines, but also by metadevice
         updates, as they need to apply their own ref_power if necessary.
+        Number updates invalidate advisory evidence after mutation, before election.
         """
         if new_ref_power != self.ref_power:
+            # The Number can change before the next coordinator batch. Split
+            # simultaneous tracked aliases before this owner's direct update.
+            toolkit = getattr(self._coordinator, "toolkit", None)
+            prepare = getattr(toolkit, "prepare_update", None)
+            if callable(prepare):
+                prepare()
             # it's actually changed, proceed...
             self.ref_power = new_ref_power
             nearest_distance = 9999  # running tally to find closest scanner
             nearest_scanner = None
+            uses_filter = getattr(toolkit, "advert_uses_optional_filter", None)
+            optional_filter = False
+            has_limit = getattr(toolkit, "receiver_has_limit", None)
+            configured_selection = (
+                bool(self.adverts) and getattr(toolkit, "settings", {}).get("reliability_weighting", False) is True
+            )
             for advert in self.adverts.values():
-                rawdist = advert.set_ref_power(new_ref_power)
-                if rawdist is not None and rawdist < nearest_distance:
-                    nearest_distance = rawdist
+                distance = advert.set_ref_power(new_ref_power)
+                if callable(uses_filter) and uses_filter(advert):
+                    optional_filter = True
+                if callable(has_limit) and has_limit(advert.scanner_address) is True:
+                    configured_selection = True
+                if distance is not None and distance < nearest_distance:
+                    nearest_distance = distance
                     nearest_scanner = advert
+            invalidate = getattr(toolkit, "invalidate_model", None)
+            if invalidate_model and callable(invalidate):
+                invalidate()
             # Even though the actual scanner should not have changed (it should
             # remain none or a given scanner, since the relative distances won't have
             # changed due to ref_power), we still call apply so that the new area_distance
             # gets applied.
             # if nearest_scanner is not None:
-            self.apply_scanner_selection(nearest_scanner)
+            if optional_filter or configured_selection:
+                # Optional filters and configured receiver policies use ordinary
+                # eligibility, caps, reliability and area-election hysteresis.
+                self._coordinator._refresh_area_by_min_distance(self)  # noqa: SLF001
+            else:
+                self.apply_scanner_selection(nearest_scanner)
             # Update the stamp so that the BermudaEntity can clear the cache and show the
             # new measurement(s) immediately.
             self.ref_power_changed = monotonic_time_coarse()
+            self.model_revision += 1
 
     def apply_scanner_selection(self, bermuda_advert: BermudaAdvert | None):
         """
@@ -652,6 +923,7 @@ class BermudaDevice(dict):
                 old_area,
                 self.area_name,
             )
+        self.model_selection_pending = False
 
     def get_scanner(self, scanner_address) -> BermudaAdvert | None:
         """
@@ -795,6 +1067,11 @@ class BermudaDevice(dict):
                         # UniversallyUniqueIDentifier is not even unique
                         # locally, so we need to make one :-)
 
+                        if len(man_data) < 22:
+                            # Too short to hold the uuid, major and minor: there is no
+                            # id to make, and registering it would create a bogus
+                            # "None_None_None" beacon metadevice.
+                            continue
                         self.beacon_unique_id = f"{self.beacon_uuid}_{self.beacon_major}_{self.beacon_minor}"
                         # Note: it's possible that a device sends multiple
                         # beacons. We are only going to process the latest
@@ -829,6 +1106,12 @@ class BermudaDevice(dict):
                 for advert in self.adverts.values():
                     advertout[f"{advert.device_address}__{advert.scanner_address}"] = advert.to_dict()
                 out[var] = advertout
+                continue
+            if val is self.area_advert:
+                # A BermudaAdvert, which is not JSON-serialisable. It is already
+                # dumped in full under `adverts` above, so emit just its
+                # identifying repr here to show which one won the area.
+                out[var] = val.__repr__()
                 continue
             out[var] = val
         return out

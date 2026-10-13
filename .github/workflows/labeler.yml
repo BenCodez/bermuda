@@ -10,11 +10,15 @@ jobs:
   labeler:
     name: Labeler
     runs-on: ubuntu-latest
+    # A new repository's token is read-only; syncing labels needs this, and only this.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
 
       - name: Run Labeler
-        uses: crazy-max/ghaction-github-labeler@v6.0.0
+        uses: crazy-max/ghaction-github-labeler@548a7c3603594ec17c819e1239f281a3b801ab4d # v6.0.0
         with:
           skip-delete: true

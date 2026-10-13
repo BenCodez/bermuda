@@ -13,3 +13,57 @@ dump_devices:
       required: false
       example: "False"
       default: false
+measurement_toolkit:
+  name: Measurement toolkit
+  description: >-
+    Run a measurement toolkit operation as a Home Assistant administrator or trusted
+    local automation. Independent measured ranges are required for calibration;
+    previews do not apply settings. Response data is optional. User authorization
+    comes from the actual service context, and validation or persistence failures
+    are returned as safe Home Assistant errors.
+  fields:
+    entry_id:
+      name: Configuration entry
+      description: >-
+        Bermuda configuration entry ID. May be omitted when exactly one Bermuda
+        entry is loaded.
+      required: false
+      selector:
+        text:
+    action:
+      name: Operation
+      description: Toolkit operation to run. Use state or diagnostics to inspect current status.
+      required: true
+      example: calibration_preview
+      selector:
+        select:
+          options:
+            - state
+            - settings
+            - profile
+            - capture
+            - calibration_preview
+            - calibration_apply
+            - calibration_rollback
+            - history_start
+            - history_stop
+            - history_clear
+            - history_export
+            - history_import
+            - replay
+            - shadow_start
+            - shadow_stop
+            - shadow_promote
+            - fingerprint_train
+            - fingerprint_clear
+            - diagnostics
+    payload:
+      name: Operation payload
+      description: >-
+        Operation-specific object. Uses opaque device and scanner IDs, measured
+        slant ranges in metres, and raw RSSI in dBm. Defaults to an empty object;
+        never include private identity keys or claims about the caller's permissions.
+      required: false
+      default: {}
+      selector:
+        object:
