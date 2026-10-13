@@ -29,11 +29,15 @@ Use the custom repository **`https://github.com/BenCodez/bermuda`**, category **
 
 For a new installation, add that repository in **HACS → Custom repositories**, download its Bermuda package, restart Home Assistant and add **Bermuda BLE Trilateration** under **Settings → Devices & services**.
 
+Normal HACS downloads require a published release from this fork with its `bermuda.zip` asset. While the feature PR is unmerged or unreleased, its branch source ZIP can be used for the manual replacement below.
+
 To replace upstream or bermuda-patched while preserving your installation:
 
-1. In HACS, remove the previously downloaded Bermuda package. **Keep the existing Bermuda integration entries under Settings → Devices & services**; do not delete their devices/entities/settings.
-2. Add the BenCodez custom repository above and download its Bermuda package. Check the repository owner when similarly named entries appear.
+1. **Keep the existing Bermuda integration entries under Settings → Devices & services**; do not delete their devices/entities/settings or add a second Bermuda entry.
+2. In HACS, remove the previously downloaded Bermuda package and install this fork's release before restarting. If HACS displays **Integration is configured**, use **Ignore** when offered to retain the Home Assistant configuration. If HACS requires deleting the integration and offers no **Ignore**, use the manual replacement below. Add the BenCodez custom repository above and check the repository owner when similarly named entries appear.
 3. Restart Home Assistant. The existing `bermuda` entries load the fork and keep their established entity identities and option keys.
+
+**Manual replacement:** Keep the Home Assistant entries and `.storage` intact. Replace only `config/custom_components/bermuda` with this fork's component files. From a branch source ZIP, copy its `custom_components/bermuda` directory. A release's `bermuda.zip` contains the component files at the archive root; extract them directly into `config/custom_components/bermuda`, without another nested `bermuda` folder. Complete the replacement before restarting Home Assistant. If the old HACS repository remains registered, an update from it can overwrite these files; switch HACS to this fork's repository for future updates.
 
 The HACS repository/package selection changes; Home Assistant's integration configuration entries stay in place. Only one downloaded implementation can occupy `custom_components/bermuda`, so install this as a replacement, not a parallel integration. To return to upstream, replace only the HACS package with the upstream package and restart, retaining the Home Assistant integration entries. Existing legacy options remain in their original namespace.
 
