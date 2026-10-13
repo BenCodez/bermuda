@@ -132,6 +132,10 @@ def _rebase_distance(distance: float | None, old_model: dict, new_model: dict) -
     """Project one stored distance through its equivalent RSSI without reseeding filters."""
     if distance is None or distance == DISTANCE_INFINITE:
         return distance
+    if finite_number(distance) and distance == 0:
+        # Floating-point underflow loses the equivalent RSSI. Retain that
+        # accepted lower bound rather than inventing a filtered observation.
+        return 0.0
     if not finite_number(distance) or distance <= 0:
         return None
     equivalent_rssi = (
@@ -140,6 +144,23 @@ def _rebase_distance(distance: float | None, old_model: dict, new_model: dict) -
     return rssi_to_metres(
         equivalent_rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
     )
+
+
+def _rebase_raw_history(history: list, rssi_history: list, old_model: dict, new_model: dict) -> list:
+    """Recover saturated raw values from their original aligned RSSI samples."""
+    rebased = []
+    for index, distance in enumerate(history):
+        value = _rebase_distance(distance, old_model, new_model)
+        if (distance in (0, DISTANCE_INFINITE) or value is None) and index < len(rssi_history):
+            rssi = rssi_history[index]
+            if finite_number(rssi):
+                value = rssi_to_metres(
+                    rssi + new_model["rssi_offset"], new_model["reference_power"], new_model["attenuation"]
+                )
+        # Legacy velocity arithmetic requires numeric samples, even when a
+        # malformed or unavailable old value has no usable source evidence.
+        rebased.append(float(DISTANCE_INFINITE) if value is None else value)
+    return rebased
 
 
 class ToolkitManager:
@@ -1053,7 +1074,9 @@ class ToolkitManager:
                             new_model["attenuation"],
                         )
                     advert.rssi_distance = _rebase_distance(filtered, old_model, new_model)
-                    advert.hist_distance[:] = [_rebase_distance(value, old_model, new_model) for value in raw_history]
+                    advert.hist_distance[:] = _rebase_raw_history(
+                        raw_history, getattr(advert, "hist_rssi", []), old_model, new_model
+                    )
                     advert.hist_distance_by_interval[:] = [
                         _rebase_distance(value, old_model, new_model) for value in filtered_history
                     ]
@@ -1658,7 +1681,11 @@ class ToolkitManager:
         for field in ("hist_distance", "hist_distance_by_interval"):
             history = getattr(advert, field, None)
             if isinstance(history, list):
-                history[:] = [_rebase_distance(value, old_model, new_model) for value in history]
+                history[:] = (
+                    _rebase_raw_history(history, getattr(advert, "hist_rssi", []), old_model, new_model)
+                    if field == "hist_distance"
+                    else [_rebase_distance(value, old_model, new_model) for value in history]
+                )
 
     @staticmethod
     def _copy_source_reading(target: Any, source: Any, *, new_view: bool) -> None:

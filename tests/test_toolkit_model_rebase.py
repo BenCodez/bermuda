@@ -12,7 +12,7 @@ from bleak.backends.scanner import AdvertisementData
 from custom_components.bermuda.api import snapshot_observations
 from custom_components.bermuda.bermuda_advert import BermudaAdvert
 from custom_components.bermuda.bermuda_device import BermudaDevice
-from custom_components.bermuda.const import CONF_RSSI_OFFSETS, DISTANCE_INFINITE
+from custom_components.bermuda.const import CONF_ATTENUATION, CONF_RSSI_OFFSETS, DISTANCE_INFINITE
 from custom_components.bermuda.recording import DiagnosticHistory
 from custom_components.bermuda.replay import ReplayEngine
 from custom_components.bermuda.toolkit import _rebase_distance
@@ -264,6 +264,48 @@ async def test_radius_and_metadata_changes_keep_all_distance_and_filter_state_ex
     assert (advert.rssi_distance_raw, advert.rssi_distance) == before_distances
     assert (advert.hist_distance, advert.hist_distance_by_interval) == histories
     assert manager._states[(DEVICE, SCANNER)] is state
+
+
+@pytest.mark.parametrize("last_rssi", [-30, -80])
+async def test_legacy_underflow_correction_keeps_numeric_source_aligned_history_without_accepting_retreat(
+    model_runtime, last_rssi
+):
+    runtime = model_runtime
+    manager, advert = runtime.manager, runtime.advert
+    options = {**deepcopy(dict(runtime.entry.options)), CONF_ATTENUATION: 0.001}
+    runtime.hass.config_entries.async_update_entry(runtime.entry, options=options)
+    runtime.coordinator.options.update(options)
+    advert.conf_attenuation = 0.001
+    manager.invalidate_model()
+    for history in (advert.hist_distance, advert.hist_stamp, advert.hist_rssi, advert.hist_distance_by_interval):
+        history.clear()
+    advert.rssi_distance = None
+    packet(runtime, -30)
+    packet(runtime, last_rssi)
+    assert advert.rssi_distance == 0.0
+    assert advert.hist_distance == [0.0 if last_rssi == -30 else DISTANCE_INFINITE, 0.0]
+    before_source = source_state(advert)
+    filtered = list(advert.hist_distance_by_interval)
+
+    await manager.async_dispatch("profile", {"kind": "receiver", "id": SCANNER, "profile": {"attenuation": 2.0}})
+    model = manager.effective_advert_model(advert)
+    expected = [
+        rssi_to_metres(rssi + model["rssi_offset"], model["reference_power"], model["attenuation"])
+        for rssi in advert.hist_rssi
+    ]
+    assert advert.hist_distance == pytest.approx(expected)
+    assert len(advert.hist_distance) == len(advert.hist_rssi) == len(advert.hist_stamp)
+    assert advert.rssi_distance_raw == expected[0]
+    assert advert.rssi_distance == 0.0
+    assert advert.hist_distance_by_interval == filtered
+    assert source_state(advert) == before_source
+    advert.calculate_data()  # A cached cycle must neither raise nor accept the rejected retreat.
+    if last_rssi == -80:
+        assert advert.rssi_distance == 0.0
+    else:
+        assert 0 <= advert.rssi_distance <= advert.rssi_distance_raw
+    assert advert.hist_distance == pytest.approx(expected)
+    assert source_state(advert) == before_source
 
 
 @pytest.mark.parametrize("value", [None, DISTANCE_INFINITE])
