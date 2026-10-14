@@ -57,7 +57,7 @@ _PANEL_PATH = "bermuda-toolkit"
 
 
 async def _register_panel(hass: HomeAssistant, entry_id: str) -> None:
-    """Register a direct-link administrator page without a sidebar item."""
+    """Register a direct-link admin page, keeping Configure on the native options flow."""
     await panel_custom.async_register_panel(
         hass,
         frontend_url_path=_PANEL_PATH,
@@ -65,7 +65,6 @@ async def _register_panel(hass: HomeAssistant, entry_id: str) -> None:
         module_url="/bermuda_toolkit/toolkit.js",
         config={"entry_id": entry_id},
         require_admin=True,
-        config_panel_domain="bermuda",
     )
 
 
