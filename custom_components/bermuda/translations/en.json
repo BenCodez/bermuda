@@ -25,7 +25,14 @@
       "no_scanners": "You need to configure some bluetooth scanners before Bermuda will have anything to work with. \nAny one of esphome bluetooth_proxy, Shelly bluetooth proxy or local bluetooth adaptor should get you started.",
       "no_devices": "No bluetooth devices are actively being reported from your scanners. \nYou will need to solve this before Bermuda can be of much help."
     },
+    "abort": {
+      "integration_not_loaded": "Bermuda is not loaded. Check its integration status and Home Assistant logs, then reopen Configure before live calibration."
+    },
     "step": {
+      "measurement_toolkit": {
+        "title": "Measurement toolkit settings",
+        "description": "[Open measurement toolkit settings]({toolkit_url}) for hardware/radio profiles and optional runtime settings. The toolkit requires a loaded Bermuda integration and a Home Assistant administrator. Use Global Options and Select Devices in the Configure menu for the original shared settings and tracked beacons. Submit returns to that menu."
+      },
       "init": {
         "title": "Configure Bermuda",
         "description": "Bermuda can currently see:\n- {device_counter_active} active out of {device_counter_devices} bluetooth devices.\n- {scanner_counter_active} active out of {scanner_counter_scanners} bluetooth scanner devices.\n\n{status}"

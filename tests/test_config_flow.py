@@ -6,6 +6,8 @@ import re
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
 from homeassistant import data_entry_flow
@@ -104,6 +106,48 @@ async def test_options_flow(hass: HomeAssistant, setup_bermuda_entry: MockConfig
     # The options listener owns a real reload, including the toolkit's durable
     # close. Finish it while the setup fixtures are still installed.
     await hass.async_block_till_done(wait_background_tasks=True)
+
+
+async def test_options_menu_links_to_toolkit_and_returns_without_saving(hass, setup_bermuda_entry):
+    before = dict(setup_bermuda_entry.options)
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert "measurement_toolkit" in result["menu_options"]
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "measurement_toolkit"}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["description_placeholders"]["toolkit_url"] == "/bermuda-toolkit"
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+    assert result["type"] == FlowResultType.MENU
+    assert dict(setup_bermuda_entry.options) == before
+
+
+@pytest.mark.parametrize("step", ["globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"])
+async def test_options_remain_accessible_without_live_runtime(hass, setup_bermuda_entry, step):
+    runtime = setup_bermuda_entry.runtime_data
+    setup_bermuda_entry.runtime_data = None
+    try:
+        result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+        assert result["type"] == FlowResultType.MENU
+        assert "Live scanner status is unavailable" in result["description_placeholders"]["status"]
+        result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+        if step.startswith("calibration"):
+            assert result["type"] == FlowResultType.ABORT
+            assert result["reason"] == "integration_not_loaded"
+        else:
+            assert result["type"] == FlowResultType.FORM
+    finally:
+        setup_bermuda_entry.runtime_data = runtime
+
+
+async def test_bad_scanner_status_does_not_block_settings(hass, setup_bermuda_entry):
+    coordinator = setup_bermuda_entry.runtime_data.coordinator
+    with patch.object(coordinator, "get_active_scanner_summary", return_value=[{"last_stamp_age": None}]):
+        result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert result["type"] == FlowResultType.MENU
+    assert "unavailable" in result["description_placeholders"]["status"]
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": "globalopts"})
+    assert result["type"] == FlowResultType.FORM
 
 
 def _fake_scanners() -> list[SimpleNamespace]:
