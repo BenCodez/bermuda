@@ -5,12 +5,13 @@ from __future__ import annotations
 import html
 import re
 from copy import deepcopy
+from sys import float_info
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
-from homeassistant.config_entries import OptionsFlowWithConfigEntry
+from homeassistant.config_entries import ConfigEntryState, OptionsFlowWithConfigEntry
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.selector import (
@@ -67,20 +68,13 @@ if TYPE_CHECKING:
 # from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 
-def _finite(value: float) -> float:
-    """Reject NaN and infinities (vol.Coerce(float) accepts "nan" and "inf")."""
-    if not usable_number(value):
-        msg = "must be a finite number"
-        raise vol.Invalid(msg)
-    return value
-
-
 # Path-loss exponent: rssi_to_metres divides by it, so zero (or NaN) aborted
 # every update cycle. Any positive finite value works; real-world ones sit
-# around 2-4. No upper bound: a value that works today must still save.
-ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), _finite, vol.Range(min=0, min_included=False))
+# around 2-4. Use serializable range validators instead of a custom callback:
+# HA must serialize these schemas before it can display the options forms.
+ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), vol.Range(min=0, max=float_info.max, min_included=False))
 # RSSI expected at 1 m, in dBm: any finite value.
-REF_POWER_SCHEMA = vol.All(vol.Coerce(float), _finite)
+REF_POWER_SCHEMA = vol.All(vol.Coerce(float), vol.Range(min=-float_info.max, max=float_info.max))
 _FLOW_OPTION_DEFAULTS = {
     CONF_MAX_RADIUS: DEFAULT_MAX_RADIUS,
     CONF_MAX_VELOCITY: DEFAULT_MAX_VELOCITY,
@@ -207,9 +201,50 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
     async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
         """Manage the options."""
-        self.coordinator = self.config_entry.runtime_data.coordinator
-        self.devices = self.coordinator.devices
+        self._refresh_runtime()
 
+        try:
+            messages = self._status_messages()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            messages = dict.fromkeys(
+                (
+                    "device_counter_active",
+                    "device_counter_devices",
+                    "scanner_counter_active",
+                    "scanner_counter_scanners",
+                ),
+                "unavailable",
+            )
+            messages["status"] = (
+                "Live scanner status is unavailable. Global Options and saved device selection are still available. "
+                "If Bermuda is not loaded, check its Home Assistant logs; live calibration needs a loaded integration."
+            )
+
+        # return await self.async_step_globalopts()
+        return self.async_show_menu(
+            step_id="init",
+            menu_options={
+                "measurement_toolkit": "Measurement toolkit settings",
+                "globalopts": "Global Options",
+                "selectdevices": "Select Devices",
+                "calibration1_global": "Calibration 1: Global",
+                "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
+            },
+            description_placeholders=messages,
+        )
+
+    def _refresh_runtime(self):
+        """Runtime data can remain attached after failed setup or unloading."""
+        self.coordinator = (
+            getattr(getattr(self.config_entry, "runtime_data", None), "coordinator", None)
+            if self.config_entry.state is ConfigEntryState.LOADED
+            else None
+        )
+        self.devices = getattr(self.coordinator, "devices", {})
+        return self.coordinator
+
+    def _status_messages(self):
+        """Build optional scanner status without making it a settings prerequisite."""
         messages = {}
         active_devices = self.coordinator.count_active_devices()
         active_scanners = self.coordinator.count_active_scanners()
@@ -252,16 +287,16 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             )
         messages["status"] += scanner_table
 
-        # return await self.async_step_globalopts()
-        return self.async_show_menu(
-            step_id="init",
-            menu_options={
-                "globalopts": "Global Options",
-                "selectdevices": "Select Devices",
-                "calibration1_global": "Calibration 1: Global",
-                "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
-            },
-            description_placeholders=messages,
+        return messages
+
+    async def async_step_measurement_toolkit(self, user_input=None):
+        """Keep the advanced toolkit discoverable without restoring a sidebar item."""
+        if user_input is not None:
+            return await self.async_step_init()
+        return self.async_show_form(
+            step_id="measurement_toolkit",
+            data_schema=vol.Schema({}),
+            description_placeholders={"toolkit_url": "/bermuda-toolkit"},
         )
 
     async def async_step_globalopts(self, user_input=None):
@@ -313,7 +348,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             return await self._update_options({CONF_DEVICES: user_input.get(CONF_DEVICES, [])})
 
         # Grab the co-ordinator's device list so we can build a selector from it.
-        self.devices = self.config_entry.runtime_data.coordinator.devices
+        self._refresh_runtime()
 
         # Where we store the options before building the selector
         options_list = []
@@ -397,6 +432,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         return self.async_show_form(step_id="selectdevices", data_schema=vol.Schema(data_schema))
 
     async def async_step_calibration1_global(self, user_input=None):
+        if self._refresh_runtime() is None:
+            return self.async_abort(reason="integration_not_loaded")
         # FIXME: This is ridiculous. But I can't yet find a better way.
         _ugly_token_hack = {
             # These are work-arounds for (broken?) placeholder substitutions.
@@ -538,6 +575,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         Distances are recalculated and displayed each time the user presses
         Submit, and they check "Save and Close" to save the config.
         """
+        if self._refresh_runtime() is None:
+            return self.async_abort(reason="integration_not_loaded")
         self._freeze_calibration_scanner_labels()
         labels = self._calibration_scanner_labels or {}
         errors = {}

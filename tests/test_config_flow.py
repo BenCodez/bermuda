@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import re
+import json
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant import data_entry_flow
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.data_entry_flow import FlowManagerResourceView
 
 # from homeassistant.core import HomeAssistant  # noqa: F401
 from homeassistant.data_entry_flow import FlowResultType
@@ -106,6 +111,89 @@ async def test_options_flow(hass: HomeAssistant, setup_bermuda_entry: MockConfig
     await hass.async_block_till_done(wait_background_tasks=True)
 
 
+async def test_options_menu_links_to_toolkit_and_returns_without_saving(hass, setup_bermuda_entry):
+    before = dict(setup_bermuda_entry.options)
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert "measurement_toolkit" in result["menu_options"]
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "measurement_toolkit"}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["description_placeholders"]["toolkit_url"] == "/bermuda-toolkit"
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+    assert result["type"] == FlowResultType.MENU
+    assert dict(setup_bermuda_entry.options) == before
+
+
+@pytest.mark.parametrize(
+    "step", ["globalopts", "calibration1_global", "calibration2_scanners", "selectdevices", "measurement_toolkit"]
+)
+async def test_options_forms_serialize_through_ha_http_view(hass, setup_bermuda_entry, step):
+    """Exercise the HTTP rendering step, not only the Python flow result."""
+    before = dict(setup_bermuda_entry.options)
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == FlowResultType.FORM
+    rendered = FlowManagerResourceView(hass.config_entries.options)._prepare_result_json(result)
+    assert isinstance(rendered["data_schema"], list)
+    json.dumps(rendered, allow_nan=False)
+    assert dict(setup_bermuda_entry.options) == before
+
+
+@pytest.mark.parametrize("step", ["globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"])
+async def test_options_remain_accessible_without_live_runtime(hass, setup_bermuda_entry, step):
+    runtime = setup_bermuda_entry.runtime_data
+    setup_bermuda_entry.runtime_data = None
+    try:
+        result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+        assert result["type"] == FlowResultType.MENU
+        assert "Live scanner status is unavailable" in result["description_placeholders"]["status"]
+        result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+        if step.startswith("calibration"):
+            assert result["type"] == FlowResultType.ABORT
+            assert result["reason"] == "integration_not_loaded"
+        else:
+            assert result["type"] == FlowResultType.FORM
+    finally:
+        setup_bermuda_entry.runtime_data = runtime
+
+
+async def test_bad_scanner_status_does_not_block_settings(hass, setup_bermuda_entry):
+    coordinator = setup_bermuda_entry.runtime_data.coordinator
+    with patch.object(coordinator, "get_active_scanner_summary", return_value=[{"last_stamp_age": None}]):
+        result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert result["type"] == FlowResultType.MENU
+    assert "unavailable" in result["description_placeholders"]["status"]
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": "globalopts"})
+    assert result["type"] == FlowResultType.FORM
+
+
+@pytest.mark.parametrize("state", [ConfigEntryState.NOT_LOADED, ConfigEntryState.SETUP_RETRY])
+@pytest.mark.parametrize("step", ["globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"])
+async def test_retained_runtime_is_not_treated_as_loaded(hass, mock_bermuda_entry, state, step):
+    entry = mock_bermuda_entry
+    # HA retains runtime_data on these paths. It is evidence of neither a
+    # completed setup nor a currently loaded integration.
+    entry.runtime_data = SimpleNamespace(coordinator=_fake_coordinator(_fake_scanners()))
+    entry.mock_state(hass, state, "Synthetic lifecycle state")
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert "Live scanner status is unavailable" in result["description_placeholders"]["status"]
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == (FlowResultType.ABORT if step.startswith("calibration") else FlowResultType.FORM)
+    if step.startswith("calibration"):
+        assert result["reason"] == "integration_not_loaded"
+
+
+@pytest.mark.parametrize("step", ["calibration1_global", "calibration2_scanners"])
+async def test_open_menu_rechecks_runtime_after_real_unload(hass, setup_bermuda_entry, step):
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert await hass.config_entries.async_unload(setup_bermuda_entry.entry_id)
+    assert setup_bermuda_entry.state is ConfigEntryState.NOT_LOADED
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "integration_not_loaded"
+
+
 def _fake_scanners() -> list[SimpleNamespace]:
     """
     Scanners deliberately listed in neither name nor distance order.
@@ -157,6 +245,7 @@ async def test_options_flow_calibration2_scanner_sorting(hass: HomeAssistant):
     config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test", title=NAME)
     config_entry.add_to_hass(hass)
     config_entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    config_entry.mock_state(hass, ConfigEntryState.LOADED)
 
     flow = BermudaOptionsFlowHandler(config_entry)
     flow.hass = hass

@@ -276,7 +276,13 @@ async def test_toolkit_keeps_configure_on_original_options_forms(hass, setup_ber
 
     menu = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
     assert menu["type"] == FlowResultType.MENU
-    assert set(menu["menu_options"]) == {"globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"}
+    assert set(menu["menu_options"]) == {
+        "measurement_toolkit",
+        "globalopts",
+        "selectdevices",
+        "calibration1_global",
+        "calibration2_scanners",
+    }
     result = await hass.config_entries.options.async_configure(menu["flow_id"], user_input={"next_step_id": step})
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == step
