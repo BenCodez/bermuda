@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import voluptuous as vol
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
-from homeassistant.config_entries import OptionsFlowWithConfigEntry
+from homeassistant.config_entries import ConfigEntryState, OptionsFlowWithConfigEntry
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.selector import (
@@ -201,8 +201,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
     async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
         """Manage the options."""
-        self.coordinator = getattr(getattr(self.config_entry, "runtime_data", None), "coordinator", None)
-        self.devices = getattr(self.coordinator, "devices", {})
+        self._refresh_runtime()
 
         try:
             messages = self._status_messages()
@@ -233,6 +232,16 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             },
             description_placeholders=messages,
         )
+
+    def _refresh_runtime(self):
+        """Runtime data can remain attached after failed setup or unloading."""
+        self.coordinator = (
+            getattr(getattr(self.config_entry, "runtime_data", None), "coordinator", None)
+            if self.config_entry.state is ConfigEntryState.LOADED
+            else None
+        )
+        self.devices = getattr(self.coordinator, "devices", {})
+        return self.coordinator
 
     def _status_messages(self):
         """Build optional scanner status without making it a settings prerequisite."""
@@ -339,9 +348,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             return await self._update_options({CONF_DEVICES: user_input.get(CONF_DEVICES, [])})
 
         # Grab the co-ordinator's device list so we can build a selector from it.
-        self.devices = getattr(
-            getattr(getattr(self.config_entry, "runtime_data", None), "coordinator", None), "devices", {}
-        )
+        self._refresh_runtime()
 
         # Where we store the options before building the selector
         options_list = []
@@ -425,7 +432,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         return self.async_show_form(step_id="selectdevices", data_schema=vol.Schema(data_schema))
 
     async def async_step_calibration1_global(self, user_input=None):
-        if self.coordinator is None:
+        if self._refresh_runtime() is None:
             return self.async_abort(reason="integration_not_loaded")
         # FIXME: This is ridiculous. But I can't yet find a better way.
         _ugly_token_hack = {
@@ -568,7 +575,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         Distances are recalculated and displayed each time the user presses
         Submit, and they check "Save and Close" to save the config.
         """
-        if self.coordinator is None:
+        if self._refresh_runtime() is None:
             return self.async_abort(reason="integration_not_loaded")
         self._freeze_calibration_scanner_labels()
         labels = self._calibration_scanner_labels or {}

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 from bleak.backends.scanner import AdvertisementData
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import area_registry as ar
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -288,6 +289,7 @@ def _flow(hass, names=("Shared Name", "Shared Name"), saved=None):
     entry = _entry(hass, DOMAIN, "calibration", options={CONF_RSSI_OFFSETS: saved or {}})
     coordinator = SimpleNamespace(devices=scanners, scanner_list=list(scanners))
     entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
     flow = BermudaOptionsFlowHandler(entry)
     flow.hass = hass
     flow.handler = entry.entry_id

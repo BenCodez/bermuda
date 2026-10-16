@@ -11,6 +11,7 @@ import pytest
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant import data_entry_flow
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.data_entry_flow import FlowManagerResourceView
@@ -167,6 +168,32 @@ async def test_bad_scanner_status_does_not_block_settings(hass, setup_bermuda_en
     assert result["type"] == FlowResultType.FORM
 
 
+@pytest.mark.parametrize("state", [ConfigEntryState.NOT_LOADED, ConfigEntryState.SETUP_RETRY])
+@pytest.mark.parametrize("step", ["globalopts", "selectdevices", "calibration1_global", "calibration2_scanners"])
+async def test_retained_runtime_is_not_treated_as_loaded(hass, mock_bermuda_entry, state, step):
+    entry = mock_bermuda_entry
+    # HA retains runtime_data on these paths. It is evidence of neither a
+    # completed setup nor a currently loaded integration.
+    entry.runtime_data = SimpleNamespace(coordinator=_fake_coordinator(_fake_scanners()))
+    entry.mock_state(hass, state, "Synthetic lifecycle state")
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert "Live scanner status is unavailable" in result["description_placeholders"]["status"]
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == (FlowResultType.ABORT if step.startswith("calibration") else FlowResultType.FORM)
+    if step.startswith("calibration"):
+        assert result["reason"] == "integration_not_loaded"
+
+
+@pytest.mark.parametrize("step", ["calibration1_global", "calibration2_scanners"])
+async def test_open_menu_rechecks_runtime_after_real_unload(hass, setup_bermuda_entry, step):
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    assert await hass.config_entries.async_unload(setup_bermuda_entry.entry_id)
+    assert setup_bermuda_entry.state is ConfigEntryState.NOT_LOADED
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "integration_not_loaded"
+
+
 def _fake_scanners() -> list[SimpleNamespace]:
     """
     Scanners deliberately listed in neither name nor distance order.
@@ -218,6 +245,7 @@ async def test_options_flow_calibration2_scanner_sorting(hass: HomeAssistant):
     config_entry = MockConfigEntry(domain=DOMAIN, data=MOCK_CONFIG, entry_id="test", title=NAME)
     config_entry.add_to_hass(hass)
     config_entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    config_entry.mock_state(hass, ConfigEntryState.LOADED)
 
     flow = BermudaOptionsFlowHandler(config_entry)
     flow.hass = hass

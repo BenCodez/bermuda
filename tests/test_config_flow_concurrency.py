@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import voluptuous as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -63,6 +64,7 @@ def flow_entry(hass, device_registry):
         get_active_scanner_summary=lambda: [],
     )
     entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
     target = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id, connections={("bluetooth", BEACON_A.upper())}, name="Synthetic Tracked Beacon"
     )
