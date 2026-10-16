@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from sys import float_info
 
 import pytest
 import voluptuous as vol
@@ -22,7 +23,7 @@ def test_rssi_to_metres_uses_the_default_for_an_unusable_attenuation(attenuation
     assert got is not False and math.isfinite(got) and got > 0
 
 
-@pytest.mark.parametrize("value", [0, -2, math.nan, "nan", math.inf, "inf"])
+@pytest.mark.parametrize("value", [0, -2, math.nan, "nan", math.inf, "inf", -math.inf, "-inf"])
 def test_attenuation_schema_rejects_bad_values(value):
     with pytest.raises(vol.Invalid):
         ATTENUATION_SCHEMA(value)
@@ -36,6 +37,14 @@ def test_attenuation_and_ref_power_schemas_accept_normal_values():
     for bad in (math.nan, "inf", -math.inf):
         with pytest.raises(vol.Invalid):
             REF_POWER_SCHEMA(bad)
+
+
+def test_serializable_schemas_preserve_all_finite_float_extremes():
+    assert ATTENUATION_SCHEMA(math.ulp(0.0)) == math.ulp(0.0)
+    assert ATTENUATION_SCHEMA(float_info.max) == float_info.max
+    assert REF_POWER_SCHEMA(-float_info.max) == -float_info.max
+    assert REF_POWER_SCHEMA(float_info.max) == float_info.max
+    assert REF_POWER_SCHEMA(0) == 0.0
 
 
 @pytest.mark.parametrize("ref_power", [math.nan, math.inf, -math.inf, None])

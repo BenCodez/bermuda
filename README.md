@@ -4,6 +4,8 @@ This custom fork adds measurement, independently labelled calibration and diagno
 
 Open **Settings → Devices & services → Bermuda BLE Trilateration → Configure** for the original **Global Options**, **Select Devices**, **Calibration 1: Global** and **Calibration 2: Scanner RSSI Offsets** controls. **Select Devices** chooses which Bluetooth devices and beacons Bermuda tracks.
 
+Global Options and Calibration 1 use Home Assistant-compatible numeric forms while retaining validation against zero attenuation, NaN and infinite values. Opening these forms does not change saved calibration.
+
 The toolkit no longer adds a sidebar item or replaces **Configure**. Administrators can open `/bermuda-toolkit` on their Home Assistant server when needed. Radio calibration appears first; optional tuning is under **Advanced**, and descriptive fields are under **Hardware details**. Read the [measurement toolkit guide](docs/measurement-toolkit.md) for controls, measured calibration, defaults, limits and privacy, or the [panel reference](docs/toolkit-panel.md) for a shorter walkthrough.
 
 ## Twelve additions

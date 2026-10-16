@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant import config_entries
 from homeassistant import data_entry_flow
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.data_entry_flow import FlowManagerResourceView
 
 # from homeassistant.core import HomeAssistant  # noqa: F401
 from homeassistant.data_entry_flow import FlowResultType
@@ -119,6 +121,21 @@ async def test_options_menu_links_to_toolkit_and_returns_without_saving(hass, se
     assert result["description_placeholders"]["toolkit_url"] == "/bermuda-toolkit"
     result = await hass.config_entries.options.async_configure(result["flow_id"], {})
     assert result["type"] == FlowResultType.MENU
+    assert dict(setup_bermuda_entry.options) == before
+
+
+@pytest.mark.parametrize(
+    "step", ["globalopts", "calibration1_global", "calibration2_scanners", "selectdevices", "measurement_toolkit"]
+)
+async def test_options_forms_serialize_through_ha_http_view(hass, setup_bermuda_entry, step):
+    """Exercise the HTTP rendering step, not only the Python flow result."""
+    before = dict(setup_bermuda_entry.options)
+    result = await hass.config_entries.options.async_init(setup_bermuda_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {"next_step_id": step})
+    assert result["type"] == FlowResultType.FORM
+    rendered = FlowManagerResourceView(hass.config_entries.options)._prepare_result_json(result)
+    assert isinstance(rendered["data_schema"], list)
+    json.dumps(rendered, allow_nan=False)
     assert dict(setup_bermuda_entry.options) == before
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import re
 from copy import deepcopy
+from sys import float_info
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
@@ -67,20 +68,13 @@ if TYPE_CHECKING:
 # from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 
-def _finite(value: float) -> float:
-    """Reject NaN and infinities (vol.Coerce(float) accepts "nan" and "inf")."""
-    if not usable_number(value):
-        msg = "must be a finite number"
-        raise vol.Invalid(msg)
-    return value
-
-
 # Path-loss exponent: rssi_to_metres divides by it, so zero (or NaN) aborted
 # every update cycle. Any positive finite value works; real-world ones sit
-# around 2-4. No upper bound: a value that works today must still save.
-ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), _finite, vol.Range(min=0, min_included=False))
+# around 2-4. Use serializable range validators instead of a custom callback:
+# HA must serialize these schemas before it can display the options forms.
+ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), vol.Range(min=0, max=float_info.max, min_included=False))
 # RSSI expected at 1 m, in dBm: any finite value.
-REF_POWER_SCHEMA = vol.All(vol.Coerce(float), _finite)
+REF_POWER_SCHEMA = vol.All(vol.Coerce(float), vol.Range(min=-float_info.max, max=float_info.max))
 _FLOW_OPTION_DEFAULTS = {
     CONF_MAX_RADIUS: DEFAULT_MAX_RADIUS,
     CONF_MAX_VELOCITY: DEFAULT_MAX_VELOCITY,
