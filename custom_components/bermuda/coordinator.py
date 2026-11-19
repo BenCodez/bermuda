@@ -6,10 +6,10 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, cast
 
-import aiofiles
 import voluptuous as vol
 import yaml
 from bluetooth_data_tools import monotonic_time_coarse
@@ -115,6 +115,15 @@ Cancellable = Callable[[], None]
 # so we're just disabling it for the whole file.
 # https://github.com/astral-sh/ruff/issues/4244
 # ruff: noqa: PLR1730
+
+
+def _load_manufacturer_yaml(file_path: str, key: str) -> list[dict]:
+    """Parse a bundled Bluetooth SIG YAML file outside the event loop."""
+    # Home Assistant's PyYAML normally provides CSafeLoader, which avoids the
+    # much slower pure-Python parser while retaining SafeLoader semantics.
+    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    with Path(file_path).open(encoding="utf-8") as file:
+        return yaml.load(file, Loader=loader)[key]  # noqa: S506 - SafeLoader only
 
 
 class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
@@ -390,16 +399,14 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             file_path = self.hass.config.path(
                 f"custom_components/{DOMAIN}/manufacturer_identification/member_uuids.yaml"
             )
-            async with aiofiles.open(file_path) as f:
-                mi_yaml = yaml.safe_load(await f.read())["uuids"]
+            mi_yaml = await self.hass.async_add_executor_job(_load_manufacturer_yaml, file_path, "uuids")
             self.member_uuids: dict[int, str] = {member["uuid"]: member["name"] for member in mi_yaml}
 
             # https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/company_identifiers/company_identifiers.yaml
             file_path = self.hass.config.path(
                 f"custom_components/{DOMAIN}/manufacturer_identification/company_identifiers.yaml"
             )
-            async with aiofiles.open(file_path) as f:
-                ci_yaml = yaml.safe_load(await f.read())["company_identifiers"]
+            ci_yaml = await self.hass.async_add_executor_job(_load_manufacturer_yaml, file_path, "company_identifiers")
             self.company_uuids: dict[int, str] = {member["value"]: member["name"] for member in ci_yaml}
         finally:
             # Ensure that an issue reading these files (which are optional, really) doesn't stop the whole show.
@@ -720,7 +727,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             for address, device in self.devices.items():
                 if device.create_sensor:
                     if not device.create_all_done:
-                        _LOGGER.debug("Firing device_new for %s (%s)", device.name, address)
+                        if device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
+                            _LOGGER.debug("Firing device_new for private BLE device %s...", address[:4])
+                        else:
+                            _LOGGER.debug("Firing device_new for %s (%s)", device.name, address)
                         # Note that the below should be OK thread-wise, debugger indicates this is being
                         # called by _run in events.py, so pretty sure we are "in the event loop".
                         async_dispatcher_send(self.hass, SIGNAL_DEVICE_NEW, address)
@@ -1803,9 +1813,13 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 elif len(address) == 17:
                     for altmac in mac_explode_formats(address):
                         self.redactions[altmac] = f"{address[:2]}::CFG_MAC_{i}::{address[-2:]}"
+                elif len(address) == 32:
+                    # An IRK is key material: keep only a short prefix, like
+                    # the existing discovered-IRK redaction below.
+                    self.redactions[address] = f"{address[:4]}::CFG_IRK_{i}"
                 else:
-                    # Don't know what it is, but not a mac.
-                    self.redactions[address] = f"CFG_OTHER_{1}_{address}"
+                    # Do not echo unrecognised configured values either.
+                    self.redactions[address] = f"CFG_OTHER_{i}"
         _LOGGER.debug("Redact confdevs: %ss, %d items", monotonic_time_coarse() - _stamp, len(self.redactions))
         # EVERYTHING ELSE
         for non_lower_address, device in self.devices.items():

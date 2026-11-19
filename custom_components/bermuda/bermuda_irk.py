@@ -136,7 +136,9 @@ class BermudaIrkManager:
             cipher = self._irks.get(irk, get_cipher_for_irk(irk))
             if cipher is None:
                 _LOGGER.error(
-                    "_validate_mac_irk called without prepared cipher for %s %s - this is a bug", address, irk.hex()
+                    "_validate_mac_irk called without prepared cipher for %s %s... - this is a bug",
+                    address,
+                    irk.hex()[:4],
                 )
         if resolve_private_address(cipher, address):
             _LOGGER.debug(

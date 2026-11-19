@@ -203,6 +203,23 @@ def test_repr(bermuda_device):
     assert repr_str == f"{bermuda_device.name} [{bermuda_device.address}]"
 
 
+def test_irk_device_is_seeded_from_current_sighting(mock_coordinator):
+    """An existing Private BLE sighting is used without awaiting a new advert."""
+    info = MagicMock()
+    info.address = "4A:BB:CC:DD:EE:FF"
+    with patch("custom_components.bermuda.bermuda_device.pble_coordinator") as pble:
+        pble.async_last_service_info.return_value = info
+        device = BermudaDevice(address="0123456789abcdef0123456789abcdef", coordinator=mock_coordinator)
+    assert device.metadevice_sources == ["4a:bb:cc:dd:ee:ff"]
+
+
+def test_irk_device_without_current_sighting_starts_empty(mock_coordinator):
+    with patch("custom_components.bermuda.bermuda_device.pble_coordinator") as pble:
+        pble.async_last_service_info.return_value = None
+        device = BermudaDevice(address="0123456789abcdef0123456789abcdef", coordinator=mock_coordinator)
+    assert device.metadevice_sources == []
+
+
 def test_scanner_registry_match_prefers_own_device_over_a_mac_neighbour(mock_coordinator, mock_remote_scanner):
     """Regression: the +-3 octet registry search also matches a NEIGHBOUR.
 
@@ -539,6 +556,35 @@ async def test_scanner_resolves_real_registry(
     assert bermuda_scanner.address_ble_mac == "11:22:33:44:55:66"
     assert bermuda_scanner.name_devreg == "esphome"
     assert "uses `device_registry.devices`" not in caplog.text
+
+
+async def test_scanner_resolves_real_registry_across_mac_octet_rollover(
+    hass, device_registry, mock_coordinator, mock_remote_scanner
+):
+    """WiFi+2 scanner matching carries into the preceding octet and beats a neighbour."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain="esphome")
+    entry.add_to_hass(hass)
+    own_wifi = "aa:bb:cc:dd:ee:ff"
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        connections={("mac", own_wifi)},
+        name="Rollover proxy",
+    )
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        connections={("mac", "aa:bb:cc:dd:ef:03")},
+        name="Neighbour device",
+    )
+
+    mock_coordinator.dr = device_registry
+    scanner = BermudaDevice(address="aa:bb:cc:dd:ef:01", coordinator=mock_coordinator)
+    scanner._hascanner = mock_remote_scanner
+    scanner.async_as_scanner_resolve_device_entries()
+
+    assert scanner.address_wifi_mac == own_wifi
+    assert scanner.name_devreg == "Rollover proxy"
 
 
 def test_scanner_integration_is_read_from_config_entry_id_on_current_cores(mock_coordinator):

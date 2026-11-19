@@ -54,8 +54,7 @@ from .const import (
     METADEVICE_TYPE_IBEACON_SOURCE,
 )
 from .profiles import receiver_value
-from .util import mac_math_offset, mac_norm
-from .util import mac_octet_offset as _mac_octet_offset
+from .util import mac_math_offset_carry, mac_norm
 
 # Integrations that provide Bluetooth scanners. When two registry entries
 # carry the same MAC - an ESPHome proxy and the router integration that also
@@ -206,13 +205,18 @@ class BermudaDevice:
                     self._coordinator.config_entry.async_on_unload(
                         _pble_coord.async_track_service_info(self.async_handle_pble_callback, _irk_bytes)
                     )
-                    _LOGGER.debug("Private BLE Callback registered for %s, %s", self.name, self.address)
+                    _LOGGER.debug("Private BLE callback registered for IRK %s...", self.address[:4])
                     #
                     # Also register a callback with our own, which can fake the PBLE callbacks.
                     self._coordinator.config_entry.async_on_unload(
                         self._coordinator.irk_manager.register_irk_callback(self.async_handle_pble_callback, _irk_bytes)
                     )
                     self._coordinator.irk_manager.add_irk(_irk_bytes)
+                    # Core calls back only on a subsequent changed advert. A
+                    # device already heard before reload should be placed from
+                    # the current sighting immediately.
+                    if current := pble_coordinator.async_last_service_info(self._coordinator.hass, _irk_bytes):
+                        self.async_handle_pble_callback(current, BluetoothChange.ADVERTISEMENT)
                 else:
                     # We have no idea, currently.
                     # Mark it as such so we don't spend time testing it again.
@@ -374,7 +378,11 @@ class BermudaDevice:
             return -1
         if any(conn[0] == "bluetooth" and conn[1].lower() == self.address for conn in device.connections):
             return 0
-        return {2: 1, -1: 2}.get(_mac_octet_offset(self.address, mac), 3)
+        if mac_math_offset_carry(mac, 2) == self.address:
+            return 1
+        if mac_math_offset_carry(mac, -1) == self.address:
+            return 2
+        return 3
 
     def _freeze_scanner_identity(self, proposed_id: str, network_address: str | None) -> None:
         """Retain entity identity through re-resolution and managed reloads."""
@@ -473,7 +481,7 @@ class BermudaDevice:
         # range of possible addresses, and see what we find in the device registry,
         # on the *assumption* that there won't be overlap between devices.
         for offset in range(-3, 3):
-            if (altmac := mac_math_offset(self.address, offset)) is not None:
+            if (altmac := mac_math_offset_carry(self.address, offset)) is not None:
                 connlist.add(("bluetooth", altmac.upper()))
                 connlist.add(("mac", altmac))
                 maclist.add(altmac)
@@ -636,8 +644,8 @@ class BermudaDevice:
         source_macs = (
             (
                 self.address_ble_mac,  # BLE mac, if known
-                mac_math_offset(self.address_wifi_mac, 2),  # WIFI+2=BLE
-                mac_math_offset(self.address_wifi_mac, -1),  # ETHER-1=BLE
+                mac_math_offset_carry(self.address_wifi_mac, 2),  # WIFI+2=BLE
+                mac_math_offset_carry(self.address_wifi_mac, -1),  # ETHER-1=BLE
             )
             if selected_proof == "legacy_mac_offset"
             else (self.address,)
@@ -804,7 +812,7 @@ class BermudaDevice:
         address = mac_norm(service_info.address)
         if address not in self.metadevice_sources:
             self.metadevice_sources.insert(0, address)
-            _LOGGER.debug("Got %s callback for new IRK address on %s of %s", change, self.name, address)
+            _LOGGER.debug("Got %s callback for new IRK address %s", change, address)
             # Add the new mac/irk pair to our internal tracker so we don't spend
             # time calculating it on the update. Be wary of causing a loop here, should
             # be fine because our irk_manager will only fire another callback if the mac is new.

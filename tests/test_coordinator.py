@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from custom_components.bermuda.bermuda_device import BermudaDevice
-from custom_components.bermuda.const import BDADDR_TYPE_OTHER
+from custom_components.bermuda.const import BDADDR_TYPE_OTHER, CONF_DEVICES
 from custom_components.bermuda.coordinator import BermudaDataUpdateCoordinator
 
 
@@ -48,6 +48,22 @@ def test_prune_devices_quota(prunable_count, quota):
     assert set(devices) == {"tracked", "also_tracked"} | {
         f"device_{index}" for index in range(prune_count, prunable_count)
     }
+
+
+def test_configured_irk_redaction_never_echoes_key_material():
+    """A configured Private BLE key gets a stable label, not the original value."""
+    irk = "0123456789abcdef0123456789abcdef"
+    coordinator = SimpleNamespace(
+        scanner_list=[],
+        options={CONF_DEVICES: [irk]},
+        redactions={},
+        devices={},
+    )
+
+    BermudaDataUpdateCoordinator.redaction_list_update(coordinator)
+
+    assert irk not in coordinator.redactions[irk]
+    assert coordinator.redactions[irk].startswith(f"{irk[:4]}::CFG_IRK_")
 
 
 def test_handle_devreg_malformed_identifier():

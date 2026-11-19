@@ -136,6 +136,14 @@ class BermudaAdvert:
             )
             self.apply_new_scanner(scanner_device)
 
+        # Valid BLE RSSI readings are -127 through +20 dBm. 127 is the
+        # unavailable sentinel used by some stacks; larger, non-finite values
+        # would otherwise produce a bogus near-zero range.
+        rssi = advertisementdata.rssi
+        if isinstance(rssi, bool) or not isinstance(rssi, int | float) or not -127 <= rssi <= 20:
+            _LOGGER.debug("Ignoring invalid rssi %s from %s", rssi, scanner_device.name)
+            return
+
         scanner = self.scanner_device
         new_stamp: float | None = None
 
