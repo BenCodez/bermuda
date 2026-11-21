@@ -17,6 +17,12 @@ def test_mac_math_offset():
     assert util.mac_math_offset(None, 4) == None
 
 
+def test_mac_math_offset_carry():
+    assert util.mac_math_offset_carry("aa:bb:cc:dd:ee:ff", 2) == "aa:bb:cc:dd:ef:01"
+    assert util.mac_math_offset_carry("aa:bb:cc:dd:ef:00", -2) == "aa:bb:cc:dd:ee:fe"
+    assert util.mac_math_offset_carry("00:00:00:00:00:00", -1) is None
+
+
 def test_mac_norm():
     assert util.mac_norm("AA:bb:CC:88:Ff:00") == "aa:bb:cc:88:ff:00"
     assert util.mac_norm("Not_exactly-a-MAC:address") == "not_exactly-a-mac:address"

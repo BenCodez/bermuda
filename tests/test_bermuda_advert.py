@@ -95,6 +95,24 @@ def test_update_advertisement(bermuda_advert, mock_advertisement_data, mock_scan
     assert bermuda_advert.service_data[0]["0000abcd-0000-1000-8000-00805f9b34fb"] == b"\x01\x02"
 
 
+@pytest.mark.parametrize("rssi", [127, float("inf"), float("nan")])
+def test_update_advertisement_ignores_invalid_rssi(bermuda_advert, mock_advertisement_data, mock_scanner_device, rssi):
+    """Unavailable and out-of-range RSSI values cannot create a false nearby range."""
+    mock_advertisement_data.rssi = rssi
+    previous = (bermuda_advert.rssi, bermuda_advert.stamp, bermuda_advert.scanner_device.last_seen)
+    bermuda_advert.update_advertisement(mock_advertisement_data, mock_scanner_device)
+    assert (bermuda_advert.rssi, bermuda_advert.stamp, bermuda_advert.scanner_device.last_seen) == previous
+
+
+def test_update_advertisement_accepts_valid_positive_rssi(bermuda_advert, mock_advertisement_data, mock_scanner_device):
+    """A valid +dBm BLE signal remains usable rather than treated as absent."""
+    mock_scanner_device.is_remote_scanner = False
+    bermuda_advert.apply_new_scanner(mock_scanner_device)
+    mock_advertisement_data.rssi = 20
+    bermuda_advert.update_advertisement(mock_advertisement_data, mock_scanner_device)
+    assert bermuda_advert.rssi == 20
+
+
 def test_set_ref_power(bermuda_advert):
     """Test set_ref_power method."""
     new_distance = bermuda_advert.set_ref_power(-65)
