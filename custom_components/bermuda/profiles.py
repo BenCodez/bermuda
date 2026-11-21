@@ -257,6 +257,8 @@ def receiver_value(values: Mapping, scanner_id: str, default: Any = None) -> Any
     Source IDs otherwise remain opaque. Existing uppercase MAC options continue
     applying to lowercase Bluetooth source IDs without re-keying unrelated data.
     """
+    if not values:
+        return default
     if scanner_id in values:
         return values[scanner_id]
     parts = scanner_id.split(":")
@@ -295,6 +297,7 @@ def effective_model(
     attenuation: float,
     rssi_offset: float,
     device_reference_power: float | None = None,
+    beacon_profile: Mapping | None = None,
 ) -> dict:
     """
     Resolve explicit profiles over a caller's effective legacy model.
@@ -305,9 +308,10 @@ def effective_model(
     A profile RSSI offset explicitly replaces that receiver's legacy offset. The
     caller should persist calibration offsets in the same effective source.
     Antenna gain/type and hardware metadata do not participate in this model.
+    A supplied beacon profile replaces the stored profile for this resolution.
     """
     receiver = receiver_value(settings.get("receiver_profiles", {}), scanner_id, {})
-    beacon = settings.get("beacon_profiles", {}).get(device_id, {})
+    beacon = settings.get("beacon_profiles", {}).get(device_id, {}) if beacon_profile is None else beacon_profile
     # Existing settings have deliberately broader semantics than new profiles:
     # rssi_to_metres supports every finite power/offset and positive exponent.
     # Applying profile bounds to these baselines would break legacy tracking.

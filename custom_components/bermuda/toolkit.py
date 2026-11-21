@@ -8,10 +8,11 @@ import json
 import math
 import time
 import uuid
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.helpers import device_registry as dr
@@ -50,8 +51,12 @@ from .signal_quality import FilterState, normalize_source_age
 from .toolkit_store import DurableToolkitStore
 from .util import rssi_to_metres
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 OPTIONS_KEY = "measurement_toolkit"
 MAX_STATES = 4096
+MAX_MODELS_PER_UPDATE = 4096
 HISTORY_BYTES = 1_500_000
 COMMIT_KEY = "_commit_id"
 MAX_COMMIT_ANCHORS = 128
@@ -94,6 +99,8 @@ def _same_options(left: dict, right: dict) -> bool:
 def _candidate_identity(identifier: str) -> str:
     """Collapse MAC aliases only in detached candidate identity maps."""
     canonical = identifier.lower()
+    if canonical == identifier:
+        return identifier
     return receiver_value({canonical: canonical}, identifier, identifier)
 
 
@@ -190,6 +197,7 @@ class ToolkitManager:
         self._states: dict[tuple[str, str], FilterState] = {}
         self._quality: dict[tuple[str, str], dict] = {}
         self._owners: dict[Any, str] = {}
+        self._advert_models: dict[tuple[str, str, float], dict] | None = None
         self._suggestions: dict[str, dict] = {}
         self.engine = CalibrationEngine()
         self.fingerprints = FingerprintModel()
@@ -627,29 +635,50 @@ class ToolkitManager:
             raise ValueError(msg)
 
     def _device_id(self, advert: Any) -> str:
-        return self._owners.get(advert, public_device_id(advert.device_address))
+        owner = self._owners.get(advert)
+        return public_device_id(advert.device_address) if owner is None else owner
+
+    @contextmanager
+    def advert_model_batch(self) -> Iterator[None]:
+        """Reuse radio models within the synchronous coordinator update."""
+        previous = self._advert_models
+        self._advert_models = {}
+        try:
+            yield
+        finally:
+            self._advert_models = previous
 
     def effective_advert_model(self, advert: Any, device_id: str | None = None) -> dict:
-        """Resolve explicit profiles without changing legacy power precedence."""
-        options = self.coordinator.options
-        reference = options.get(CONF_REF_POWER, DEFAULT_REF_POWER)
-        offset = receiver_value(options.get(CONF_RSSI_OFFSETS, {}), advert.scanner_address, 0.0)
+        """Resolve the radio model. Callers must treat the result as read-only."""
+        scanner_id = advert.scanner_address
         owner = _candidate_identity(device_id or self._device_id(advert))
+        device_power = getattr(advert, "ref_power", 0.0)
+        models = self._advert_models
+        if models is not None:
+            # Options and profiles are applied outside this synchronous batch.
+            # Metadevice preparation can change ownership or the advert's power.
+            key = (scanner_id, owner, device_power if finite_number(device_power) else 0.0)
+            if (cached := models.get(key)) is not None:
+                return cached
+        options = self.coordinator.options
         settings = self.settings
-        fixed = settings["fixed_references"].get(owner, {})
-        if "reference_power" in fixed:
-            settings = deepcopy(settings)
-            existing = settings["beacon_profiles"].get(owner, {})
-            settings["beacon_profiles"][owner] = _fixed_reference_profile(fixed, existing)
-        return effective_model(
+        fixed = settings["fixed_references"].get(owner)
+        beacon_profile = None
+        if fixed is not None and "reference_power" in fixed:
+            beacon_profile = _fixed_reference_profile(fixed, settings["beacon_profiles"].get(owner, {}))
+        model = effective_model(
             settings,
-            advert.scanner_address,
+            scanner_id,
             owner,
-            reference_power=reference,
+            reference_power=options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
             attenuation=options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
-            rssi_offset=offset,
-            device_reference_power=getattr(advert, "ref_power", 0.0),
+            rssi_offset=receiver_value(options.get(CONF_RSSI_OFFSETS, {}), scanner_id, 0.0),
+            device_reference_power=device_power,
+            beacon_profile=beacon_profile,
         )
+        if models is not None and len(models) < MAX_MODELS_PER_UPDATE:
+            models[key] = model
+        return model
 
     def process_advert(self, advert: Any, new_stamp: float | None) -> bool:
         """Keep diagnostics for every reading; optional modes handle filtered ranges."""
