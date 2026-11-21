@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import perf_counter
@@ -668,25 +669,24 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
         try:  # so we can still clean up update_in_progress
             nowstamp = monotonic_time_coarse()
+            toolkit = getattr(self, "toolkit", None)
+            model_batch = getattr(toolkit, "advert_model_batch", None)
+            with model_batch() if callable(model_batch) else nullcontext():
+                # The main "get all adverts from the backend" part.
+                result_gather_adverts = self._async_gather_advert_data()
 
-            # The main "get all adverts from the backend" part.
-            result_gather_adverts = self._async_gather_advert_data()
+                self.update_metadevices()
 
-            self.update_metadevices()
+                prepare_update = getattr(toolkit, "prepare_update", None)
+                if callable(prepare_update):
+                    prepare_update()
 
-            prepare_update = getattr(getattr(self, "toolkit", None), "prepare_update", None)
-            if callable(prepare_update):
-                prepare_update()
+                # Recalculate smoothed distances, last_seen, and area using the
+                # latest data for all devices and scanners.
+                for device in self.devices.values():
+                    device.calculate_data()
 
-            # Calculate per-device data
-            #
-            # Scanner entries have been loaded up with latest data, now we can
-            # process data for all devices over all scanners.
-            for device in self.devices.values():
-                # Recalculate smoothed distances, last_seen etc
-                device.calculate_data()
-
-            self._refresh_areas_by_min_distance()
+                self._refresh_areas_by_min_distance()
 
             # We might need to freshen deliberately on first start if no new scanners
             # were discovered in the first scan update. This is likely if nothing has changed
@@ -735,7 +735,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self.stamp_last_update_started = nowstamp
         self.stamp_last_update = monotonic_time_coarse()
         self.last_update_success = True
-        toolkit = getattr(self, "toolkit", None)
         after_update = getattr(toolkit, "after_update", None)
         if callable(after_update):
             # This synchronous hook owns its bounded background work. It sees
